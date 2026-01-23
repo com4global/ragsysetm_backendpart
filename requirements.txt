@@ -1,4 +1,38 @@
+# Text Processing
 pypdf
 openai
 pinecone
-dotenv
+python-dotenv
+fastapi
+uvicorn
+python-multipart
+openpyxl
+python-docx
+pandas
+
+# Debugging
+debugpy
+
+# Multimodal Processing - Images
+pillow
+clip-interrogator
+pytesseract
+opencv-python
+
+# Multimodal Processing - Deep Learning
+torch
+torchvision
+transformers
+
+# Multimodal Processing - Audio
+librosa
+soundfile
+openai-whisper
+
+# Multimodal Processing - Video
+moviepy
+scenedetect
+
+# Utilities
+numpy
+scipy

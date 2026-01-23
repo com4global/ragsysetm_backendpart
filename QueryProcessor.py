@@ -10,7 +10,7 @@ def process_user_query(query: str):
     matched_chunks = search_in_pinecone(query_vector)
     # Send the user query and the search results (query + context) to the LLM for Generating response
     generated_response = query_llm_with_context(query, matched_chunks)
-    print(generated_response)
+    return generated_response
 
 if __name__ == "__main__":
     user_query = "What is the work timing policy?"
