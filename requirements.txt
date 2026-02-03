@@ -9,6 +9,9 @@ python-multipart
 openpyxl
 python-docx
 pandas
+whisper-timestamped
+yt-dlp
+ffmpeg-python
 
 # Debugging
 debugpy
@@ -36,3 +39,5 @@ scenedetect
 # Utilities
 numpy
 scipy
+fastapi
+uvicorn

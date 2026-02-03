@@ -2,16 +2,19 @@ import cv2
 import os
 import numpy as np
 from typing import List, Tuple, Dict
+import whisper
 import tempfile
+from audio_processor import transcribe_audio
+model = whisper.load_model("base")
 
 print("🎥 Initializing Video Processor...")
 
 try:
-    import moviepy.editor as mpy
+    from moviepy import VideoFileClip
     print("✅ MoviePy loaded successfully")
 except Exception as e:
-    print(f"❌ Error loading MoviePy: {e}")
-    mpy = None
+    from moviepy.editor import VideoFileClip
+    print("✅ MoviePy (Legacy) loaded successfully")
 
 try:
     from audio_processor import transcribe_audio
@@ -87,12 +90,11 @@ def get_video_duration(video_path: str) -> float:
 def extract_audio_from_video(video_path: str) -> str:
     """Extract audio from video and transcribe"""
     try:
-        if mpy is None:
-            print("⚠️  MoviePy not available, skipping audio extraction")
-            return ""
+        print(f"🎵 Extracting audio from: {os.path.basename(video_path)}")
+        
         
         print("🎵 Extracting audio from video...")
-        video = mpy.VideoFileClip(video_path)
+        video = VideoFileClip(video_path)
         
         if video.audio is None:
             print("⚠️  Video has no audio track")
@@ -102,7 +104,7 @@ def extract_audio_from_video(video_path: str) -> str:
         # Save audio temporarily
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             audio_path = tmp.name
-            video.audio.write_audiofile(audio_path, verbose=False, logger=None)
+            video.audio.write_audiofile(audio_path,codec='pcm_s16le', logger=None)
         
         # Transcribe
         transcript = transcribe_audio(audio_path)
@@ -271,7 +273,7 @@ if __name__ == "__main__":
     # Test video processor
     print("Testing video processor...")
     
-    test_video_path = "./resources/test_video.mp4"
+    test_video_path = "./resources/MCHX6510.MOV"
     
     if os.path.exists(test_video_path):
         result = process_video(test_video_path)

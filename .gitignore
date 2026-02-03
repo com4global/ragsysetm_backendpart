@@ -31,3 +31,13 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+frontend/
+# Ignore Vercel configuration
+vercel.json
+# Ignore all video formats
+*.mp4
+*.mov
+*.wmv
+*.avi
+*.mkv
+*.flv

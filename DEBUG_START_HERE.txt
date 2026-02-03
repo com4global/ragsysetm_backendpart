@@ -1,0 +1,154 @@
+╔════════════════════════════════════════════════════════════════════╗
+║                                                                    ║
+║        🔴 BACKEND DEBUGGING SETUP - COMPLETE & READY 🔴           ║
+║                                                                    ║
+╚════════════════════════════════════════════════════════════════════╝
+
+┌─ WHAT WAS DONE ────────────────────────────────────────────────────┐
+│                                                                     │
+│  ✅ launch.json fixed with proper FastAPI debug config            │
+│  ✅ Breakpoint added to /chat endpoint (main.py line 39)          │
+│  ✅ debugpy installed for Python debugging                         │
+│  ✅ Documentation created for complete debugging guide             │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ HOW TO USE IT (3 STEPS) ──────────────────────────────────────────┐
+│                                                                     │
+│  1️⃣  Press: Ctrl+Shift+D                                          │
+│     Opens: Run & Debug panel                                      │
+│                                                                     │
+│  2️⃣  Select: "Debug FastAPI Backend" from dropdown                │
+│                                                                     │
+│  3️⃣  Press: F5                                                     │
+│     Starts: Backend on http://localhost:8000                      │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ TEST VIA SWAGGER UI ──────────────────────────────────────────────┐
+│                                                                     │
+│  1. Open: http://localhost:8000/docs                              │
+│                                                                     │
+│  2. Find: /chat endpoint → Click "Try it out"                     │
+│                                                                     │
+│  3. Enter:                                                          │
+│     {                                                              │
+│       "query": "What is the revenue in 2021?"                     │
+│     }                                                              │
+│                                                                     │
+│  4. Click: "Execute"                                              │
+│                                                                     │
+│  5. Result: 🔴 Code pauses at breakpoint in main.py               │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ WHEN BREAKPOINT IS HIT ──────────────────────────────────────────┐
+│                                                                     │
+│  📊 Left Panel:      See all variables (request, etc.)            │
+│  💻 Bottom Panel:    Debug console to inspect data                │
+│  ⌨️  Toolbar:        Debug controls (F5, F10, F11, Shift+F11)     │
+│                                                                     │
+│  TRY:  request.query                                              │
+│        → Output: "What is the revenue in 2021?"                   │
+│                                                                     │
+│  Press: F5 to continue execution                                  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ DEBUG CONTROLS ──────────────────────────────────────────────────┐
+│                                                                     │
+│  F5           → Continue / Resume from breakpoint                │
+│  F10          → Step over (execute one line)                     │
+│  F11          → Step into (enter function)                       │
+│  Shift+F11    → Step out (exit function)                         │
+│  Shift+F5     → Stop debugging                                   │
+│  F9           → Toggle breakpoint on current line                │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ THE FLOW YOU'LL DEBUG ───────────────────────────────────────────┐
+│                                                                     │
+│  Frontend sends query                                             │
+│         ↓ (axios.post)                                            │
+│  Backend receives at /chat                                        │
+│         ↓ 🔴 BREAKPOINT HERE (you inspect)                        │
+│  Embed query → Search Pinecone → Call LLM                        │
+│         ↓                                                          │
+│  Return response                                                  │
+│         ↓                                                          │
+│  Frontend displays in chat ✅                                      │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ CURRENT BREAKPOINT ──────────────────────────────────────────────┐
+│                                                                     │
+│  📍 Location: main.py, line 39                                    │
+│  🎯 Function: chat() - the /chat endpoint                         │
+│  🔴 Status: Active and ready                                      │
+│                                                                     │
+│  To add more:  Click on any line number                           │
+│                Red dot = breakpoint added                         │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ DOCUMENTS CREATED ───────────────────────────────────────────────┐
+│                                                                     │
+│  📄 DEBUGGING_READY.md     ← Start here                           │
+│  📄 DEBUG_BACKEND.md       ← Full guide with examples             │
+│  📄 QUICK_DEBUG.md         ← Quick reference card                 │
+│  🐍 debug_backend.py       ← Alt. debug launcher                  │
+│  🐍 test_backend.py        ← Test if backend works                │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ QUICK EXAMPLE SESSION ───────────────────────────────────────────┐
+│                                                                     │
+│  > Press F5                                                        │
+│  ✅ Backend starts: "Uvicorn running on http://127.0.0.1:8000"   │
+│                                                                     │
+│  > Browser: http://localhost:8000/docs                           │
+│  ✅ Swagger UI opens                                              │
+│                                                                     │
+│  > Find /chat → "Try it out" → Enter query → "Execute"           │
+│  ✅ Code pauses at breakpoint (line 39, orange highlight)        │
+│                                                                     │
+│  > Inspect: request.query in debug console                       │
+│  ✅ Shows: "What is the revenue in 2021?"                         │
+│                                                                     │
+│  > Press F5                                                        │
+│  ✅ Code continues through pipeline                               │
+│                                                                     │
+│  > Swagger UI shows response                                      │
+│  ✅ "The revenue in 2021 for BMW Group was €111,239 million."    │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ YOU CAN ALSO ADD BREAKPOINTS AT: ────────────────────────────────┐
+│                                                                     │
+│  📍 QueryProcessor.py → see query processing step-by-step        │
+│  📍 vectorstore.py    → inspect what chunks are retrieved        │
+│  📍 llm.py            → see what context is sent to LLM           │
+│                                                                     │
+│  Just click line numbers to add red dots!                         │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─ NEXT STEPS AFTER DEBUGGING BACKEND ──────────────────────────────┐
+│                                                                     │
+│  1. Test different queries via Swagger UI                        │
+│  2. Verify responses are correct                                 │
+│  3. When satisfied, start React frontend:                        │
+│                                                                     │
+│     cd frontend                                                   │
+│     npm install  (first time only)                               │
+│     npm start                                                     │
+│                                                                     │
+│  4. Chat via: http://localhost:3000                              │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+╔════════════════════════════════════════════════════════════════════╗
+║                                                                    ║
+║              ✅ READY TO DEBUG - PRESS F5 TO START ✅              ║
+║                                                                    ║
+╚════════════════════════════════════════════════════════════════════╝

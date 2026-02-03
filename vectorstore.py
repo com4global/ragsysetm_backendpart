@@ -1,104 +1,212 @@
-from pinecone import Pinecone
-import os
-from dotenv import load_dotenv
-from typing import List
-from pathlib import Path
+"""
+Vector Store Module (Pinecone)
+Handles:
+- Storing embeddings with page-level metadata
+- Searching across single or multiple namespaces
+- Returning chunks WITH proof (page, document, path)
+"""
 
-# Load environment variables from .env file
+from pinecone import Pinecone
+from typing import List, Dict
+from dotenv import load_dotenv
+from pathlib import Path
+import os
+
+# --------------------------------------------------
+# ENV SETUP
+# --------------------------------------------------
+
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-# Initialize Pinecone client
-pinecone_client = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-index_name = os.getenv("PINECONE_INDEX_NAME")
-index = pinecone_client.Index(index_name)
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+
+if not PINECONE_API_KEY or not PINECONE_INDEX_NAME:
+    raise RuntimeError("Pinecone API key or index name not set")
+
+# --------------------------------------------------
+# CLIENT INIT
+# --------------------------------------------------
+
+pinecone = Pinecone(api_key=PINECONE_API_KEY)
+index = pinecone.Index(PINECONE_INDEX_NAME)
 
 
-def store_in_pinecone(chunks: List[str], embeddings: List[List[float]], namespace: str = ""):
-    vectors_to_upsert = []
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-        vector_data = {
-            "id": f"chunk_{i}",
-            "values": embedding,
+# --------------------------------------------------
+# UPSERT
+# --------------------------------------------------
+
+
+def store_in_pinecone(
+    embedded_chunks: List[Dict],
+    namespace: str
+):
+    """
+    Store embeddings in Pinecone with metadata
+    embedded_chunks = [
+        {
+            "embedding": [...],
             "metadata": {
-                "text": chunk,
-                "chunk_index": i
+                "text": "...",
+                "page": "...",
+                "doc_name": "...",
+                "path": "..."
             }
         }
-        vectors_to_upsert.append(vector_data)
-    
-    # Upsert vectors in batches (Pinecone recommends batch size of 100)
+    ]
+    """
+
+
+
+
+   
+    if not embedded_chunks:
+        raise ValueError("No embedded chunks provided")
+
+    vectors = []
+
+    for i, item in enumerate(embedded_chunks):
+        meta = item["metadata"]
+
+        vector_id = f"{meta['doc_name']}::{meta['page']}::{i}"
+
+        vectors.append({
+            "id": vector_id,
+            "values": item["embedding"],
+            "metadata": meta
+        })
+
+    # Batch upsert
     batch_size = 100
-    for i in range(0, len(vectors_to_upsert), batch_size):
-        batch = vectors_to_upsert[i:i + batch_size]
-        index.upsert(vectors=batch, namespace=namespace)
+    for i in range(0, len(vectors), batch_size):
+        batch = vectors[i:i + batch_size]
+        index.upsert(
+            vectors=batch,
+            namespace=namespace
+        )
 
+    print(f"✅ Upserted {len(vectors)} vectors into namespace '{namespace}'")
 
-def search_in_pinecone(query_vector: List[float], top_k: int = 4, namespace: str = ""):
-    """
-    Search for vectors in Pinecone across all namespaces
-    If specific namespace is provided, search only in that namespace
-    Otherwise, search across all documents (all namespaces)
-    
-    IMPORTANT: Searches each namespace separately and aggregates results by score
-    """
-    if namespace:
-        # Search in specific namespace
-        print(f"🔍 Searching in namespace: '{namespace}'")
-        results = index.query(
+# --------------------------------------------------
+# SEARCH
+# --------------------------------------------------
+
+#def search_in_pinecone(query_vector: List[float], top_k: int = 5, namespace: str | None = None) -> List[Dict]:
+def search_in_pinecone(query_vector: List[float], top_k: int = 5, namespace: str | None = None) -> List[Dict]:
+    results = []
+    # If namespace is provided, wrap it in a list to use the same logic
+    namespaces_to_search = [namespace] if namespace else list(index.describe_index_stats().namespaces.keys())
+
+    for ns in namespaces_to_search:
+        res = index.query(
             vector=query_vector,
             top_k=top_k,
             include_metadata=True,
-            namespace=namespace
+            namespace=ns
         )
-        matched_chunks = []
-        for i, match in enumerate(results.matches, 1):
-            chunk_text = match.metadata.get("text", "")
-            score = match.score
-            print(f"  Match {i}: score={score:.4f}, text_len={len(chunk_text)}")
-            matched_chunks.append(chunk_text)
-        return matched_chunks
-    else:
-        # Search across ALL namespaces by querying each one separately
-        print(f"🔍 Searching across ALL namespaces...")
-        all_matches = []
         
-        # Get list of all namespaces in index
-        index_stats = index.describe_index_stats()
-        namespaces = list(index_stats.namespaces.keys()) if hasattr(index_stats, 'namespaces') else ['__default__']
-        
-        print(f"   Namespaces to search: {namespaces}")
-        
-        # Search each namespace
-        for ns in namespaces:
-            try:
-                results = index.query(
-                    vector=query_vector,
-                    top_k=top_k,
-                    include_metadata=True,
-                    namespace=ns
-                )
-                print(f"   Namespace '{ns}': {len(results.matches)} matches")
-                for match in results.matches:
-                    # Store match with namespace info
-                    match.namespace = ns
-                    all_matches.append(match)
-            except Exception as e:
-                print(f"   Error searching namespace '{ns}': {e}")
-        
-        # Sort all matches by score (highest first) and take top_k
-        all_matches.sort(key=lambda x: x.score, reverse=True)
-        top_matches = all_matches[:top_k]
-        
-        print(f"Found {len(top_matches)} matches for the query (aggregated from all namespaces).")
-        
-        # Extract text chunks
-        matched_chunks = []
-        for i, match in enumerate(top_matches, 1):
-            chunk_text = match.metadata.get("text", "")
-            score = match.score
-            ns_info = getattr(match, 'namespace', 'unknown')
-            print(f"  Match {i}: score={score:.4f}, namespace='{ns_info}', text_len={len(chunk_text)}")
-            matched_chunks.append(chunk_text)
-        
-        return matched_chunks
+        for match in res.matches:
+            results.append({
+                "text": match.metadata.get("text", ""),
+                "score": match.score,
+                "page": match.metadata.get("page", "N/A"),
+                "doc_name": match.metadata.get("doc_name", "Unknown"),
+                "path": match.metadata.get("path", "Unknown"),
+                "namespace": ns
+            })
+
+    # Sort all results from all namespaces by score
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+
+# def search_in_pinecone(
+#     query_vector: List[float],
+#     top_k: int = 5,
+#     namespace: str | None = None
+# ) -> List[Dict]:
+#     """
+#     Search Pinecone and return chunks WITH proof
+
+#     Returns:
+#     [
+#         {
+#             "text": "...",
+#             "score": 0.89,
+#             "page": "Page 2",
+#             "doc_name": "HRPolicy.pdf",
+#             "path": "/resources/HRPolicy.pdf",
+#             "namespace": "pdf"
+#         }
+#     ]
+#     """
+
+#     results = []
+
+#     # ---------- SINGLE NAMESPACE ----------
+#     if namespace:
+#         print(f"🔍 Searching namespace: {namespace}")
+
+#         res = index.query(
+#             vector=query_vector,
+#             top_k=top_k,
+#             include_metadata=True,
+#             namespace=namespace
+#         )
+#     for match in res.matches:
+#         print("DEBUG MATCH ID:", match.id)
+#         print("DEBUG METADATA:", match.metadata)
+#         print("DEBUG PAGE:", match.metadata.get("page"))
+#         print("DEBUG DOC:", match.metadata.get("doc_name"))
+#         print("DEBUG PATH:", match.metadata.get("path"))
+#         print("-" * 40)
+#         for match in res.matches:
+#             results.append({
+#                 "text": match.metadata.get("text", ""),
+#                 "score": match.score,
+#                 "page": match.metadata.get("page"),
+#                 "doc_name": match.metadata.get("doc_name"),
+#                 "path": match.metadata.get("path"),
+#                 "namespace": namespace
+#             })
+
+#         return results
+
+#     # ---------- ALL NAMESPACES ----------
+#     print("🔍 Searching across ALL namespaces")
+
+#     stats = index.describe_index_stats()
+    
+#     print("AVAILABLE NAMESPACES:", stats.namespaces)
+#     namespaces = list(stats.namespaces.keys())
+
+#     for ns in namespaces:
+#         try:
+#             res = index.query(
+#                 vector=query_vector,
+#                 top_k=top_k,
+#                 include_metadata=True,
+#                 namespace=ns
+#             )
+
+#             for match in res.matches:
+#                 results.append({
+#                     "text": match.metadata.get("text", ""),
+#                     "score": match.score,
+#                     "page": match.metadata.get("page"),
+#                     "doc_name": match.metadata.get("doc_name"),
+#                     "path": match.metadata.get("path"),
+#                     "namespace": ns
+#                 })
+
+#         except Exception as e:
+#             print(f"⚠️ Failed searching namespace '{ns}': {e}")
+
+#     # Sort by relevance
+#     results.sort(key=lambda x: x["score"], reverse=True)
+
+#     final_results = results[:top_k]
+
+#     print(f"✅ Retrieved {len(final_results)} results")
+
+#     return final_results
