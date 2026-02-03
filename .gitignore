@@ -33,7 +33,6 @@ Thumbs.db
 *.swp
 frontend/
 # Ignore Vercel configuration
-vercel.json
 # Ignore all video formats
 *.mp4
 *.mov
