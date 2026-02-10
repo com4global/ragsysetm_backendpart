@@ -14,406 +14,406 @@ Production-ready API with user isolation and security
 # from fastapi.staticfiles import StaticFiles
 # from datetime import datetime, timedelta
 # import uuid
-from datetime import timezone
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-import os
-import shutil
-from pathlib import Path
-from fastapi.staticfiles import StaticFiles
-from datetime import datetime, timedelta
-import uuid
+# from datetime import timezone
+# from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status, Query
+# from fastapi.middleware.cors import CORSMiddleware
+# from fastapi.responses import JSONResponse
+# from pydantic import BaseModel
+# from typing import Optional, List, Dict, Any
+# import os
+# import shutil
+# from pathlib import Path
+# from fastapi.staticfiles import StaticFiles
+# from datetime import datetime, timedelta
+# import uuid
 
-# Import authentication modules
-from Auth import (
-    UserCreate, UserLogin, Token, TokenData, User,
-    verify_password, get_password_hash,
-    create_access_token, create_refresh_token,
-    get_current_user, verify_refresh_token
-)
-from database import user_db
+# # Import authentication modules
+# from Auth import (
+#     UserCreate, UserLogin, Token, TokenData, User,
+#     verify_password, get_password_hash,
+#     create_access_token, create_refresh_token,
+#     get_current_user, verify_refresh_token
+# )
+# from database import user_db
 
-app = FastAPI(title="RAG.AI Enterprise API", version="2.0.0")
+# app = FastAPI(title="RAG.AI Enterprise API", version="2.0.0")
 
-# CORS Configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # Update for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# # CORS Configuration
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["https://documentperser-frontend-cwd4.vercel.app/", "https://documentperser-frontend-cwd4.vercel.app"],  # Update for production
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
 
-# File storage
-RESOURCES_DIR = Path("./resources")
-RESOURCES_DIR.mkdir(exist_ok=True)
-app.mount("/static_files", StaticFiles(directory=str(RESOURCES_DIR)), name="static")
+# # File storage
+# RESOURCES_DIR = Path("./resources")
+# RESOURCES_DIR.mkdir(exist_ok=True)
+# app.mount("/static_files", StaticFiles(directory=str(RESOURCES_DIR)), name="static")
 
-# ==================== MODELS ====================
+# # ==================== MODELS ====================
 
-class QueryRequest(BaseModel):
-    query: str
-    session_id: Optional[str] = None
+# class QueryRequest(BaseModel):
+#     query: str
+#     session_id: Optional[str] = None
 
-# ✅ FLEXIBLE SOURCE MODEL - handles both string and dict sources
-class QueryResponse(BaseModel):
-    response: str
-    query: str
-    sources: List[Dict[str, Any]] = []  # ✅ Changed to flexible dict
-    session_id: str
+# # ✅ FLEXIBLE SOURCE MODEL - handles both string and dict sources
+# class QueryResponse(BaseModel):
+#     response: str
+#     query: str
+#     sources: List[Dict[str, Any]] = []  # ✅ Changed to flexible dict
+#     session_id: str
 
-class RefreshTokenRequest(BaseModel):
-    refresh_token: str
+# class RefreshTokenRequest(BaseModel):
+#     refresh_token: str
 
-class FileResponse(BaseModel):
-    filename: str
-    file_type: str
-    file_size: int
-    chunks_created: int = 0
-    uploaded_at: str
-    processed: bool = False
+# class FileResponse(BaseModel):
+#     filename: str
+#     file_type: str
+#     file_size: int
+#     chunks_created: int = 0
+#     uploaded_at: str
+#     processed: bool = False
 
-# ==================== AUTHENTICATION ENDPOINTS ====================
+# # ==================== AUTHENTICATION ENDPOINTS ====================
 
-@app.post("/api/auth/register", response_model=Token, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserCreate):
-    """Register a new user"""
-    # Check if user already exists
-    existing_user = user_db.get_user_by_email(user_data.email)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
+# @app.post("/api/auth/register", response_model=Token, status_code=status.HTTP_201_CREATED)
+# async def register(user_data: UserCreate):
+#     """Register a new user"""
+#     # Check if user already exists
+#     existing_user = user_db.get_user_by_email(user_data.email)
+#     if existing_user:
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail="Email already registered"
+#         )
     
-    # Hash password and create user
-    password_hash = get_password_hash(user_data.password)
-    user = user_db.create_user(
-        email=user_data.email,
-        password_hash=password_hash,
-        full_name=user_data.full_name,
-        company=user_data.company
-    )
+#     # Hash password and create user
+#     password_hash = get_password_hash(user_data.password)
+#     user = user_db.create_user(
+#         email=user_data.email,
+#         password_hash=password_hash,
+#         full_name=user_data.full_name,
+#         company=user_data.company
+#     )
     
-    # Create tokens
-    token_data = {"user_id": user["user_id"], "email": user["email"]}
-    access_token = create_access_token(token_data)
-    refresh_token = create_refresh_token(token_data)
+#     # Create tokens
+#     token_data = {"user_id": user["user_id"], "email": user["email"]}
+#     access_token = create_access_token(token_data)
+#     refresh_token = create_refresh_token(token_data)
     
-    # Save refresh token
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    user_db.save_refresh_token(user["user_id"], refresh_token, expires_at)
+#     # Save refresh token
+#     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+#     user_db.save_refresh_token(user["user_id"], refresh_token, expires_at)
     
-    return Token(
-        access_token=access_token,
-        refresh_token=refresh_token
-    )
+#     return Token(
+#         access_token=access_token,
+#         refresh_token=refresh_token
+#     )
 
-@app.post("/api/auth/login", response_model=Token)
-async def login(credentials: UserLogin):
-    """Login user and return tokens"""
-    # Get user
-    user = user_db.get_user_by_email(credentials.email)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
-        )
+# @app.post("/api/auth/login", response_model=Token)
+# async def login(credentials: UserLogin):
+#     """Login user and return tokens"""
+#     # Get user
+#     user = user_db.get_user_by_email(credentials.email)
+#     if not user:
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED,
+#             detail="Invalid email or password"
+#         )
     
-    # Verify password
-    if not verify_password(credentials.password, user["password_hash"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
-        )
+#     # Verify password
+#     if not verify_password(credentials.password, user["password_hash"]):
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED,
+#             detail="Invalid email or password"
+#         )
     
-    # Check if user is active
-    if not user["is_active"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is disabled"
-        )
+#     # Check if user is active
+#     if not user["is_active"]:
+#         raise HTTPException(
+#             status_code=status.HTTP_403_FORBIDDEN,
+#             detail="Account is disabled"
+#         )
     
-    # Update last login
-    user_db.update_last_login(user["user_id"])
+#     # Update last login
+#     user_db.update_last_login(user["user_id"])
     
-    # Create tokens
-    token_data = {"user_id": user["user_id"], "email": user["email"]}
-    access_token = create_access_token(token_data)
-    refresh_token = create_refresh_token(token_data)
+#     # Create tokens
+#     token_data = {"user_id": user["user_id"], "email": user["email"]}
+#     access_token = create_access_token(token_data)
+#     refresh_token = create_refresh_token(token_data)
     
-    # Save refresh token
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    user_db.save_refresh_token(user["user_id"], refresh_token, expires_at)
+#     # Save refresh token
+#     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+#     user_db.save_refresh_token(user["user_id"], refresh_token, expires_at)
     
-    return Token(
-        access_token=access_token,
-        refresh_token=refresh_token
-    )
+#     return Token(
+#         access_token=access_token,
+#         refresh_token=refresh_token
+#     )
 
-@app.post("/api/auth/refresh", response_model=Token)
-async def refresh_access_token(request: RefreshTokenRequest):
-    """Refresh access token using refresh token"""
-    try:
-        token_data = verify_refresh_token(request.refresh_token)
+# @app.post("/api/auth/refresh", response_model=Token)
+# async def refresh_access_token(request: RefreshTokenRequest):
+#     """Refresh access token using refresh token"""
+#     try:
+#         token_data = verify_refresh_token(request.refresh_token)
         
-        # Verify token in database
-        user_id = user_db.verify_refresh_token(request.refresh_token)
-        if not user_id or user_id != token_data.user_id:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid refresh token"
-            )
+#         # Verify token in database
+#         user_id = user_db.verify_refresh_token(request.refresh_token)
+#         if not user_id or user_id != token_data.user_id:
+#             raise HTTPException(
+#                 status_code=status.HTTP_401_UNAUTHORIZED,
+#                 detail="Invalid refresh token"
+#             )
         
-        # Create new access token
-        new_token_data = {"user_id": token_data.user_id, "email": token_data.email}
-        access_token = create_access_token(new_token_data)
+#         # Create new access token
+#         new_token_data = {"user_id": token_data.user_id, "email": token_data.email}
+#         access_token = create_access_token(new_token_data)
         
-        return Token(
-            access_token=access_token,
-            refresh_token=request.refresh_token
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token"
-        )
+#         return Token(
+#             access_token=access_token,
+#             refresh_token=request.refresh_token
+#         )
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED,
+#             detail="Invalid refresh token"
+#         )
 
-@app.post("/api/auth/logout")
-async def logout(
-    refresh_token: str,
-    current_user: TokenData = Depends(get_current_user)
-):
-    """Logout user by revoking refresh token"""
-    user_db.revoke_refresh_token(refresh_token)
-    return {"message": "Successfully logged out"}
+# @app.post("/api/auth/logout")
+# async def logout(
+#     refresh_token: str,
+#     current_user: TokenData = Depends(get_current_user)
+# ):
+#     """Logout user by revoking refresh token"""
+#     user_db.revoke_refresh_token(refresh_token)
+#     return {"message": "Successfully logged out"}
 
-@app.get("/api/auth/me")
-async def get_current_user_info(current_user: TokenData = Depends(get_current_user)):
-    """Get current user information"""
-    user = user_db.get_user_by_id(current_user.user_id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
+# @app.get("/api/auth/me")
+# async def get_current_user_info(current_user: TokenData = Depends(get_current_user)):
+#     """Get current user information"""
+#     user = user_db.get_user_by_id(current_user.user_id)
+#     if not user:
+#         raise HTTPException(
+#             status_code=status.HTTP_404_NOT_FOUND,
+#             detail="User not found"
+#         )
     
-    # Remove sensitive data
-    user.pop("password_hash", None)
+#     # Remove sensitive data
+#     user.pop("password_hash", None)
     
-    # Add statistics
-    stats = user_db.get_user_stats(current_user.user_id)
-    user.update(stats)
+#     # Add statistics
+#     stats = user_db.get_user_stats(current_user.user_id)
+#     user.update(stats)
     
-    return user
+#     return user
 
-# ==================== FILE MANAGEMENT ENDPOINTS ====================
+# # ==================== FILE MANAGEMENT ENDPOINTS ====================
 
-@app.post("/api/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    current_user: TokenData = Depends(get_current_user)
-):
-    """Upload file for authenticated user"""
-    try:
-        from file_processor import get_supported_formats, get_file_type
+# @app.post("/api/upload")
+# async def upload_file(
+#     file: UploadFile = File(...),
+#     current_user: TokenData = Depends(get_current_user)
+# ):
+#     """Upload file for authenticated user"""
+#     try:
+#         from file_processor import get_supported_formats, get_file_type
         
-        file_ext = Path(file.filename).suffix.lower()
-        supported = get_supported_formats()
-        media_exts = ['.mp4', '.avi', '.mov', '.mp3', '.wav', '.jpg', '.png', '.jpeg', '.gif']
+#         file_ext = Path(file.filename).suffix.lower()
+#         supported = get_supported_formats()
+#         media_exts = ['.mp4', '.avi', '.mov', '.mp3', '.wav', '.jpg', '.png', '.jpeg', '.gif']
         
-        if file_ext not in supported and file_ext not in media_exts:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Unsupported format: {file_ext}"
-            )
+#         if file_ext not in supported and file_ext not in media_exts:
+#             raise HTTPException(
+#                 status_code=400, 
+#                 detail=f"Unsupported format: {file_ext}"
+#             )
         
-        # Create user-specific directory
-        user_dir = RESOURCES_DIR / current_user.user_id
-        user_dir.mkdir(exist_ok=True)
+#         # Create user-specific directory
+#         user_dir = RESOURCES_DIR / current_user.user_id
+#         user_dir.mkdir(exist_ok=True)
         
-        # Save file with user isolation
-        file_path = user_dir / file.filename
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+#         # Save file with user isolation
+#         file_path = user_dir / file.filename
+#         with open(file_path, "wb") as buffer:
+#             shutil.copyfileobj(file.file, buffer)
         
-        file_size = file_path.stat().st_size
-        file_type = get_file_type(str(file_path)) if file_ext in supported else "Media"
+#         file_size = file_path.stat().st_size
+#         file_type = get_file_type(str(file_path)) if file_ext in supported else "Media"
         
-        # Add to user's file records
-        file_record = user_db.add_user_file(
-            user_id=current_user.user_id,
-            filename=file.filename,
-            file_type=file_type,
-            file_size=file_size
-        )
+#         # Add to user's file records
+#         file_record = user_db.add_user_file(
+#             user_id=current_user.user_id,
+#             filename=file.filename,
+#             file_type=file_type,
+#             file_size=file_size
+#         )
         
-        return {"success": True, "file": file_record}
+#         return {"success": True, "file": file_record}
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/process-file")
-async def process_file(
-    filename: str,
-    current_user: TokenData = Depends(get_current_user)
-):
-    """Process uploaded file for authenticated user"""
-    try:
-        # Verify file belongs to user
-        if not user_db.file_belongs_to_user(current_user.user_id, filename):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied to this file"
-            )
+# @app.post("/api/process-file")
+# async def process_file(
+#     filename: str,
+#     current_user: TokenData = Depends(get_current_user)
+# ):
+#     """Process uploaded file for authenticated user"""
+#     try:
+#         # Verify file belongs to user
+#         if not user_db.file_belongs_to_user(current_user.user_id, filename):
+#             raise HTTPException(
+#                 status_code=status.HTTP_403_FORBIDDEN,
+#                 detail="Access denied to this file"
+#             )
         
-        from dataprocessor import process_file
+#         from dataprocessor import process_file
         
-        # Process file from user's directory
-        user_dir = RESOURCES_DIR / current_user.user_id
-        file_path = user_dir / filename
+#         # Process file from user's directory
+#         user_dir = RESOURCES_DIR / current_user.user_id
+#         file_path = user_dir / filename
         
-        if not file_path.exists():
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="File not found"
-            )
+#         if not file_path.exists():
+#             raise HTTPException(
+#                 status_code=status.HTTP_404_NOT_FOUND,
+#                 detail="File not found"
+#             )
         
-        # Process with user_id context for isolation
-        result = process_file(str(file_path), user_id=current_user.user_id)
+#         # Process with user_id context for isolation
+#         result = process_file(str(file_path), user_id=current_user.user_id)
         
-        # Update file record
-        user_db.update_file_processed(
-            user_id=current_user.user_id,
-            filename=filename,
-            chunks_created=result["chunks_created"]
-        )
+#         # Update file record
+#         user_db.update_file_processed(
+#             user_id=current_user.user_id,
+#             filename=filename,
+#             chunks_created=result["chunks_created"]
+#         )
         
-        return {"success": True, "result": result}
+#         return {"success": True, "result": result}
     
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/files")
-async def get_user_files(current_user: TokenData = Depends(get_current_user)):
-    """Get all files for authenticated user"""
-    try:
-        print(f"🔍 Fetching files for user: {current_user.user_id}")
-        files = user_db.get_user_files(current_user.user_id)
-        print(f"✅ Files retrieved: {len(files)}")
-        
-        stats = user_db.get_user_stats(current_user.user_id)
-        print(f"✅ Stats retrieved: {stats}")
-        
-        return {"files": files, "stats": stats}
-    except Exception as e:
-        print(f"❌ Error in get_user_files: {str(e)}")
-        print(f"❌ Error type: {type(e).__name__}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
 # @app.get("/api/files")
 # async def get_user_files(current_user: TokenData = Depends(get_current_user)):
 #     """Get all files for authenticated user"""
-#     files = user_db.get_user_files(current_user.user_id)
-#     stats = user_db.get_user_stats(current_user.user_id)
+#     try:
+#         print(f"🔍 Fetching files for user: {current_user.user_id}")
+#         files = user_db.get_user_files(current_user.user_id)
+#         print(f"✅ Files retrieved: {len(files)}")
+        
+#         stats = user_db.get_user_stats(current_user.user_id)
+#         print(f"✅ Stats retrieved: {stats}")
+        
+#         return {"files": files, "stats": stats}
+#     except Exception as e:
+#         print(f"❌ Error in get_user_files: {str(e)}")
+#         print(f"❌ Error type: {type(e).__name__}")
+#         import traceback
+#         traceback.print_exc()
+#         raise HTTPException(status_code=500, detail=str(e))
+# # @app.get("/api/files")
+# # async def get_user_files(current_user: TokenData = Depends(get_current_user)):
+# #     """Get all files for authenticated user"""
+# #     files = user_db.get_user_files(current_user.user_id)
+# #     stats = user_db.get_user_stats(current_user.user_id)
     
-#     return {"files": files, "stats": stats}
+# #     return {"files": files, "stats": stats}
 
-@app.delete("/api/files/{filename}")
-async def delete_file(
-    filename: str,
-    current_user: TokenData = Depends(get_current_user)
-):
-    """Delete file for authenticated user"""
-    try:
-        # Verify file belongs to user
-        if not user_db.file_belongs_to_user(current_user.user_id, filename):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied to this file"
-            )
+# @app.delete("/api/files/{filename}")
+# async def delete_file(
+#     filename: str,
+#     current_user: TokenData = Depends(get_current_user)
+# ):
+#     """Delete file for authenticated user"""
+#     try:
+#         # Verify file belongs to user
+#         if not user_db.file_belongs_to_user(current_user.user_id, filename):
+#             raise HTTPException(
+#                 status_code=status.HTTP_403_FORBIDDEN,
+#                 detail="Access denied to this file"
+#             )
         
-        # Delete physical file
-        user_dir = RESOURCES_DIR / current_user.user_id
-        file_path = user_dir / filename
-        if file_path.exists():
-            file_path.unlink()
+#         # Delete physical file
+#         user_dir = RESOURCES_DIR / current_user.user_id
+#         file_path = user_dir / filename
+#         if file_path.exists():
+#             file_path.unlink()
         
-        # Delete from database
-        user_db.delete_user_file(current_user.user_id, filename)
+#         # Delete from database
+#         user_db.delete_user_file(current_user.user_id, filename)
         
-        # Delete from vector store (you'll need to implement this)
-        from dataprocessor import delete_user_file_vectors
-        delete_user_file_vectors(current_user.user_id, filename)
+#         # Delete from vector store (you'll need to implement this)
+#         from dataprocessor import delete_user_file_vectors
+#         delete_user_file_vectors(current_user.user_id, filename)
         
-        return {"success": True, "message": "File deleted"}
+#         return {"success": True, "message": "File deleted"}
     
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== CHAT ENDPOINTS ====================
+# # ==================== CHAT ENDPOINTS ====================
 
-@app.post("/chat", response_model=QueryResponse)
-async def chat(
-    request: QueryRequest,
-    current_user: TokenData = Depends(get_current_user)
-):
-    """Chat endpoint with user-specific context"""
-    try:
-        from QueryProcessor import process_user_query
+# @app.post("/chat", response_model=QueryResponse)
+# async def chat(
+#     request: QueryRequest,
+#     current_user: TokenData = Depends(get_current_user)
+# ):
+#     """Chat endpoint with user-specific context"""
+#     try:
+#         from QueryProcessor import process_user_query
         
-        # Generate session ID if not provided
-        session_id = request.session_id or str(uuid.uuid4())
+#         # Generate session ID if not provided
+#         session_id = request.session_id or str(uuid.uuid4())
         
-        # Process query with user context for data isolation
-        result = process_user_query(
-            query=request.query,
-            user_id=current_user.user_id
-        )
+#         # Process query with user context for data isolation
+#         result = process_user_query(
+#             query=request.query,
+#             user_id=current_user.user_id
+#         )
         
-        # Save to chat history
-        user_db.add_chat_message(
-            user_id=current_user.user_id,
-            session_id=session_id,
-            query=request.query,
-            response=result["answer"],
-            sources=result.get("sources", [])
-        )
+#         # Save to chat history
+#         user_db.add_chat_message(
+#             user_id=current_user.user_id,
+#             session_id=session_id,
+#             query=request.query,
+#             response=result["answer"],
+#             sources=result.get("sources", [])
+#         )
         
-        return QueryResponse(
-            response=result["answer"],
-            query=request.query,
-            sources=result.get("sources", []),
-            session_id=session_id
-        )
+#         return QueryResponse(
+#             response=result["answer"],
+#             query=request.query,
+#             sources=result.get("sources", []),
+#             session_id=session_id
+#         )
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/chat/history")
-async def get_chat_history(
-    session_id: Optional[str] = None,
-    limit: int = 50,
-    current_user: TokenData = Depends(get_current_user)
-):
-    """Get chat history for authenticated user"""
-    history = user_db.get_chat_history(
-        user_id=current_user.user_id,
-        session_id=session_id,
-        limit=limit
-    )
-    return {"history": history}
+# @app.get("/api/chat/history")
+# async def get_chat_history(
+#     session_id: Optional[str] = None,
+#     limit: int = 50,
+#     current_user: TokenData = Depends(get_current_user)
+# ):
+#     """Get chat history for authenticated user"""
+#     history = user_db.get_chat_history(
+#         user_id=current_user.user_id,
+#         session_id=session_id,
+#         limit=limit
+#     )
+#     return {"history": history}
 
 # ==================== MEDIA PROCESSING ENDPOINTS ====================
 
@@ -467,131 +467,131 @@ async def get_chat_history(
 
 # ==================== HEALTH CHECK ====================
 
-@app.get("/")
-def read_root():
-    return {
-        "message": "RAG.AI Enterprise API v2.0",
-        "status": "operational",
-        "features": ["authentication", "user_isolation", "file_management", "chat"]
-    }
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-
-
-
-
-
-# from fastapi import FastAPI, File, UploadFile, HTTPException
-# from fastapi.middleware.cors import CORSMiddleware
-# from pydantic import BaseModel
-# import os
-# import shutil
-# from pathlib import Path
-# from fastapi.staticfiles import StaticFiles
-
-# app = FastAPI()
-
-# # Enable CORS
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# RESOURCES_DIR = Path("./resources")
-# RESOURCES_DIR.mkdir(exist_ok=True)
-# app.mount("/static_files", StaticFiles(directory=str(RESOURCES_DIR)), name="static")
-
-# class QueryRequest(BaseModel):
-#     query: str
-
-# class QueryResponse(BaseModel):
-#     response: str
-#     query: str
-#     sources: list = []
-
 # @app.get("/")
 # def read_root():
-#     return {"message": "HR Assistant RAG API (Memory Optimized) is running"}
+#     return {
+#         "message": "RAG.AI Enterprise API v2.0",
+#         "status": "operational",
+#         "features": ["authentication", "user_isolation", "file_management", "chat"]
+#     }
 
-# @app.post("/chat")
-# def chat(request: QueryRequest):
-#     try:
-#         # LAZY IMPORT: Only loads when someone chats
-#         from QueryProcessor import process_user_query
-#         result = process_user_query(request.query)
-        
-#         return QueryResponse(
-#             response=result["answer"], 
-#             query=request.query,
-#             sources=result.get("sources", [])
-#         )
-#     except Exception as e:
-#         return {"error": str(e), "query": request.query}
-
-# @app.post("/api/upload")
-# async def upload_file(file: UploadFile = File(...)):
-#     try:
-#         # LAZY IMPORT: For supported formats
-#         from file_processor import get_supported_formats, get_file_type
-#         from file_manager import add_file_record
-
-#         file_ext = Path(file.filename).suffix.lower()
-#         supported = get_supported_formats()
-        
-#         # Add media formats manually to avoid loading heavy processors here
-#         media_exts = ['.mp4', '.avi', '.mov', '.mp3', '.wav', '.jpg', '.png']
-        
-#         if file_ext not in supported and file_ext not in media_exts:
-#             raise HTTPException(status_code=400, detail="Unsupported format")
-
-#         file_path = RESOURCES_DIR / file.filename
-#         with open(file_path, "wb") as buffer:
-#             shutil.copyfileobj(file.file, buffer)
-            
-#         file_size = file_path.stat().st_size
-#         file_type = get_file_type(str(file_path)) if file_ext in supported else "Media"
-        
-#         file_record = add_file_record(file.filename, file_type, file_size)
-#         return {"success": True, "file": file_record}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# @app.post("/api/process-file")
-# def process_uploaded_file(filename: str):
-#     try:
-#         # LAZY IMPORT: Heavy processing only happens here
-#         from dataprocessor import process_file
-#         from file_manager import update_file_record
-        
-#         file_path = RESOURCES_DIR / filename
-#         result = process_file(str(file_path))
-#         update_file_record(filename, result["chunks_created"])
-        
-#         return {"success": True, "result": result}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# @app.get("/api/files")
-# def get_files():
-#     # File manager is lightweight, but we still import locally for consistency
-#     from file_manager import get_all_files, get_file_stats
-#     return {"files": get_all_files(), "stats": get_file_stats()}
+# @app.get("/health")
+# def health_check():
+#     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 # if __name__ == "__main__":
 #     import uvicorn
 #     port = int(os.environ.get("PORT", 10000))
 #     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+
+#without token
+
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import os
+import shutil
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+
+app = FastAPI()
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+RESOURCES_DIR = Path("./resources")
+RESOURCES_DIR.mkdir(exist_ok=True)
+app.mount("/static_files", StaticFiles(directory=str(RESOURCES_DIR)), name="static")
+
+class QueryRequest(BaseModel):
+    query: str
+
+class QueryResponse(BaseModel):
+    response: str
+    query: str
+    sources: list = []
+
+@app.get("/")
+def read_root():
+    return {"message": "HR Assistant RAG API (Memory Optimized) is running"}
+
+@app.post("/chat")
+def chat(request: QueryRequest):
+    try:
+        # LAZY IMPORT: Only loads when someone chats
+        from QueryProcessor import process_user_query
+        result = process_user_query(request.query)
+        
+        return QueryResponse(
+            response=result["answer"], 
+            query=request.query,
+            sources=result.get("sources", [])
+        )
+    except Exception as e:
+        return {"error": str(e), "query": request.query}
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        # LAZY IMPORT: For supported formats
+        from file_processor import get_supported_formats, get_file_type
+        from file_manager import add_file_record
+
+        file_ext = Path(file.filename).suffix.lower()
+        supported = get_supported_formats()
+        
+        # Add media formats manually to avoid loading heavy processors here
+        media_exts = ['.mp4', '.avi', '.mov', '.mp3', '.wav', '.jpg', '.png']
+        
+        if file_ext not in supported and file_ext not in media_exts:
+            raise HTTPException(status_code=400, detail="Unsupported format")
+
+        file_path = RESOURCES_DIR / file.filename
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        file_size = file_path.stat().st_size
+        file_type = get_file_type(str(file_path)) if file_ext in supported else "Media"
+        
+        file_record = add_file_record(file.filename, file_type, file_size)
+        return {"success": True, "file": file_record}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/process-file")
+def process_uploaded_file(filename: str):
+    try:
+        # LAZY IMPORT: Heavy processing only happens here
+        from dataprocessor import process_file
+        from file_manager import update_file_record
+        
+        file_path = RESOURCES_DIR / filename
+        result = process_file(str(file_path))
+        update_file_record(filename, result["chunks_created"])
+        
+        return {"success": True, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/files")
+def get_files():
+    # File manager is lightweight, but we still import locally for consistency
+    from file_manager import get_all_files, get_file_stats
+    return {"files": get_all_files(), "stats": get_file_stats()}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 #original main.py

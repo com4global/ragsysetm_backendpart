@@ -333,6 +333,17 @@
       "uploaded_at": "2026-02-01T22:06:17.431106",
       "processed": false,
       "chunks_created": 0
+    },
+    {
+      "id": 33,
+      "file_name": "timesheet_LMTS00919265.pdf",
+      "file_type": "pdf",
+      "file_size": 32333,
+      "status": "completed",
+      "uploaded_at": "2026-02-10T10:26:06.377759",
+      "processed": true,
+      "chunks_created": 1,
+      "processed_at": "2026-02-10T10:27:13.093317"
     }
   ]
 }
