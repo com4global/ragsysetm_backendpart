@@ -15,7 +15,10 @@ __pycache__/
 *.python-version
 
 # Virtual environment
+.myenv/
 .menv/
+venv/
+*.venv/
 .menv/*
 .menv/**
 
@@ -30,6 +33,7 @@ Thumbs.db
 # IDE/editor configs
 .vscode/
 .idea/
+.vs/
 *.swp
 frontend/
 # Ignore Vercel configuration

@@ -287,6 +287,57 @@ def delete_namespace(namespace: str):
         raise
 
 
+# Default embedding dimension (OpenAI text-embedding-3-small)
+DEFAULT_EMBEDDING_DIM = 1536
+
+
+def delete_vectors_by_doc_name(filename: str, namespace: Optional[str] = None) -> int:
+    """
+    Delete all vectors for a given document (by doc_name metadata).
+    Used for "Remove from DB" and for full file delete.
+    
+    Args:
+        filename: doc_name (file name) to remove from vector DB
+        namespace: If provided, only search this namespace. Otherwise infer from file extension.
+    
+    Returns:
+        Number of vectors deleted.
+    """
+    from pathlib import Path
+    if namespace is None:
+        namespace = Path(filename).suffix.lower().lstrip(".") or "txt"
+    try:
+        stats = index.describe_index_stats()
+        dim = stats.dimension
+    except Exception:
+        dim = DEFAULT_EMBEDDING_DIM
+    dummy_vector = [0.0] * dim
+    ids_to_delete = []
+    top_k = 10000
+    while True:
+        res = index.query(
+            vector=dummy_vector,
+            top_k=top_k,
+            include_metadata=False,
+            filter={"doc_name": {"$eq": filename}},
+            namespace=namespace,
+        )
+        matches = res.matches or []
+        if not matches:
+            break
+        ids_to_delete.extend([m.id for m in matches])
+        if len(matches) < top_k:
+            break
+    if not ids_to_delete:
+        print(f"📭 No vectors found for doc_name='{filename}' in namespace '{namespace}'")
+        return 0
+    for i in range(0, len(ids_to_delete), 1000):
+        batch = ids_to_delete[i : i + 1000]
+        index.delete(ids=batch, namespace=namespace)
+    print(f"🗑️ Deleted {len(ids_to_delete)} vectors for '{filename}' from namespace '{namespace}'")
+    return len(ids_to_delete)
+
+
 def list_all_namespaces() -> List[str]:
     """
     List all namespaces in the index

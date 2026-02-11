@@ -1,0 +1,12 @@
+# Core dependencies for RAG pipeline
+pypdf
+openai
+pinecone
+python-dotenv
+fastapi
+uvicorn
+python-multipart
+openpyxl
+python-docx
+pandas
+numpy

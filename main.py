@@ -489,7 +489,7 @@ Production-ready API with user isolation and security
 #without token
 
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -587,6 +587,63 @@ def get_files():
     # File manager is lightweight, but we still import locally for consistency
     from file_manager import get_all_files, get_file_stats
     return {"files": get_all_files(), "stats": get_file_stats()}
+
+
+@app.delete("/api/files/{filename}/chunks")
+def remove_file_chunks(filename: str):
+    """Remove all vector DB chunks for this file. File record is reset to pending."""
+    try:
+        from file_manager import reset_file_chunks, get_file_by_name
+        if get_file_by_name(filename) is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        deleted = 0
+        try:
+            from vectorstore import delete_vectors_by_doc_name
+            deleted = delete_vectors_by_doc_name(filename)
+        except (ImportError, ModuleNotFoundError) as e:
+            raise HTTPException(status_code=503, detail="Pinecone not available. Install: pip install pinecone")
+        reset_file_chunks(filename)
+        return {"success": True, "message": f"Removed {deleted} chunks from DB", "deleted_count": deleted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/files/{filename}")
+def delete_file(filename: str):
+    """Delete file from disk, metadata, and remove its chunks from the vector DB."""
+    return _do_delete_file(filename)
+
+
+@app.delete("/api/files")
+def delete_file_by_query(filename: str = Query(..., alias="filename")):
+    """Delete file by query param (alternative for clients that prefer ?filename=)."""
+    return _do_delete_file(filename)
+
+
+def _do_delete_file(filename: str):
+    """Shared delete logic."""
+    try:
+        from file_manager import delete_file_record, get_file_by_name
+        if get_file_by_name(filename) is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        file_path = RESOURCES_DIR / filename
+        if file_path.exists():
+            file_path.unlink()
+        deleted = 0
+        try:
+            from vectorstore import delete_vectors_by_doc_name
+            deleted = delete_vectors_by_doc_name(filename)
+        except (ImportError, ModuleNotFoundError) as e:
+            print(f"⚠️ Pinecone not available, skipping vector cleanup: {e}")
+        delete_file_record(filename)
+        return {"success": True, "message": "File and its chunks deleted", "deleted_chunks": deleted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
