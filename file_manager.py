@@ -774,6 +774,19 @@ def update_file_record(file_name: str, chunks_count: int):
     save_metadata(metadata)
 
 
+def reset_file_chunks(file_name: str):
+    """Reset file to pending after chunks are removed from vector DB (chunks only)."""
+    metadata = load_metadata()
+    for file_record in metadata["files"]:
+        if file_record["file_name"] == file_name:
+            file_record["processed"] = False
+            file_record["status"] = "uploaded"
+            file_record["chunks_created"] = 0
+            file_record.pop("processed_at", None)
+            break
+    save_metadata(metadata)
+
+
 def get_all_files() -> List[Dict]:
     """Get all uploaded files"""
     metadata = load_metadata()
