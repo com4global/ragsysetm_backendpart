@@ -495,6 +495,8 @@ from pydantic import BaseModel
 import os
 import shutil
 from pathlib import Path
+import requests
+
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
@@ -510,8 +512,13 @@ app.add_middleware(
 
 RESOURCES_DIR = Path("./resources")
 RESOURCES_DIR.mkdir(exist_ok=True)
-app.mount("/static_files", StaticFiles(directory=str(RESOURCES_DIR)), name="static")
-
+#app.mount("/static_files", StaticFiles(directory=str(RESOURCES_DIR)), name="static")
+# NEW: Schema for the metadata the frontend will send
+class FileMetadataRequest(BaseModel):
+    file_name: str
+    file_type: str
+    file_size: int
+    blob_url: str
 class QueryRequest(BaseModel):
     query: str
 
@@ -523,6 +530,54 @@ class QueryResponse(BaseModel):
 @app.get("/")
 def read_root():
     return {"message": "HR Assistant RAG API (Memory Optimized) is running"}
+
+
+@app.post("/api/record-metadata")
+async def record_metadata(request: FileMetadataRequest):
+    try:
+        from file_manager import add_file_record
+        file_record = add_file_record(
+            request.file_name, 
+            request.file_type, 
+            request.file_size, 
+            request.blob_url
+        )
+        return {"success": True, "file": file_record}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/process-file")
+def process_uploaded_file(filename: str):
+    try:
+        from dataprocessor import process_file
+        from file_manager import update_file_record, get_file_by_name
+        
+        # 1. Look up the file record to get the URL
+        file_info = get_file_by_name(filename)
+        if not file_info or "blob_url" not in file_info:
+            raise HTTPException(status_code=404, detail="File URL not found")
+
+        # 2. Download from Vercel Blob to a temporary local file
+        temp_path = RESOURCES_DIR / filename
+        response = requests.get(file_info["blob_url"], stream=True)
+        if response.status_code == 200:
+            with open(temp_path, "wb") as f:
+                f.write(response.content)
+        else:
+            raise Exception("Failed to download file from Vercel Blob")
+        
+        # 3. Process the local temp file for RAG
+        result = process_file(str(temp_path))
+        update_file_record(filename, result["chunks_created"])
+        
+        # 4. Cleanup: Remove the local file after processing to save disk space
+        if temp_path.exists():
+            os.remove(temp_path)
+            
+        return {"success": True, "result": result}
+    except Exception as e:
+        if temp_path.exists(): os.remove(temp_path) # Cleanup on error
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/chat")
 def chat(request: QueryRequest):
@@ -539,48 +594,48 @@ def chat(request: QueryRequest):
     except Exception as e:
         return {"error": str(e), "query": request.query}
 
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    try:
-        # LAZY IMPORT: For supported formats
-        from file_processor import get_supported_formats, get_file_type
-        from file_manager import add_file_record
+# @app.post("/api/upload")
+# async def upload_file(file: UploadFile = File(...)):
+#     try:
+#         # LAZY IMPORT: For supported formats
+#         from file_processor import get_supported_formats, get_file_type
+#         from file_manager import add_file_record
 
-        file_ext = Path(file.filename).suffix.lower()
-        supported = get_supported_formats()
+#         file_ext = Path(file.filename).suffix.lower()
+#         supported = get_supported_formats()
         
-        # Add media formats manually to avoid loading heavy processors here
-        media_exts = ['.mp4', '.avi', '.mov', '.mp3', '.wav', '.jpg', '.png']
+#         # Add media formats manually to avoid loading heavy processors here
+#         media_exts = ['.mp4', '.avi', '.mov', '.mp3', '.wav', '.jpg', '.png']
         
-        if file_ext not in supported and file_ext not in media_exts:
-            raise HTTPException(status_code=400, detail="Unsupported format")
+#         if file_ext not in supported and file_ext not in media_exts:
+#             raise HTTPException(status_code=400, detail="Unsupported format")
 
-        file_path = RESOURCES_DIR / file.filename
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+#         file_path = RESOURCES_DIR / file.filename
+#         with open(file_path, "wb") as buffer:
+#             shutil.copyfileobj(file.file, buffer)
             
-        file_size = file_path.stat().st_size
-        file_type = get_file_type(str(file_path)) if file_ext in supported else "Media"
+#         file_size = file_path.stat().st_size
+#         file_type = get_file_type(str(file_path)) if file_ext in supported else "Media"
         
-        file_record = add_file_record(file.filename, file_type, file_size)
-        return {"success": True, "file": file_record}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#         file_record = add_file_record(file.filename, file_type, file_size)
+#         return {"success": True, "file": file_record}
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/process-file")
-def process_uploaded_file(filename: str):
-    try:
-        # LAZY IMPORT: Heavy processing only happens here
-        from dataprocessor import process_file
-        from file_manager import update_file_record
+# @app.post("/api/process-file")
+# def process_uploaded_file(filename: str):
+#     try:
+#         # LAZY IMPORT: Heavy processing only happens here
+#         from dataprocessor import process_file
+#         from file_manager import update_file_record
         
-        file_path = RESOURCES_DIR / filename
-        result = process_file(str(file_path))
-        update_file_record(filename, result["chunks_created"])
+#         file_path = RESOURCES_DIR / filename
+#         result = process_file(str(file_path))
+#         update_file_record(filename, result["chunks_created"])
         
-        return {"success": True, "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#         return {"success": True, "result": result}
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/files")
 def get_files():

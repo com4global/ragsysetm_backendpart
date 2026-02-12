@@ -716,8 +716,9 @@ def save_metadata(metadata: Dict):
         json.dump(metadata, f, indent=2)
 
 
-def add_file_record(file_name: str, file_type: str, file_size: int) -> Dict:
-    """Add a new file record"""
+
+def add_file_record(file_name: str, file_type: str, file_size: int, blob_url: str) -> Dict:
+    """Add a new file record with Vercel Blob URL"""
     metadata = load_metadata()
     
     file_record = {
@@ -725,6 +726,7 @@ def add_file_record(file_name: str, file_type: str, file_size: int) -> Dict:
         "file_name": file_name,
         "file_type": file_type,
         "file_size": file_size,
+        "blob_url": blob_url,      # <--- ADDED THIS
         "status": "uploaded",
         "uploaded_at": datetime.now().isoformat(),
         "processed": False,
@@ -733,8 +735,28 @@ def add_file_record(file_name: str, file_type: str, file_size: int) -> Dict:
     
     metadata["files"].append(file_record)
     save_metadata(metadata)
-    
     return file_record
+
+#ADD FILE FOR LOCAL DIRECTORY
+# def add_file_record(file_name: str, file_type: str, file_size: int) -> Dict:
+#     """Add a new file record"""
+#     metadata = load_metadata()
+    
+#     file_record = {
+#         "id": len(metadata["files"]) + 1,
+#         "file_name": file_name,
+#         "file_type": file_type,
+#         "file_size": file_size,
+#         "status": "uploaded",
+#         "uploaded_at": datetime.now().isoformat(),
+#         "processed": False,
+#         "chunks_created": 0
+#     }
+    
+#     metadata["files"].append(file_record)
+#     save_metadata(metadata)
+    
+#     return file_record
 
 
 def update_file_record(file_name: str, chunks_count: int):
