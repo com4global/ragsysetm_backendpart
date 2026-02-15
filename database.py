@@ -1,325 +1,218 @@
-"""
-User Database Manager
-Handles user CRUD operations with secure data isolation
-"""
 
-import sqlite3
-import uuid
-from datetime import datetime
+import os
 from typing import Optional, Dict, List
-from contextlib import contextmanager
-from pathlib import Path
+from datetime import datetime
+from supabase import create_client, Client
+from dotenv import load_dotenv
 
-# This gets the directory where database.py actually lives
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = BASE_DIR / "users.db"
+load_dotenv()
 
-print(f"Database is located at: {DATABASE_PATH}")
-DATABASE_PATH.parent.mkdir(exist_ok=True)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("Warning: SUPABASE_URL or SUPABASE_KEY not found in environment variables.")
+
+# Use service role key if available (bypasses RLS), otherwise anon key
+_effective_key = SUPABASE_SERVICE_KEY or SUPABASE_KEY
+_key_type = "service_role" if SUPABASE_SERVICE_KEY else "anon"
+print(f"Supabase client using {_key_type} key")
+
+try:
+    supabase: Client = create_client(SUPABASE_URL, _effective_key)
+except Exception as e:
+    print(f"Failed to initialize Supabase client: {e}")
+    supabase = None
 
 class UserDatabase:
     def __init__(self):
-        self.db_path = DATABASE_PATH
-        self._initialize_database()
-    
-    @contextmanager
-    def get_connection(self):
-        """Context manager for database connections"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        pass # Client is global
+
+    def _get_client_with_token(self, user_token: str = None):
+        """Get a Supabase client with the user's JWT set for RLS.
+        If using service_role key, token is not needed (RLS bypassed).
+        If using anon key, we need to set the user's JWT for RLS policies.
+        """
+        if _key_type == "service_role" or not user_token:
+            return supabase
+        
+        # For anon key + user token: set the auth header so RLS sees auth.uid()
+        # Create a new client with the user's token
         try:
-            yield conn
-            conn.commit()
+            client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            client.postgrest.auth(user_token)
+            return client
         except Exception as e:
-            conn.rollback()
-            raise e
-        finally:
-            conn.close()
-    
-    def _initialize_database(self):
-        """Create database tables if they don't exist"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Users table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id TEXT PRIMARY KEY,
-                    email TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    full_name TEXT NOT NULL,
-                    company TEXT,
-                    role TEXT DEFAULT 'user',
-                    is_active INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_login TIMESTAMP,
-                    preferences TEXT DEFAULT '{}'
-                )
-            """)
-            
-            # User files table - links files to users
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_files (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL,
-                    filename TEXT NOT NULL,
-                    file_type TEXT,
-                    file_size INTEGER,
-                    chunks_created INTEGER DEFAULT 0,
-                    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    processed BOOLEAN DEFAULT 0,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id),
-                    UNIQUE(user_id, filename)
-                )
-            """)
-            
-            # Chat history table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS chat_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    query TEXT NOT NULL,
-                    response TEXT NOT NULL,
-                    sources TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-            """)
-            
-            # Refresh tokens table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS refresh_tokens (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id TEXT NOT NULL,
-                    token TEXT UNIQUE NOT NULL,
-                    expires_at TIMESTAMP NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-            """)
-            
-            # Create indexes for performance
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_email ON users(email)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_files_user ON user_files(user_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_user_session ON chat_history(user_id, session_id)")
+            print(f"Error creating authenticated client: {e}")
+            return supabase
     
     # User Management
-    def create_user(self, email: str, password_hash: str, full_name: str, 
-                   company: Optional[str] = None) -> Dict:
-        """Create a new user"""
-        user_id = str(uuid.uuid4())
-        
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO users (user_id, email, password_hash, full_name, company)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, email, password_hash, full_name, company))
-        
-        return self.get_user_by_id(user_id)
-    
     def get_user_by_email(self, email: str) -> Optional[Dict]:
-        """Get user by email"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        """Get user by email from profiles table"""
+        try:
+            response = supabase.table('profiles').select("*").eq('email', email).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            print(f"Error getting user by email: {e}")
+            return None
     
     def get_user_by_id(self, user_id: str) -> Optional[Dict]:
         """Get user by ID"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-    
+        try:
+            response = supabase.table('profiles').select("*").eq('id', user_id).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            print(f"Error getting user by id: {e}")
+            return None
+
     def update_last_login(self, user_id: str):
         """Update user's last login timestamp"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE users 
-                SET last_login = CURRENT_TIMESTAMP 
-                WHERE user_id = ?
-            """, (user_id,))
-    
+        try:
+            supabase.table('profiles').update({'last_login': datetime.utcnow().isoformat()}).eq('id', user_id).execute()
+        except Exception as e:
+            print(f"Error updating last login: {e}")
+
     # File Management
-    def add_user_file(self, user_id: str, filename: str, file_type: str, 
-                     file_size: int) -> Dict:
+    def add_user_file(self, user_id: str, filename: str, file_type: str, file_size: int, blob_url: str = None, user_token: str = None) -> Dict:
         """Add a file record for a user"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO user_files (user_id, filename, file_type, file_size)
-                VALUES (?, ?, ?, ?)
-            """, (user_id, filename, file_type, file_size))
-            
-            return {
+        try:
+            data = {
+                "user_id": user_id,
                 "filename": filename,
                 "file_type": file_type,
                 "file_size": file_size,
-                "uploaded_at": datetime.now().isoformat()
+                "uploaded_at": datetime.utcnow().isoformat(),
+                "chunks_created": 0,
+                "processed": False
             }
-    
-    # ✅ FIXED: Move fetchall() inside the context manager
-    def get_user_files(self, user_id: str) -> List[Dict]:
+            # Only include blob_url if the column exists in the table
+            # Note: blob_url column may not exist in schema — skip if None
+            if blob_url:
+                data["blob_url"] = blob_url
+            
+            client = self._get_client_with_token(user_token)
+            # Upsert based on (user_id, filename) unique constraint
+            response = client.table('user_files').upsert(data, on_conflict='user_id, filename').execute()
+            # Return the inserted data
+            return response.data[0] if response.data else data
+        except Exception as e:
+            print(f"Error adding user file: {e}")
+            return {}
+
+    def get_user_files(self, user_id: str, user_token: str = None) -> List[Dict]:
         """Get all files for a specific user"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT 
-                    id,
-                    user_id,
-                    filename as file_name,
-                    file_type,
-                    file_size,
-                    chunks_created,
-                    uploaded_at,
-                    CASE 
-                        WHEN processed = 1 THEN 'completed'
-                        ELSE 'pending'
-                    END as status
-                FROM user_files 
-                WHERE user_id = ? 
-                ORDER BY uploaded_at DESC
-            """, (user_id,))
-            # ✅ Fetch data BEFORE the connection closes
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]  # ✅ Now inside the context
-    
-    def update_file_processed(self, user_id: str, filename: str, chunks_created: int):
+        try:
+            client = self._get_client_with_token(user_token)
+            response = client.table('user_files').select("*").eq('user_id', user_id).order('uploaded_at', desc=True).execute()
+            files = response.data
+            # Map status
+            for f in files:
+                f['status'] = 'completed' if f.get('processed') else 'pending'
+                f['file_name'] = f.get('filename') # Frontend expects file_name
+            return files
+        except Exception as e:
+            print(f"Error getting user files: {e}")
+            return []
+
+    def update_file_processed(self, user_id: str, filename: str, chunks_created: int, user_token: str = None):
         """Mark file as processed"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE user_files 
-                SET processed = 1, chunks_created = ?
-                WHERE user_id = ? AND filename = ?
-            """, (chunks_created, user_id, filename))
-    
-    def delete_user_file(self, user_id: str, filename: str):
+        try:
+            client = self._get_client_with_token(user_token)
+            client.table('user_files').update({
+                'processed': True, 
+                'chunks_created': chunks_created
+            }).eq('user_id', user_id).eq('filename', filename).execute()
+        except Exception as e:
+            print(f"Error updating file status: {e}")
+
+    def delete_user_file(self, user_id: str, filename: str, user_token: str = None):
         """Delete a file record for a user"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                DELETE FROM user_files 
-                WHERE user_id = ? AND filename = ?
-            """, (user_id, filename))
-    
-    def file_belongs_to_user(self, user_id: str, filename: str) -> bool:
+        try:
+            client = self._get_client_with_token(user_token)
+            client.table('user_files').delete().eq('user_id', user_id).eq('filename', filename).execute()
+        except Exception as e:
+            print(f"Error deleting user file: {e}")
+
+    def file_belongs_to_user(self, user_id: str, filename: str, user_token: str = None) -> bool:
         """Check if a file belongs to a user"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COUNT(*) as count FROM user_files 
-                WHERE user_id = ? AND filename = ?
-            """, (user_id, filename))
-            return cursor.fetchone()['count'] > 0
-    
+        try:
+            client = self._get_client_with_token(user_token)
+            response = client.table('user_files').select('id').eq('user_id', user_id).eq('filename', filename).execute()
+            return len(response.data) > 0
+        except Exception:
+            return False
+
     # Chat History
-    def add_chat_message(self, user_id: str, session_id: str, query: str, 
-                        response: str, sources: List[str] = None):
+    def add_chat_message(self, user_id: str, session_id: str, query: str, response: str, sources: List[str] = None, user_token: str = None):
         """Add a chat message to history"""
-        import json
-        sources_json = json.dumps(sources or [])
-        
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO chat_history (user_id, session_id, query, response, sources)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, session_id, query, response, sources_json))
-    
-    def get_chat_history(self, user_id: str, session_id: Optional[str] = None, 
-                        limit: int = 50) -> List[Dict]:
+        try:
+            data = {
+                "user_id": user_id,
+                "session_id": session_id,
+                "query": query,
+                "response": response,
+                "sources": sources or [],
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            client = self._get_client_with_token(user_token)
+            client.table('chat_history').insert(data).execute()
+        except Exception as e:
+            print(f"Error adding chat message: {e}")
+
+    def get_chat_history(self, user_id: str, session_id: Optional[str] = None, limit: int = 50, user_token: str = None) -> List[Dict]:
         """Get chat history for a user"""
-        import json
-        
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
+        try:
+            client = self._get_client_with_token(user_token)
+            query = client.table('chat_history').select("*").eq('user_id', user_id)
             if session_id:
-                cursor.execute("""
-                    SELECT * FROM chat_history 
-                    WHERE user_id = ? AND session_id = ?
-                    ORDER BY timestamp DESC LIMIT ?
-                """, (user_id, session_id, limit))
-            else:
-                cursor.execute("""
-                    SELECT * FROM chat_history 
-                    WHERE user_id = ?
-                    ORDER BY timestamp DESC LIMIT ?
-                """, (user_id, limit))
+                query = query.eq('session_id', session_id)
             
-            # ✅ Fetch inside context manager
-            rows = cursor.fetchall()
-            history = []
-            for row in rows:
-                row_dict = dict(row)
-                row_dict['sources'] = json.loads(row_dict['sources'])
-                history.append(row_dict)
-            
-            return history
-    
-    # Token Management
+            response = query.order('timestamp', desc=True).limit(limit).execute()
+            return response.data
+        except Exception as e:
+            print(f"Error getting chat history: {e}")
+            return []
+
+    # Token Management (Not needed if using Supabase Auth completely, but kept for interface compatibility)
     def save_refresh_token(self, user_id: str, token: str, expires_at: datetime):
-        """Save a refresh token"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO refresh_tokens (user_id, token, expires_at)
-                VALUES (?, ?, ?)
-            """, (user_id, token, expires_at.isoformat()))
-    
+        pass # Supabase handles this
+
     def verify_refresh_token(self, token: str) -> Optional[str]:
-        """Verify refresh token and return user_id"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT user_id FROM refresh_tokens 
-                WHERE token = ? AND expires_at > CURRENT_TIMESTAMP
-            """, (token,))
-            row = cursor.fetchone()
-            return row['user_id'] if row else None
-    
+        return None # Supabase handles this
+
     def revoke_refresh_token(self, token: str):
-        """Revoke a refresh token"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM refresh_tokens WHERE token = ?", (token,))
-    
+        pass # Supabase handles this
+
     # Statistics
-    def get_user_stats(self, user_id: str) -> Dict:
+    def get_user_stats(self, user_id: str, user_token: str = None) -> Dict:
         """Get statistics for a user"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
+        try:
+            client = self._get_client_with_token(user_token)
             
-            # File count
-            cursor.execute("""
-                SELECT COUNT(*) as count FROM user_files WHERE user_id = ?
-            """, (user_id,))
-            file_count = cursor.fetchone()['count']
+            # Count files
+            files_res = client.table('user_files').select('*', count='exact').eq('user_id', user_id).execute()
+            file_count = files_res.count or 0
+
+            # Count chats
+            chats_res = client.table('chat_history').select('*', count='exact').eq('user_id', user_id).execute()
+            chat_count = chats_res.count or 0
             
-            # Chat count
-            cursor.execute("""
-                SELECT COUNT(*) as count FROM chat_history WHERE user_id = ?
-            """, (user_id,))
-            chat_count = cursor.fetchone()['count']
-            
-            # Total chunks
-            cursor.execute("""
-                SELECT COALESCE(SUM(chunks_created), 0) as total 
-                FROM user_files WHERE user_id = ?
-            """, (user_id,))
-            total_chunks = cursor.fetchone()['total']
-            
+            files_data = files_res.data
+            total_chunks = sum(f.get('chunks_created', 0) for f in files_data) if files_data else 0
+            total_size = sum(f.get('file_size', 0) for f in files_data) if files_data else 0
+
             return {
                 "total_files": file_count,
+                "processed_files": sum(1 for f in files_data if f.get('processed')) if files_data else 0,
                 "total_chats": chat_count,
-                "total_chunks": total_chunks
+                "total_chunks": total_chunks,
+                "total_size_bytes": total_size,
+                "files_this_week": 0
             }
+        except Exception as e:
+            print(f"Error getting stats: {e}")
+            return {"total_files": 0, "processed_files": 0, "total_chats": 0, "total_chunks": 0, "total_size_bytes": 0, "files_this_week": 0}
 
 # Global instance
 user_db = UserDatabase()

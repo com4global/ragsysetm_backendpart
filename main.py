@@ -26,485 +26,65 @@ Production-ready API with user isolation and security
 # from fastapi.staticfiles import StaticFiles
 # from datetime import datetime, timedelta
 # import uuid
-
-# # Import authentication modules
-# from Auth import (
-#     UserCreate, UserLogin, Token, TokenData, User,
-#     verify_password, get_password_hash,
-#     create_access_token, create_refresh_token,
-#     get_current_user, verify_refresh_token
-# )
-# from database import user_db
-
-# app = FastAPI(title="RAG.AI Enterprise API", version="2.0.0")
-
-# # CORS Configuration
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["https://documentperser-frontend-cwd4.vercel.app/", "https://documentperser-frontend-cwd4.vercel.app"],  # Update for production
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# # File storage
-# RESOURCES_DIR = Path("./resources")
-# RESOURCES_DIR.mkdir(exist_ok=True)
-# app.mount("/static_files", StaticFiles(directory=str(RESOURCES_DIR)), name="static")
-
-# # ==================== MODELS ====================
-
-# class QueryRequest(BaseModel):
-#     query: str
-#     session_id: Optional[str] = None
-
-# # ✅ FLEXIBLE SOURCE MODEL - handles both string and dict sources
-# class QueryResponse(BaseModel):
-#     response: str
-#     query: str
-#     sources: List[Dict[str, Any]] = []  # ✅ Changed to flexible dict
-#     session_id: str
-
-# class RefreshTokenRequest(BaseModel):
-#     refresh_token: str
-
-# class FileResponse(BaseModel):
-#     filename: str
-#     file_type: str
-#     file_size: int
-#     chunks_created: int = 0
-#     uploaded_at: str
-#     processed: bool = False
-
-# # ==================== AUTHENTICATION ENDPOINTS ====================
-
-# @app.post("/api/auth/register", response_model=Token, status_code=status.HTTP_201_CREATED)
-# async def register(user_data: UserCreate):
-#     """Register a new user"""
-#     # Check if user already exists
-#     existing_user = user_db.get_user_by_email(user_data.email)
-#     if existing_user:
-#         raise HTTPException(
-#             status_code=status.HTTP_400_BAD_REQUEST,
-#             detail="Email already registered"
-#         )
-    
-#     # Hash password and create user
-#     password_hash = get_password_hash(user_data.password)
-#     user = user_db.create_user(
-#         email=user_data.email,
-#         password_hash=password_hash,
-#         full_name=user_data.full_name,
-#         company=user_data.company
-#     )
-    
-#     # Create tokens
-#     token_data = {"user_id": user["user_id"], "email": user["email"]}
-#     access_token = create_access_token(token_data)
-#     refresh_token = create_refresh_token(token_data)
-    
-#     # Save refresh token
-#     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-#     user_db.save_refresh_token(user["user_id"], refresh_token, expires_at)
-    
-#     return Token(
-#         access_token=access_token,
-#         refresh_token=refresh_token
-#     )
-
-# @app.post("/api/auth/login", response_model=Token)
-# async def login(credentials: UserLogin):
-#     """Login user and return tokens"""
-#     # Get user
-#     user = user_db.get_user_by_email(credentials.email)
-#     if not user:
-#         raise HTTPException(
-#             status_code=status.HTTP_401_UNAUTHORIZED,
-#             detail="Invalid email or password"
-#         )
-    
-#     # Verify password
-#     if not verify_password(credentials.password, user["password_hash"]):
-#         raise HTTPException(
-#             status_code=status.HTTP_401_UNAUTHORIZED,
-#             detail="Invalid email or password"
-#         )
-    
-#     # Check if user is active
-#     if not user["is_active"]:
-#         raise HTTPException(
-#             status_code=status.HTTP_403_FORBIDDEN,
-#             detail="Account is disabled"
-#         )
-    
-#     # Update last login
-#     user_db.update_last_login(user["user_id"])
-    
-#     # Create tokens
-#     token_data = {"user_id": user["user_id"], "email": user["email"]}
-#     access_token = create_access_token(token_data)
-#     refresh_token = create_refresh_token(token_data)
-    
-#     # Save refresh token
-#     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-#     user_db.save_refresh_token(user["user_id"], refresh_token, expires_at)
-    
-#     return Token(
-#         access_token=access_token,
-#         refresh_token=refresh_token
-#     )
-
-# @app.post("/api/auth/refresh", response_model=Token)
-# async def refresh_access_token(request: RefreshTokenRequest):
-#     """Refresh access token using refresh token"""
-#     try:
-#         token_data = verify_refresh_token(request.refresh_token)
-        
-#         # Verify token in database
-#         user_id = user_db.verify_refresh_token(request.refresh_token)
-#         if not user_id or user_id != token_data.user_id:
-#             raise HTTPException(
-#                 status_code=status.HTTP_401_UNAUTHORIZED,
-#                 detail="Invalid refresh token"
-#             )
-        
-#         # Create new access token
-#         new_token_data = {"user_id": token_data.user_id, "email": token_data.email}
-#         access_token = create_access_token(new_token_data)
-        
-#         return Token(
-#             access_token=access_token,
-#             refresh_token=request.refresh_token
-#         )
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=status.HTTP_401_UNAUTHORIZED,
-#             detail="Invalid refresh token"
-#         )
-
-# @app.post("/api/auth/logout")
-# async def logout(
-#     refresh_token: str,
-#     current_user: TokenData = Depends(get_current_user)
-# ):
-#     """Logout user by revoking refresh token"""
-#     user_db.revoke_refresh_token(refresh_token)
-#     return {"message": "Successfully logged out"}
-
-# @app.get("/api/auth/me")
-# async def get_current_user_info(current_user: TokenData = Depends(get_current_user)):
-#     """Get current user information"""
-#     user = user_db.get_user_by_id(current_user.user_id)
-#     if not user:
-#         raise HTTPException(
-#             status_code=status.HTTP_404_NOT_FOUND,
-#             detail="User not found"
-#         )
-    
-#     # Remove sensitive data
-#     user.pop("password_hash", None)
-    
-#     # Add statistics
-#     stats = user_db.get_user_stats(current_user.user_id)
-#     user.update(stats)
-    
-#     return user
-
-# # ==================== FILE MANAGEMENT ENDPOINTS ====================
-
-# @app.post("/api/upload")
-# async def upload_file(
-#     file: UploadFile = File(...),
-#     current_user: TokenData = Depends(get_current_user)
-# ):
-#     """Upload file for authenticated user"""
-#     try:
-#         from file_processor import get_supported_formats, get_file_type
-        
-#         file_ext = Path(file.filename).suffix.lower()
-#         supported = get_supported_formats()
-#         media_exts = ['.mp4', '.avi', '.mov', '.mp3', '.wav', '.jpg', '.png', '.jpeg', '.gif']
-        
-#         if file_ext not in supported and file_ext not in media_exts:
-#             raise HTTPException(
-#                 status_code=400, 
-#                 detail=f"Unsupported format: {file_ext}"
-#             )
-        
-#         # Create user-specific directory
-#         user_dir = RESOURCES_DIR / current_user.user_id
-#         user_dir.mkdir(exist_ok=True)
-        
-#         # Save file with user isolation
-#         file_path = user_dir / file.filename
-#         with open(file_path, "wb") as buffer:
-#             shutil.copyfileobj(file.file, buffer)
-        
-#         file_size = file_path.stat().st_size
-#         file_type = get_file_type(str(file_path)) if file_ext in supported else "Media"
-        
-#         # Add to user's file records
-#         file_record = user_db.add_user_file(
-#             user_id=current_user.user_id,
-#             filename=file.filename,
-#             file_type=file_type,
-#             file_size=file_size
-#         )
-        
-#         return {"success": True, "file": file_record}
-    
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# @app.post("/api/process-file")
-# async def process_file(
-#     filename: str,
-#     current_user: TokenData = Depends(get_current_user)
-# ):
-#     """Process uploaded file for authenticated user"""
-#     try:
-#         # Verify file belongs to user
-#         if not user_db.file_belongs_to_user(current_user.user_id, filename):
-#             raise HTTPException(
-#                 status_code=status.HTTP_403_FORBIDDEN,
-#                 detail="Access denied to this file"
-#             )
-        
-#         from dataprocessor import process_file
-        
-#         # Process file from user's directory
-#         user_dir = RESOURCES_DIR / current_user.user_id
-#         file_path = user_dir / filename
-        
-#         if not file_path.exists():
-#             raise HTTPException(
-#                 status_code=status.HTTP_404_NOT_FOUND,
-#                 detail="File not found"
-#             )
-        
-#         # Process with user_id context for isolation
-#         result = process_file(str(file_path), user_id=current_user.user_id)
-        
-#         # Update file record
-#         user_db.update_file_processed(
-#             user_id=current_user.user_id,
-#             filename=filename,
-#             chunks_created=result["chunks_created"]
-#         )
-        
-#         return {"success": True, "result": result}
-    
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
-# @app.get("/api/files")
-# async def get_user_files(current_user: TokenData = Depends(get_current_user)):
-#     """Get all files for authenticated user"""
-#     try:
-#         print(f"🔍 Fetching files for user: {current_user.user_id}")
-#         files = user_db.get_user_files(current_user.user_id)
-#         print(f"✅ Files retrieved: {len(files)}")
-        
-#         stats = user_db.get_user_stats(current_user.user_id)
-#         print(f"✅ Stats retrieved: {stats}")
-        
-#         return {"files": files, "stats": stats}
-#     except Exception as e:
-#         print(f"❌ Error in get_user_files: {str(e)}")
-#         print(f"❌ Error type: {type(e).__name__}")
-#         import traceback
-#         traceback.print_exc()
-#         raise HTTPException(status_code=500, detail=str(e))
-# # @app.get("/api/files")
-# # async def get_user_files(current_user: TokenData = Depends(get_current_user)):
-# #     """Get all files for authenticated user"""
-# #     files = user_db.get_user_files(current_user.user_id)
-# #     stats = user_db.get_user_stats(current_user.user_id)
-    
-# #     return {"files": files, "stats": stats}
-
-# @app.delete("/api/files/{filename}")
-# async def delete_file(
-#     filename: str,
-#     current_user: TokenData = Depends(get_current_user)
-# ):
-#     """Delete file for authenticated user"""
-#     try:
-#         # Verify file belongs to user
-#         if not user_db.file_belongs_to_user(current_user.user_id, filename):
-#             raise HTTPException(
-#                 status_code=status.HTTP_403_FORBIDDEN,
-#                 detail="Access denied to this file"
-#             )
-        
-#         # Delete physical file
-#         user_dir = RESOURCES_DIR / current_user.user_id
-#         file_path = user_dir / filename
-#         if file_path.exists():
-#             file_path.unlink()
-        
-#         # Delete from database
-#         user_db.delete_user_file(current_user.user_id, filename)
-        
-#         # Delete from vector store (you'll need to implement this)
-#         from dataprocessor import delete_user_file_vectors
-#         delete_user_file_vectors(current_user.user_id, filename)
-        
-#         return {"success": True, "message": "File deleted"}
-    
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# # ==================== CHAT ENDPOINTS ====================
-
-# @app.post("/chat", response_model=QueryResponse)
-# async def chat(
-#     request: QueryRequest,
-#     current_user: TokenData = Depends(get_current_user)
-# ):
-#     """Chat endpoint with user-specific context"""
-#     try:
-#         from QueryProcessor import process_user_query
-        
-#         # Generate session ID if not provided
-#         session_id = request.session_id or str(uuid.uuid4())
-        
-#         # Process query with user context for data isolation
-#         result = process_user_query(
-#             query=request.query,
-#             user_id=current_user.user_id
-#         )
-        
-#         # Save to chat history
-#         user_db.add_chat_message(
-#             user_id=current_user.user_id,
-#             session_id=session_id,
-#             query=request.query,
-#             response=result["answer"],
-#             sources=result.get("sources", [])
-#         )
-        
-#         return QueryResponse(
-#             response=result["answer"],
-#             query=request.query,
-#             sources=result.get("sources", []),
-#             session_id=session_id
-#         )
-    
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# @app.get("/api/chat/history")
-# async def get_chat_history(
-#     session_id: Optional[str] = None,
-#     limit: int = 50,
-#     current_user: TokenData = Depends(get_current_user)
-# ):
-#     """Get chat history for authenticated user"""
-#     history = user_db.get_chat_history(
-#         user_id=current_user.user_id,
-#         session_id=session_id,
-#         limit=limit
-#     )
-#     return {"history": history}
-
-# ==================== MEDIA PROCESSING ENDPOINTS ====================
-
-# @app.post("/api/process-video-file")
-# async def process_video(
-#     filename: str,
-#     current_user: TokenData = Depends(get_current_user)
-# ):
-#     """Process video file for authenticated user"""
-#     if not user_db.file_belongs_to_user(current_user.user_id, filename):
-#         raise HTTPException(
-#             status_code=status.HTTP_403_FORBIDDEN,
-#             detail="Access denied to this file"
-#         )
-    
-#     # Implement your video processing logic with user_id context
-#     # ...
-#     return {"success": True, "message": "Video processing started"}
-
-# @app.post("/api/process-audio-file")
-# async def process_audio(
-#     filename: str,
-#     current_user: TokenData = Depends(get_current_user)
-# ):
-#     """Process audio file for authenticated user"""
-#     if not user_db.file_belongs_to_user(current_user.user_id, filename):
-#         raise HTTPException(
-#             status_code=status.HTTP_403_FORBIDDEN,
-#             detail="Access denied to this file"
-#         )
-    
-#     # Implement your audio processing logic with user_id context
-#     # ...
-#     return {"success": True, "message": "Audio processing started"}
-
-# @app.post("/api/process-image-file")
-# async def process_image(
-#     filename: str,
-#     current_user: TokenData = Depends(get_current_user)
-# ):
-#     """Process image file for authenticated user"""
-#     if not user_db.file_belongs_to_user(current_user.user_id, filename):
-#         raise HTTPException(
-#             status_code=status.HTTP_403_FORBIDDEN,
-#             detail="Access denied to this file"
-#         )
-    
-#     # Implement your image processing logic with user_id context
-#     # ...
-#     return {"success": True, "message": "Image processing started"}
-
-# ==================== HEALTH CHECK ====================
-
-# @app.get("/")
-# def read_root():
-#     return {
-#         "message": "RAG.AI Enterprise API v2.0",
-#         "status": "operational",
-#         "features": ["authentication", "user_isolation", "file_management", "chat"]
-#     }
-
-# @app.get("/health")
-# def health_check():
-#     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
-
-# if __name__ == "__main__":
-#     import uvicorn
-#     port = int(os.environ.get("PORT", 10000))
-#     uvicorn.run(app, host="0.0.0.0", port=port)
-
-
-
-#without token
-
-
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
 import os
 import shutil
-from pathlib import Path
+import uuid
+import logging
+import uvicorn
 import requests
+from pathlib import Path
+from contextlib import asynccontextmanager
+from bs4 import BeautifulSoup
+from youtube_transcript_api import YouTubeTranscriptApi
+import re
 
-from fastapi.staticfiles import StaticFiles
+# Local modules
+from database import user_db, supabase
+from Auth import get_current_user, User
+# from Auth import (
+#     Token, UserCreate, UserLogin, 
+#     create_access_token, create_refresh_token, 
+#     verify_password, get_password_hash,
+#     verify_token, verify_refresh_token
+# )
+# from services.file_manager import FileManager
+# from services.dataprocessor import DataProcessor
+# from services.vectorstore import VectorStore
+# from services.chat_service import ChatService # If you have one
 
-app = FastAPI()
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Enable CORS
+# Constants
+UPLOAD_DIR = "uploads"
+PROCESSED_DIR = "processed"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(PROCESSED_DIR, exist_ok=True)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting up...")
+    yield
+    # Shutdown
+    logger.info("Shutting down...")
+
+app = FastAPI(title="RAG HR Assistant", version="2.0", lifespan=lifespan)
+
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "https://ragsysetm-backendpart.onrender.com"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -512,693 +92,364 @@ app.add_middleware(
 
 RESOURCES_DIR = Path("./resources")
 RESOURCES_DIR.mkdir(exist_ok=True)
-#app.mount("/static_files", StaticFiles(directory=str(RESOURCES_DIR)), name="static")
-# NEW: Schema for the metadata the frontend will send
+
+# === Models ===
 class FileMetadataRequest(BaseModel):
     file_name: str
     file_type: str
     file_size: int
     blob_url: str
+
 class QueryRequest(BaseModel):
     query: str
+    session_id: Optional[str] = None
 
 class QueryResponse(BaseModel):
     response: str
     query: str
-    sources: list = []
+    sources: List[Dict[str, Any]] = []
+    session_id: Optional[str] = None
+
+# === Endpoints ===
 
 @app.get("/")
 def read_root():
-    return {"message": "HR Assistant RAG API (Memory Optimized) is running"}
-
+    return {
+        "message": "RAG HR Assistant API v3.0 (Secure)",
+        "status": "operational",
+        "features": ["authentication", "user_isolation", "file_management", "chat"]
+    }
 
 @app.post("/api/record-metadata")
-async def record_metadata(request: FileMetadataRequest):
+async def record_metadata(request: FileMetadataRequest, current_user: User = Depends(get_current_user)):
+    """Record file metadata in Supabase after frontend uploads to Vercel Blob"""
     try:
-        from file_manager import add_file_record
-        file_record = add_file_record(
-            request.file_name, 
-            request.file_type, 
-            request.file_size, 
-            request.blob_url
+        file_record = user_db.add_user_file(
+            user_id=current_user.id,
+            filename=request.file_name,
+            file_type=request.file_type,
+            file_size=request.file_size,
+            blob_url=request.blob_url,
+            user_token=current_user.access_token
         )
         return {"success": True, "file": file_record}
     except Exception as e:
+        logger.error(f"Error recording metadata: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/upload")
+async def upload_file_endpoint(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+    """Upload a file via multipart/form-data, save locally, and record metadata"""
+    try:
+        from datetime import datetime
+        logger.info(f"📤 Upload started: {file.filename} by user {current_user.id}")
+        
+        # 1. Save file to local storage (resources directory root)
+        RESOURCES_DIR.mkdir(parents=True, exist_ok=True)
+        local_path = RESOURCES_DIR / file.filename
+        
+        with open(local_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        file_size = len(content)
+        logger.info(f"📤 File saved: {local_path} ({file_size} bytes)")
+        
+        # 2. Record metadata in local .file_metadata.json
+        existing_files = _read_local_file_metadata()
+        # Remove existing entry for same filename (update)
+        existing_files = [f for f in existing_files if f.get('filename') != file.filename and f.get('file_name') != file.filename]
+        existing_files.append({
+            "filename": file.filename,
+            "file_name": file.filename,
+            "file_type": file.content_type or 'application/octet-stream',
+            "file_size": file_size,
+            "chunks_created": 0,
+            "processed": False,
+            "status": "pending",
+            "uploaded_at": datetime.utcnow().isoformat(),
+        })
+        _save_local_file_metadata(existing_files)
+        logger.info(f"📤 Metadata saved locally for {file.filename}")
+        
+        # 3. Also try to record in Supabase (best effort)
+        try:
+            user_db.add_user_file(
+                user_id=current_user.id,
+                filename=file.filename,
+                file_type=file.content_type or 'application/octet-stream',
+                file_size=file_size,
+                blob_url=None,
+                user_token=current_user.access_token
+            )
+        except Exception as e:
+            logger.warning(f"Supabase metadata record failed (local OK): {e}")
+        
+        return {
+            "success": True,
+            "file_name": file.filename,
+            "filename": file.filename,
+            "file_size": file_size,
+            "file_type": file.content_type,
+            "message": f"File {file.filename} uploaded successfully"
+        }
+    except Exception as e:
+        logger.error(f"Error uploading file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/process-file")
-def process_uploaded_file(filename: str):
+async def process_file_endpoint(filename: str, current_user: User = Depends(get_current_user)):
+    """Process a file for RAG — uses local metadata and file storage"""
     try:
         from dataprocessor import process_file
-        from file_manager import update_file_record, get_file_by_name
         
-        # 1. Look up the file record to get the URL
-        file_info = get_file_by_name(filename)
-        if not file_info or "blob_url" not in file_info:
-            raise HTTPException(status_code=404, detail="File URL not found")
+        logger.info(f"⚙️ Processing file: {filename} for user {current_user.id}")
+        
+        # 1. Check local metadata for the file
+        existing_files = _read_local_file_metadata()
+        file_meta = next(
+            (f for f in existing_files if f.get('filename') == filename or f.get('file_name') == filename), 
+            None
+        )
+        
+        if not file_meta:
+            raise HTTPException(status_code=404, detail="File metadata not found")
 
-        # 2. Download from Vercel Blob to a temporary local file
-        temp_path = RESOURCES_DIR / filename
-        response = requests.get(file_info["blob_url"], stream=True)
-        if response.status_code == 200:
-            with open(temp_path, "wb") as f:
-                f.write(response.content)
-        else:
-            raise Exception("Failed to download file from Vercel Blob")
+        # 2. Resolve file path — check resources root first, then user subdirectory
+        local_path = RESOURCES_DIR / filename
+        if not local_path.exists():
+            user_temp_dir = RESOURCES_DIR / current_user.id
+            local_path = user_temp_dir / filename
         
-        # 3. Process the local temp file for RAG
-        result = process_file(str(temp_path))
-        update_file_record(filename, result["chunks_created"])
+        if not local_path.exists():
+            raise HTTPException(status_code=404, detail=f"File {filename} not found on disk")
         
-        # 4. Cleanup: Remove the local file after processing to save disk space
-        if temp_path.exists():
-            os.remove(temp_path)
+        logger.info(f"⚙️ File found at: {local_path}")
+        
+        # 3. Process and Index with User Isolation
+        result = process_file(str(local_path), user_id=current_user.id)
+        
+        # 4. Update local metadata
+        for f in existing_files:
+            if f.get('filename') == filename or f.get('file_name') == filename:
+                f['processed'] = True
+                f['status'] = 'completed'
+                f['chunks_created'] = result.get("chunks_created", 0)
+                break
+        _save_local_file_metadata(existing_files)
+        logger.info(f"⚙️ Local metadata updated for {filename}: {result.get('chunks_created', 0)} chunks")
+        
+        # 5. Also try to update Supabase (best effort)
+        try:
+            user_db.update_file_processed(
+                user_id=current_user.id,
+                filename=filename,
+                chunks_created=result["chunks_created"],
+                user_token=current_user.access_token
+            )
+        except Exception as e:
+            logger.warning(f"Supabase update failed (local OK): {e}")
             
         return {"success": True, "result": result}
+    except HTTPException:
+        raise
     except Exception as e:
-        if temp_path.exists(): os.remove(temp_path) # Cleanup on error
+        logger.error(f"Error processing file {filename}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/chat")
-def chat(request: QueryRequest):
+@app.post("/chat", response_model=QueryResponse)
+async def chat_endpoint(request: QueryRequest, current_user: User = Depends(get_current_user)):
+    """Process user query with authenticated session and data isolation"""
     try:
-        # LAZY IMPORT: Only loads when someone chats
         from QueryProcessor import process_user_query
-        result = process_user_query(request.query)
+        
+        session_id = request.session_id or str(uuid.uuid4())
+        
+        # Process with user-specific context
+        result = process_user_query(request.query, user_id=current_user.id)
+        
+        # Save to history
+        user_db.add_chat_message(
+            user_id=current_user.id,
+            session_id=session_id,
+            query=request.query,
+            response=result["answer"],
+            sources=result.get("sources", []),
+            user_token=current_user.access_token
+        )
         
         return QueryResponse(
-            response=result["answer"], 
+            response=result["answer"],
             query=request.query,
-            sources=result.get("sources", [])
+            sources=result.get("sources", []),
+            session_id=session_id
         )
     except Exception as e:
-        return {"error": str(e), "query": request.query}
+        logger.error(f"Chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# @app.post("/api/upload")
-# async def upload_file(file: UploadFile = File(...)):
-#     try:
-#         # LAZY IMPORT: For supported formats
-#         from file_processor import get_supported_formats, get_file_type
-#         from file_manager import add_file_record
-
-#         file_ext = Path(file.filename).suffix.lower()
-#         supported = get_supported_formats()
+def _read_local_file_metadata():
+    """Read file metadata from local .file_metadata.json"""
+    import json as _json
+    metadata_path = RESOURCES_DIR / ".file_metadata.json"
+    if not metadata_path.exists():
+        return []
+    
+    try:
+        with open(metadata_path, "r") as f:
+            metadata = _json.load(f)
         
-#         # Add media formats manually to avoid loading heavy processors here
-#         media_exts = ['.mp4', '.avi', '.mov', '.mp3', '.wav', '.jpg', '.png']
-        
-#         if file_ext not in supported and file_ext not in media_exts:
-#             raise HTTPException(status_code=400, detail="Unsupported format")
-
-#         file_path = RESOURCES_DIR / file.filename
-#         with open(file_path, "wb") as buffer:
-#             shutil.copyfileobj(file.file, buffer)
+        files = []
+        for file_meta in metadata.get("files", []):
+            filename = file_meta.get("file_name", "")
+            if not filename:
+                continue
             
-#         file_size = file_path.stat().st_size
-#         file_type = get_file_type(str(file_path)) if file_ext in supported else "Media"
+            # Get actual file size from disk
+            file_path = RESOURCES_DIR / filename
+            file_size = int(file_path.stat().st_size) if file_path.exists() else file_meta.get("file_size", 0)
+            
+            files.append({
+                "filename": filename,
+                "file_name": filename,
+                "file_type": file_meta.get("file_type", "document"),
+                "file_size": file_size,
+                "chunks_created": file_meta.get("chunks_created", 0),
+                "processed": file_meta.get("processed", False),
+                "status": "completed" if file_meta.get("processed") else "pending",
+                "uploaded_at": file_meta.get("uploaded_at", ""),
+            })
         
-#         file_record = add_file_record(file.filename, file_type, file_size)
-#         return {"success": True, "file": file_record}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
+        return files
+    except Exception as e:
+        logger.error(f"Error reading local file metadata: {e}")
+        return []
 
-# @app.post("/api/process-file")
-# def process_uploaded_file(filename: str):
-#     try:
-#         # LAZY IMPORT: Heavy processing only happens here
-#         from dataprocessor import process_file
-#         from file_manager import update_file_record
-        
-#         file_path = RESOURCES_DIR / filename
-#         result = process_file(str(file_path))
-#         update_file_record(filename, result["chunks_created"])
-        
-#         return {"success": True, "result": result}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
+def _save_local_file_metadata(files_list):
+    """Save file metadata to local .file_metadata.json"""
+    import json as _json
+    metadata_path = RESOURCES_DIR / ".file_metadata.json"
+    
+    # Convert to storage format
+    storage_files = []
+    for i, f in enumerate(files_list):
+        storage_files.append({
+            "id": i + 1,
+            "file_name": f.get("filename") or f.get("file_name", ""),
+            "file_type": f.get("file_type", "document"),
+            "file_size": f.get("file_size", 0),
+            "chunks_created": f.get("chunks_created", 0),
+            "processed": f.get("processed", False),
+            "uploaded_at": f.get("uploaded_at", ""),
+        })
+    
+    try:
+        with open(metadata_path, "w") as fp:
+            _json.dump({"files": storage_files}, fp, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving local file metadata: {e}")
 
 @app.get("/api/files")
-def get_files():
-    # File manager is lightweight, but we still import locally for consistency
-    from file_manager import get_all_files, get_file_stats
-    return {"files": get_all_files(), "stats": get_file_stats()}
-
-
-@app.delete("/api/files/{filename}/chunks")
-def remove_file_chunks(filename: str):
-    """Remove all vector DB chunks for this file. File record is reset to pending."""
+async def list_files_endpoint(current_user: User = Depends(get_current_user)):
+    """List all files and stats for authenticated user"""
     try:
-        from file_manager import reset_file_chunks, get_file_by_name
-        if get_file_by_name(filename) is None:
-            raise HTTPException(status_code=404, detail="File not found")
-        deleted = 0
+        logger.info(f"📂 /api/files called by user_id={current_user.id}, email={current_user.email}")
+        
+        # Read from local .file_metadata.json (primary source)
+        files = _read_local_file_metadata()
+        logger.info(f"📂 Read {len(files)} files from local metadata")
+        
+        # Disable Supabase fallback to ensure local files are displayed
+        # user_db.get_user_files() logic removed to prevent overwriting
+        pass
+        
+        # Build stats from the files we have
+        total_files = len(files)
+        processed_files = sum(1 for f in files if f.get('processed'))
+        total_chunks = sum(f.get('chunks_created', 0) for f in files)
+        total_size = sum(f.get('file_size', 0) for f in files)
+        
+        stats = {
+            "total_files": total_files,
+            "processed_files": processed_files,
+            "total_chats": 0,
+            "total_chunks": total_chunks,
+            "total_size_bytes": total_size,
+            "files_this_week": 0
+        }
+        
+        # Try to get chat count from Supabase
         try:
-            from vectorstore import delete_vectors_by_doc_name
-            deleted = delete_vectors_by_doc_name(filename)
-        except (ImportError, ModuleNotFoundError) as e:
-            raise HTTPException(status_code=503, detail="Pinecone not available. Install: pip install pinecone")
-        reset_file_chunks(filename)
-        return {"success": True, "message": f"Removed {deleted} chunks from DB", "deleted_count": deleted}
-    except HTTPException:
-        raise
+            supabase_stats = user_db.get_user_stats(current_user.id, user_token=current_user.access_token)
+            stats["total_chats"] = supabase_stats.get("total_chats", 0)
+        except Exception:
+            pass
+        
+        logger.info(f"📂 Found {len(files)} files, stats={stats}")
+        return {"files": files, "stats": stats}
     except Exception as e:
+        logger.error(f"Error listing files: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.delete("/api/files/{filename}")
-def delete_file(filename: str):
-    """Delete file from disk, metadata, and remove its chunks from the vector DB."""
-    return _do_delete_file(filename)
-
-
-@app.delete("/api/files")
-def delete_file_by_query(filename: str = Query(..., alias="filename")):
-    """Delete file by query param (alternative for clients that prefer ?filename=)."""
-    return _do_delete_file(filename)
-
-
-def _do_delete_file(filename: str):
-    """Shared delete logic."""
+async def delete_file_endpoint(filename: str, current_user: User = Depends(get_current_user)):
+    """Delete file record, disk file, and chunks for authenticated user"""
     try:
-        from file_manager import delete_file_record, get_file_by_name
-        if get_file_by_name(filename) is None:
-            raise HTTPException(status_code=404, detail="File not found")
-        file_path = RESOURCES_DIR / filename
-        if file_path.exists():
-            file_path.unlink()
-        deleted = 0
+        logger.info(f"🗑️ Delete requested: {filename} by user {current_user.id}")
+        
+        # 1. Check local metadata for the file
+        existing_files = _read_local_file_metadata()
+        file_found = any(
+            f.get('filename') == filename or f.get('file_name') == filename 
+            for f in existing_files
+        )
+        
+        if not file_found:
+            raise HTTPException(status_code=404, detail=f"File {filename} not found")
+        
+        # 2. Remove from local .file_metadata.json
+        updated_files = [
+            f for f in existing_files 
+            if f.get('filename') != filename and f.get('file_name') != filename
+        ]
+        _save_local_file_metadata(updated_files)
+        logger.info(f"🗑️ Removed {filename} from local metadata")
+        
+        # 3. Delete physical file from disk
+        local_path = RESOURCES_DIR / filename
+        if local_path.exists():
+            local_path.unlink()
+            logger.info(f"🗑️ Deleted file from disk: {local_path}")
+        
+        # 4. Delete vectors from Pinecone (best effort)
         try:
-            from vectorstore import delete_vectors_by_doc_name
-            deleted = delete_vectors_by_doc_name(filename)
-        except (ImportError, ModuleNotFoundError) as e:
-            print(f"⚠️ Pinecone not available, skipping vector cleanup: {e}")
-        delete_file_record(filename)
-        return {"success": True, "message": "File and its chunks deleted", "deleted_chunks": deleted}
+            from dataprocessor import delete_user_file_vectors
+            delete_user_file_vectors(current_user.id, filename)
+        except Exception as ve:
+            logger.warning(f"Vector deletion failed (non-critical): {ve}")
+            
+        # 5. Delete from Supabase (best effort)
+        try:
+            user_db.delete_user_file(current_user.id, filename, user_token=current_user.access_token)
+        except Exception as e:
+            logger.warning(f"Supabase deletion failed (non-critical): {e}")
+        
+        return {"success": True, "message": f"File {filename} deleted successfully"}
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Error deleting file {filename}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/chat/history")
+async def history_endpoint(session_id: Optional[str] = None, current_user: User = Depends(get_current_user)):
+    """Get chat history for authenticated user"""
+    try:
+        history = user_db.get_chat_history(user_id=current_user.id, session_id=session_id, user_token=current_user.access_token)
+        return {"history": history}
+    except Exception as e:
+        logger.error(f"History error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-
-#original main.py
-# from fastapi import FastAPI, File, UploadFile, HTTPException
-# from fastapi.middleware.cors import CORSMiddleware
-# from pydantic import BaseModel
-# from QueryProcessor import process_user_query
-# from file_manager import add_file_record, get_all_files, get_file_stats, update_file_record
-# from dataprocessor import process_file
-# from file_processor import get_supported_formats
-# import os
-# import shutil
-# from pathlib import Path
-# from fastapi.staticfiles import StaticFiles
-# # from video_processor import process_video
-# # from youtube_processor import process_youtube_link
-# # from image_processor import process_single_image
-# # from audio_processor import process_audio as process_audio_file
-# import os
-
-
-# app = FastAPI()
-
-
-# # Enable CORS for React frontend
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# RESOURCES_DIR = Path("./resources")
-# RESOURCES_DIR.mkdir(exist_ok=True)
-# current_dir = os.path.dirname(os.path.abspath(__file__))
-# resources_path = os.path.join(current_dir, "resources")
-# app.mount("/static_files", StaticFiles(directory=resources_path), name="static")
-
-# class QueryRequest(BaseModel):
-#     query: str
-
-# class QueryResponse(BaseModel):
-#     response: str
-#     query: str
-#     sources: list = [] # Add this field
-
-# @app.get("/")
-# def read_root():
-#     return {"message": "HR Assistant RAG API is running"}
-
-# # @app.post("/chat")
-# # def chat(request: QueryRequest):
-# #     """
-# #     Process user query through the RAG pipeline
-# #     """
-# #     # ============== DEBUGGING OUTPUT ===============
-# #     print("\n" + "="*70)
-# #     print("🔴 CHAT ENDPOINT HIT!")
-# #     print("="*70)
-# #     print(f"📥 RECEIVED REQUEST")
-# #     print(f"   Type: {type(request)}")
-# #     print(f"   Query: {request.query}")
-# #     print(f"   Query Length: {len(request.query)}")
-# #     print("-"*70)
-    
-# #     try:
-# #         print(f"\n🔄 STEP 1: Processing query...")
-# #         print(f"   Calling: process_user_query('{request.query}')")
-        
-# #         response = process_user_query(request.query)
-        
-# #         print(f"\n✅ STEP 2: Response received from LLM")
-# #         print(f"   Type: {type(response)}")
-# #         print(f"   Length: {len(str(response))}")
-# #         print(f"   Content: {response[:100]}..." if len(str(response)) > 100 else f"   Content: {response}")
-        
-# #         print(f"\n📤 RETURNING RESPONSE")
-# #         print(f"   Status: SUCCESS")
-# #         print("="*70 + "\n")
-        
-# #         return QueryResponse(response=response, query=request.query)
-        
-# #     except Exception as e:
-# #         print(f"\n❌ ERROR OCCURRED")
-# #         print(f"   Error Type: {type(e).__name__}")
-# #         print(f"   Error Message: {str(e)}")
-        
-# #         import traceback
-# #         print(f"\n📋 TRACEBACK:")
-# #         traceback.print_exc()
-# #         print("="*70 + "\n")
-        
-# #         return {"error": str(e), "query": request.query}
-
-# @app.post("/api/process-video-file")
-# async def process_video_file_endpoint(filename: str):
-#     try:
-#         file_path = RESOURCES_DIR / filename
-#         if not file_path.exists():
-#             raise HTTPException(status_code=404, detail="Video file not found")
-
-#         # 1. Extract and Transcribe
-#         video_data = process_video(str(file_path), extract_frames_fps=0.5)
-#         transcript = video_data.get("transcript", "")
-
-#         # 2. Save transcript to a .txt file (Mirroring your YouTube logic)
-#         txt_filename = f"{Path(filename).stem}_transcript.txt"
-#         txt_path = RESOURCES_DIR / txt_filename
-        
-#         with open(txt_path, "w", encoding="utf-8") as f:
-#             f.write(transcript)
-
-#         # 3. Add record for the NEW text file
-#         from file_manager import add_file_record, update_file_record
-#         from dataprocessor import process_file
-        
-#         file_record = add_file_record(
-#             txt_filename, 
-#             "Video Transcript", 
-#             os.path.getsize(txt_path)
-#         )
-
-#         # 4. Process the text file into Pinecone using your working logic
-#         result = process_file(str(txt_path))
-        
-#         # 5. Update metadata
-#         update_file_record(txt_filename, result["chunks_created"])
-
-#         return {
-#             "success": True,
-#             "message": "Video transcribed to text and indexed",
-#             "transcript_file": txt_filename
-#         }
-#     except Exception as e:
-#         import traceback
-#         traceback.print_exc()
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# # @app.post("/api/process-video-file")
-# # async def process_video_file_endpoint(filename: str):
-# #     try:
-# #         file_path = RESOURCES_DIR / filename
-# #         if not file_path.exists():
-# #             raise HTTPException(status_code=404, detail="Video file not found")
-
-# #         # 1. Process video
-# #         video_data = process_video(str(file_path), extract_frames_fps=0.5)
-
-# #         # 2. Get Embeddings
-# #         from embedder import embed_chunks
-# #         embeddings = embed_chunks(video_data["text_chunks"])
-
-# #         # 3. Prepare the unified list for store_in_pinecone
-# #         # Your vectorstore expects: {"embedding": [...], "metadata": {...}}
-# #         combined_data = []
-# #         for i, text in enumerate(video_data["text_chunks"]):
-# #             combined_data.append({
-# #                 "embedding": embeddings[i],
-# #                 "metadata": {
-# #                     "text": text,
-# #                     "doc_name": filename,
-# #                     "page": f"Segment {i+1}", 
-# #                     "path": str(file_path)
-# #                 }
-# #             })
-
-# #         # 4. Correct Function Name Import
-# #         from vectorstore import store_in_pinecone
-        
-# #         # Store in Vector DB (using 'video' namespace or 'pdf' as you prefer)
-# #         store_in_pinecone(combined_data, namespace="pdf") 
-
-# #         # 5. Update file metadata
-# #         update_file_record(filename, len(combined_data))
-
-# #         return {
-# #             "success": True,
-# #             "message": "Video processed and indexed",
-# #             "chunks": len(combined_data)
-# #         }
-# #     except Exception as e:
-# #         import traceback
-# #         traceback.print_exc()
-# #         raise HTTPException(status_code=500, detail=str(e))
-    
-# # @app.post("/api/process-video-file")
-# # async def process_video_file_endpoint(filename: str):
-# #     """
-# #     Process a locally uploaded video file (MP4, AVI, etc.)
-# #     """
-# #     try:
-# #         file_path = RESOURCES_DIR / filename
-# #         if not file_path.exists():
-# #             raise HTTPException(status_code=404, detail="Video file not found")
-
-# #         # 1. Use your existing video_processor.py logic
-# #         # extract_frames_fps=0.5 means 1 frame every 2 seconds
-# #         video_data = process_video(str(file_path), extract_frames_fps=0.5)
-
-# #         # 2. Convert video text chunks into Pinecone-ready format
-# #         # We format them to look like the YouTube transcripts your LLM likes
-# #         chunks_for_db = []
-# #         for i, text in enumerate(video_data["text_chunks"]):
-# #             # Assuming 1 chunk per sentence, we estimate the "page" as a timestamp
-# #             # or just label it as 'Video Segment'
-# #             chunks_for_db.append({
-# #                 "text": text,
-# #                 "doc_name": filename,
-# #                 "page": f"Segment {i+1}", 
-# #                 "path": str(file_path)
-# #             })
-
-# #         # 3. Store in Vector DB (Pinecone)
-# #         from vectorstore import upsert_to_pinecone
-# #         from embedder import embed_chunks
-        
-# #         # Embed the text segments
-# #         embeddings = embed_chunks(video_data["text_chunks"])
-        
-# #         # Upsert
-# #         upsert_to_pinecone(chunks_for_db, embeddings, namespace="pdf") # Using 'pdf' namespace for testing as per your code
-
-# #         # 4. Update file metadata
-# #         update_file_record(filename, len(chunks_for_db))
-
-# #         return {
-# #             "success": True,
-# #             "message": "Video processed and indexed",
-# #             "chunks": len(chunks_for_db)
-# #         }
-# #     except Exception as e:
-# #         raise HTTPException(status_code=500, detail=str(e))
-
-# @app.post("/chat")
-# def chat(request: QueryRequest):
-#         try:
-#             # result is now the dict {"answer": ..., "sources": ...}
-#             result = process_user_query(request.query)
-        
-#             return QueryResponse(
-#             response=result["answer"], 
-#             query=request.query,
-#             sources=result["sources"]
-#         )
-#         except Exception as e:
-#             return {"error": str(e), "query": request.query}
-
-# # ============== FILE MANAGEMENT ENDPOINTS ==============
-
-# @app.post("/api/upload")
-# async def upload_file(file: UploadFile = File(...)):
-#     try:
-#         file_ext = Path(file.filename).suffix.lower()
-        
-#         # 1. Define all media categories based on your MultimodalUploader.jsx
-#         media_map = {
-#             'video': ['.mp4', '.avi', '.mov', '.mkv', '.webm'],
-#             'audio': ['.mp3', '.wav', '.ogg', '.m4a', '.flac'],
-#             'image': ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'],
-#             'document': get_supported_formats()  # ['.pdf', '.docx', '.xlsx', etc.]
-#         }
-        
-#         # Flatten the map to get a master list of all allowed extensions
-#         all_supported = [ext for sublist in media_map.values() for ext in sublist]
-        
-#         if file_ext not in all_supported:
-#             raise HTTPException(
-#                 status_code=400, 
-#                 detail=f"Format {file_ext} not supported. Use: {', '.join(all_supported)}"
-#             )
-
-#         # 2. Save file to resources directory
-#         file_path = RESOURCES_DIR / file.filename
-#         with open(file_path, "wb") as buffer:
-#             shutil.copyfileobj(file.file, buffer)
-            
-#         # 3. Determine File Type for Metadata
-#         file_type = "Unknown"
-#         for category, extensions in media_map.items():
-#             if file_ext in extensions:
-#                 file_type = category.capitalize()
-#                 break
-        
-#         # 4. Fallback for document sub-types (Excel vs PDF vs Word)
-#         if file_type == "Document":
-#             try:
-#                 from file_processor import get_file_type
-#                 file_type = get_file_type(str(file_path))
-#             except Exception:
-#                 pass # Keep as "Document" if sub-processor fails
-
-#         # 5. Record in Database/File Manager
-#         file_size = file_path.stat().st_size
-#         file_record = add_file_record(file.filename, file_type, file_size)
-        
-#         return {
-#             "success": True, 
-#             "message": f"{file_type} uploaded successfully",
-#             "file": file_record
-#         }
-        
-#     except Exception as e:
-#         print(f"CRITICAL UPLOAD ERROR: {str(e)}")
-#         import traceback
-#         traceback.print_exc()
-#         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
-
-# # @app.post("/api/upload")
-# # async def upload_file(file: UploadFile = File(...)):
-# #     """
-# #     Upload a file to resources folder
-# #     Supports: PDF, Excel, CSV, TXT, Word, XML
-# #     """
-# #     try:
-# #         # Validate file extension
-# #         supported = get_supported_formats()
-# #         file_ext = Path(file.filename).suffix.lower()
-        
-# #         if file_ext not in supported:
-# #             raise HTTPException(
-# #                 status_code=400, 
-# #                 detail=f"File type {file_ext} not supported. Supported: {', '.join(supported)}"
-# #             )
-        
-# #         # Save file
-# #         file_path = RESOURCES_DIR / file.filename
-        
-# #         with open(file_path, "wb") as buffer:
-# #             shutil.copyfileobj(file.file, buffer)
-        
-# #         file_size = file_path.stat().st_size
-        
-# #         # Get file type
-# #         from file_processor import get_file_type
-# #         file_type = get_file_type(str(file_path))
-        
-# #         # Record in metadata
-# #         file_record = add_file_record(file.filename, file_type, file_size)
-        
-# #         return {
-# #             "success": True,
-# #             "message": f"File {file.filename} uploaded successfully",
-# #             "file": file_record
-# #         }
-    
-# #     except Exception as e:
-# #         raise HTTPException(status_code=500, detail=str(e))
-    
-    
-
-# @app.post("/api/process-file")
-# def process_uploaded_file(filename: str):
-#     """
-#     Process an uploaded file and store in vector DB
-#     """
-#     try:
-#         file_path = RESOURCES_DIR / filename
-        
-#         if not file_path.exists():
-#             raise HTTPException(status_code=404, detail=f"File {filename} not found")
-        
-#         # Process the file
-#         result = process_file(str(file_path))
-        
-#         # Update metadata
-#         update_file_record(filename, result["chunks_created"])
-        
-#         return {
-#             "success": True,
-#             "message": f"File processed successfully",
-#             "result": result
-#         }
-    
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-    
-#     # Add this new endpoint
-# # @app.post("/api/process-youtube")
-# # async def process_youtube(data: dict):
-# #     url = data.get("url")
-# #     if not url:
-# #         raise HTTPException(status_code=400, detail="No URL provided")
-    
-# #     try:
-# #         # 1. Download & Transcribe
-# #         video_info = process_youtube_link(url)
-        
-# #         # 2. Add to your existing file manager
-# #         file_record = add_file_record(
-# #             video_info["filename"], 
-# #             video_info["file_type"], 
-# #             video_info["file_size"]
-# #         )
-        
-# #         # 3. Process into Vector DB (Reuse your existing process_file!)
-# #         from dataprocessor import process_file
-# #         file_path = RESOURCES_DIR / video_info["filename"]
-# #         result = process_file(str(file_path))
-        
-# #         # 4. Update metadata
-# #         update_file_record(video_info["filename"], result["chunks_created"])
-        
-# #         return {"success": True, "message": "Video transcribed and indexed", "file": file_record}
-# #     except Exception as e:
-# #         raise HTTPException(status_code=500, detail=str(e))
-    
-
-    
-# # @app.post("/api/process-image-file")
-# # async def process_image_file_endpoint(filename: str):
-# #     file_path = RESOURCES_DIR / filename
-    
-# #         # This now uses the Smart Toggle logic!
-# #     image_data = process_single_image(str(file_path))
-    
-# #         # Save to TXT for your RAG system
-# #     txt_filename = f"{Path(filename).stem}_content.txt"
-# #     with open(RESOURCES_DIR / txt_filename, "w", encoding="utf-8") as f:
-# #         f.write(image_data["combined_text"])
-        
-# #     # Process into Pinecone via your existing dataprocessor
-# #     from dataprocessor import process_file
-# #     result = process_file(str(RESOURCES_DIR / txt_filename))
-    
-# #     return {"success": True, "method": "Smart Image Logic", "indexed_chunks": result["chunks_created"]}
-
-# # --- AUDIO ENDPOINT ---
-# # @app.post("/api/process-audio-file")
-# # async def process_audio_file_endpoint(filename: str):
-# #     try:
-# #         file_path = RESOURCES_DIR / filename
-# #         if not file_path.exists():
-# #             raise HTTPException(status_code=404, detail="Audio file not found")
-
-# #         # 1. Use audio_processor to get Whisper transcript
-# #         audio_data = process_audio_file(str(file_path))
-# #         transcript = audio_data.get("transcript", "")
-
-# #         # 2. Save to .txt
-# #         txt_filename = f"{Path(filename).stem}_audio_transcript.txt"
-# #         txt_path = RESOURCES_DIR / txt_filename
-# #         with open(txt_path, "w", encoding="utf-8") as f:
-# #             f.write(transcript)
-
-# #         # 3. Add record and process into Pinecone
-# #         from file_manager import add_file_record, update_file_record
-# #         from dataprocessor import process_file
-        
-# #         add_file_record(txt_filename, "Audio Transcript", os.path.getsize(txt_path))
-# #         result = process_file(str(txt_path))
-# #         update_file_record(txt_filename, result["chunks_created"])
-
-# #         return {"success": True, "message": "Audio transcribed and indexed", "text_file": txt_filename}
-# #     except Exception as e:
-# #         raise HTTPException(status_code=500, detail=str(e))
-
-# @app.get("/api/files")
-# def get_files():
-#     """
-#     Get all uploaded files with their metadata
-#     """
-#     try:
-#         files = get_all_files()
-#         stats = get_file_stats()
-#         return {
-#             "files": files,
-#             "stats": stats
-#         }
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# @app.get("/api/files/stats")
-# def get_stats():
-#     """
-#     Get file upload statistics
-#     """
-#     try:
-#         stats = get_file_stats()
-#         return stats
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-# @app.get("/api/supported-formats")
-# def get_formats():
-#     """
-#     Get list of supported file formats
-#     """
-#     return {
-#         "supported_formats": get_supported_formats(),
-#         "description": "Upload documents in any of these formats for RAG processing"
-#     }
-
-# if __name__ == "__main__":
-#     import uvicorn
-#     port = int(os.environ.get("PORT", 10000))
-#     uvicorn.run(app, host="0.0.0.0", port=port)
-#     #uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))

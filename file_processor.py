@@ -42,12 +42,42 @@ def _page(text: str, page: str, file_path: str):
 # -------------------------------------------------
 def read_pdf_file(file_path: str) -> List[dict]:
     pages = []
-    reader = PdfReader(file_path)
+    
+    # Method 1: Try pypdf (fast, standard)
+    try:
+        reader = PdfReader(file_path, strict=False)
+        for i, page in enumerate(reader.pages, start=1):
+            text = ""
+            try:
+                text = page.extract_text()
+            except Exception:
+                # Retry workaround: remove annotations
+                try:
+                    if "/Annots" in page:
+                        del page["/Annots"]
+                    text = page.extract_text()
+                except Exception:
+                    pass
+            
+            if text and len(text.strip()) > 10:  # Valid text found
+                pages.append(_page(text, f"Page {i}", file_path))
+    except Exception as e:
+        print(f"pypdf failed: {e}")
 
-    for i, page in enumerate(reader.pages, start=1):
-        text = page.extract_text()
-        if text:
-            pages.append(_page(text, f"Page {i}", file_path))
+    # Method 2: Fallback to pdfplumber (slower, robust) if pypdf failed or yielded no pages
+    if not pages:
+        print(f"pypdf yielded no text for {file_path}, switching to pdfplumber...")
+        try:
+            import pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                for i, page in enumerate(pdf.pages, start=1):
+                    text = page.extract_text()
+                    if text and text.strip():
+                        pages.append(_page(text, f"Page {i}", file_path))
+        except ImportError:
+            print("pdfplumber not installed. Cannot use fallback.")
+        except Exception as e:
+            print(f"pdfplumber failed: {e}")
 
     return pages
 
