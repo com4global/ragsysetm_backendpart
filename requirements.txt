@@ -13,3 +13,13 @@ pypdf
 numpy
 supabase
 openpyxl
+python-docx
+pdfplumber
+Pillow
+pytesseract
+openai-whisper
+librosa
+soundfile
+opencv-python-headless
+moviepy
+decorator==4.4.2
