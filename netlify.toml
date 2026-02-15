@@ -5,9 +5,6 @@
 [dev]
   command = "uvicorn main:app --reload"
 
-[functions]
-  external_code = ["."]  # Include root files in function build
-
 [[redirects]]
   from = "/*"
   to = "/.netlify/functions/netlify_app"
