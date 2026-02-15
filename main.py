@@ -98,7 +98,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:3001",
-        "https://ragsysetm-backendpart.onrender.com"
+        "https://ragsysetm-backendpart.onrender.com",
+        "https://zenzeebot.netlify.app",
+        "https://6991b268cf3584bbea00a87f--zenzeebot.netlify.app", 
+        "https://ragsystem-koaoq3ye1-com4globals-projects.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -563,4 +566,4 @@ async def history_endpoint(session_id: Optional[str] = None, current_user: User 
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
