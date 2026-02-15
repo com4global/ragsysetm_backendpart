@@ -100,9 +100,9 @@ app.add_middleware(
         "http://localhost:3001",
         "https://ragsysetm-backendpart.onrender.com",
         "https://zenzeebot.netlify.app",
-        "https://6991b268cf3584bbea00a87f--zenzeebot.netlify.app", 
-        "https://ragsystem-koaoq3ye1-com4globals-projects.vercel.app"
+        "https://ragsystem-1f65p6bm4-com4globals-projects.vercel.app"
     ],
+    allow_origin_regex="https://.*-zenzeebot\.netlify\.app", # Allow Deploy Previews
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
