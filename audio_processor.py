@@ -1,25 +1,48 @@
-import whisper
-import librosa
 import numpy as np
 from typing import List, Tuple, Dict
 import os
 
-# Load Whisper model
-print("🎵 Loading Whisper model for audio transcription...")
-try:
-    whisper_model = whisper.load_model("base")
-    print("✅ Whisper model loaded successfully")
-except Exception as e:
-    print(f"❌ Error loading Whisper model: {e}")
-    whisper_model = None
+# Lazy load heavy libraries
+whisper = None
+librosa = None
+
+def load_audio_libs():
+    global whisper, librosa
+    if whisper is None:
+        try:
+            import whisper as w
+            whisper = w
+        except ImportError:
+            print("⚠️ Whisper not installed")
+    if librosa is None:
+        try:
+            import librosa as l
+            librosa = l
+        except ImportError:
+            print("⚠️ Librosa not installed")
+
+# Placeholder for model
+whisper_model = None
+
+def load_model():
+    global whisper_model, whisper
+    load_audio_libs()
+    if whisper and whisper_model is None:
+        try:
+            print("🎵 Loading Whisper model...")
+            whisper_model = whisper.load_model("base")
+            print("✅ Whisper model loaded")
+        except Exception as e:
+            print(f"❌ Error loading Whisper: {e}")
 
 
 def transcribe_audio(audio_path: str, language: str = "en") -> str:
     """Transcribe audio to text using Whisper"""
     try:
+        load_model()
         if whisper_model is None:
             print(f"⚠️  Whisper model not available for {audio_path}")
-            return ""
+            return "Transcription unavailable: Whisper library not installed on this environment."
         
         print(f"🎵 Transcribing: {os.path.basename(audio_path)}")
         result = whisper_model.transcribe(audio_path, language=language)
@@ -35,6 +58,10 @@ def transcribe_audio(audio_path: str, language: str = "en") -> str:
 def get_audio_duration(audio_path: str) -> float:
     """Get duration of audio file in seconds"""
     try:
+        load_audio_libs()
+        if librosa is None:
+             return 0.0
+             
         y, sr = librosa.load(audio_path)
         duration = librosa.get_duration(y=y, sr=sr)
         print(f"📊 Audio duration: {duration:.2f} seconds")
@@ -47,6 +74,10 @@ def get_audio_duration(audio_path: str) -> float:
 def get_audio_sample_rate(audio_path: str) -> int:
     """Get sample rate of audio file"""
     try:
+        load_audio_libs()
+        if librosa is None:
+            return 0
+            
         y, sr = librosa.load(audio_path)
         return sr
     except Exception as e:
@@ -57,6 +88,10 @@ def get_audio_sample_rate(audio_path: str) -> int:
 def chunk_audio_by_silence(audio_path: str, threshold_db: int = -40) -> List[Tuple[float, float]]:
     """Chunk audio by detecting silence"""
     try:
+        load_audio_libs()
+        if librosa is None:
+            return []
+
         y, sr = librosa.load(audio_path)
         S = librosa.feature.melspectrogram(y=y, sr=sr)
         S_db = librosa.power_to_db(S, ref=np.max)

@@ -1,40 +1,49 @@
-import cv2
 import os
 import numpy as np
 from typing import List, Tuple, Dict
-import whisper
 import tempfile
 from audio_processor import transcribe_audio
-model = whisper.load_model("base")
 
-print("🎥 Initializing Video Processor...")
+# Lazy load heavy libraries
+cv2 = None
+VideoFileClip = None
+whisper = None
+whisper_model = None
 
-try:
-    from moviepy import VideoFileClip
-    print("✅ MoviePy loaded successfully")
-except Exception as e:
-    from moviepy.editor import VideoFileClip
-    print("✅ MoviePy (Legacy) loaded successfully")
+def load_video_libs():
+    global cv2, VideoFileClip, whisper, whisper_model
+    try:
+        import cv2 as c
+        cv2 = c
+    except ImportError:
+        print("⚠️ OpenCV not installed")
 
-try:
-    from audio_processor import transcribe_audio
-    print("✅ Audio processor imported")
-except Exception as e:
-    print(f"⚠️  Could not import audio_processor: {e}")
+    try:
+        from moviepy import VideoFileClip as VFC
+        VideoFileClip = VFC
+    except ImportError:
+        try:
+             from moviepy.editor import VideoFileClip as VFC
+             VideoFileClip = VFC
+        except ImportError:
+             print("⚠️ MoviePy not installed")
+
+    try:
+        import whisper as w
+        whisper = w
+        if whisper_model is None:
+             whisper_model = whisper.load_model("base")
+    except ImportError:
+        print("⚠️ Whisper not installed")
 
 
 def extract_frames_at_intervals(video_path: str, fps: int = 1) -> List[np.ndarray]:
-    """
-    Extract frames from video at specified intervals
-    
-    Args:
-        video_path: Path to video file
-        fps: Frames per second to extract (1 = 1 frame per second)
-    
-    Returns:
-        List of frame arrays
-    """
+    """Extract frames from video at specified intervals"""
     try:
+        load_video_libs()
+        if cv2 is None:
+            return []
+
         cap = cv2.VideoCapture(video_path)
         
         if not cap.isOpened():
@@ -72,6 +81,10 @@ def extract_frames_at_intervals(video_path: str, fps: int = 1) -> List[np.ndarra
 def get_video_duration(video_path: str) -> float:
     """Get video duration in seconds"""
     try:
+        load_video_libs()
+        if cv2 is None:
+            return 0.0
+
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -90,6 +103,11 @@ def get_video_duration(video_path: str) -> float:
 def extract_audio_from_video(video_path: str) -> str:
     """Extract audio from video and transcribe"""
     try:
+        load_video_libs()
+        if VideoFileClip is None:
+             print("⚠️ MoviePy unavailable.")
+             return ""
+
         print(f"🎵 Extracting audio from: {os.path.basename(video_path)}")
         
         
@@ -104,7 +122,15 @@ def extract_audio_from_video(video_path: str) -> str:
         # Save audio temporarily
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             audio_path = tmp.name
-            video.audio.write_audiofile(audio_path,codec='pcm_s16le', logger=None)
+            # video.audio.write_audiofile(audio_path,codec='pcm_s16le', logger=None)
+            # Use try/except for write_audiofile as it needs ffmpeg
+            try:
+                video.audio.write_audiofile(audio_path,codec='pcm_s16le', logger=None)
+            except Exception as e:
+                print(f"❌ FFMPEG/Write Error: {e}")
+                video.close()
+                return ""
+
         
         # Transcribe
         transcript = transcribe_audio(audio_path)
@@ -127,15 +153,12 @@ def extract_audio_from_video(video_path: str) -> str:
 def detect_scene_changes(video_path: str, threshold: float = 30.0) -> List[Tuple[int, int]]:
     """
     Detect scene changes in video based on frame differences
-    
-    Args:
-        video_path: Path to video file
-        threshold: Difference threshold for detecting scene change
-    
-    Returns:
-        List of (start_frame, end_frame) tuples
     """
     try:
+        load_video_libs()
+        if cv2 is None:
+            return []
+
         cap = cv2.VideoCapture(video_path)
         
         if not cap.isOpened():
@@ -179,6 +202,10 @@ def detect_scene_changes(video_path: str, threshold: float = 30.0) -> List[Tuple
 def get_video_metadata(video_path: str) -> Dict:
     """Get video metadata"""
     try:
+        load_video_libs()
+        if cv2 is None:
+            return {}
+
         cap = cv2.VideoCapture(video_path)
         
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
