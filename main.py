@@ -385,8 +385,6 @@ async def chat_endpoint(request: QueryRequest, current_user: User = Depends(get_
 def _read_local_file_metadata():
     """Read file metadata from local .file_metadata.json"""
     import json as _json
-    """Read file metadata from local .file_metadata.json"""
-    import json as _json
     # Check writable first, then static
     metadata_path = WRITE_RESOURCES_DIR / ".file_metadata.json"
     if not metadata_path.exists():
