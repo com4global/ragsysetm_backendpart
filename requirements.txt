@@ -11,3 +11,4 @@ youtube-transcript-api
 mangum
 pypdf
 numpy
+supabase
