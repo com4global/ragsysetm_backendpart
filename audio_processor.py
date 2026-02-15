@@ -122,8 +122,9 @@ def process_audio(audio_path: str) -> Dict:
         transcript = transcribe_audio(audio_path)
         
         if not transcript:
-            print("⚠️  No transcript generated")
-            return {
+            print("⚠️ No transcript generated")
+            return {"transcript": ""} # Return empty so main.py doesn't crash   
+        return {
                 "file": os.path.basename(audio_path),
                 "duration": duration,
                 "sample_rate": sample_rate,

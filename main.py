@@ -34,6 +34,7 @@ from typing import List, Optional, Dict, Any
 import os
 import shutil
 import uuid
+from datetime import datetime
 import logging
 import uvicorn
 import requests
@@ -98,6 +99,12 @@ class FileMetadataRequest(BaseModel):
     file_name: str
     file_type: str
     file_size: int
+
+class RegisterFileRequest(BaseModel):
+    filename: str
+    file_type: str
+    file_size: int
+    blob_url: str
     blob_url: str
 
 class QueryRequest(BaseModel):
@@ -197,6 +204,47 @@ async def upload_file_endpoint(file: UploadFile = File(...), current_user: User 
         logger.error(f"Error uploading file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/register-file")
+async def register_file_endpoint(request: RegisterFileRequest, current_user: User = Depends(get_current_user)):
+    """Register a file uploaded to Vercel Blob"""
+    try:
+        logger.info(f"📝 Registering blob file: {request.filename} ({request.blob_url})")
+        
+        # 1. Save to Supabase (Primary for Blob)
+        try:
+            user_db.add_user_file(
+                user_id=current_user.id,
+                filename=request.filename,
+                file_type=request.file_type,
+                file_size=request.file_size,
+                blob_url=request.blob_url,
+                user_token=current_user.access_token
+            )
+        except Exception as e:
+            logger.error(f"Failed to register in Supabase: {e}")
+            raise HTTPException(status_code=500, detail="Database registration failed")
+
+        # 2. Update local metadata (for hybrid visibility)
+        existing_files = _read_local_file_metadata()
+        existing_files = [f for f in existing_files if f.get('filename') != request.filename]
+        existing_files.append({
+            "filename": request.filename,
+            "file_name": request.filename,
+            "file_type": request.file_type,
+            "file_size": request.file_size,
+            "chunks_created": 0,
+            "processed": False,
+            "status": "pending",
+            "uploaded_at": datetime.utcnow().isoformat(),
+            "blob_url": request.blob_url
+        })
+        _save_local_file_metadata(existing_files)
+        
+        return {"success": True, "message": "File registered successfully"}
+    except Exception as e:
+        logger.error(f"Error registering file: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/process-file")
 async def process_file_endpoint(filename: str, current_user: User = Depends(get_current_user)):
     """Process a file for RAG — uses local metadata and file storage"""
@@ -215,14 +263,42 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
         if not file_meta:
             raise HTTPException(status_code=404, detail="File metadata not found")
 
-        # 2. Resolve file path — check resources root first, then user subdirectory
+        # 2. Resolve file path
         local_path = RESOURCES_DIR / filename
-        if not local_path.exists():
-            user_temp_dir = RESOURCES_DIR / current_user.id
-            local_path = user_temp_dir / filename
+        user_temp_dir = RESOURCES_DIR / current_user.id
         
         if not local_path.exists():
-            raise HTTPException(status_code=404, detail=f"File {filename} not found on disk")
+            local_path = user_temp_dir / filename
+
+        # 3. If local file missing, try to download from Blob URL
+        if not local_path.exists():
+            blob_url = file_meta.get('blob_url')
+            # Check Supabase if local metadata missing blob_url
+            if not blob_url:
+                try:
+                    s_files = user_db.get_user_files(current_user.id, current_user.access_token)
+                    s_file = next((f for f in s_files if f['filename'] == filename), None)
+                    if s_file:
+                        blob_url = s_file.get('blob_url')
+                except:
+                    pass
+
+            if blob_url:
+                logger.info(f"⬇️ Downloading from Blob: {blob_url}")
+                try:
+                    response = requests.get(blob_url)
+                    response.raise_for_status()
+                    # Ensure user directory
+                    user_temp_dir.mkdir(exist_ok=True)
+                    local_path = user_temp_dir / filename
+                    with open(local_path, 'wb') as f:
+                        f.write(response.content)
+                    logger.info(f"⬇️ Downloaded to {local_path}")
+                except Exception as e:
+                    logger.error(f"Failed to download blob: {e}")
+                    raise HTTPException(status_code=404, detail="File download failed")
+            else:
+                 raise HTTPException(status_code=404, detail=f"File {filename} not found on disk or blob")
         
         logger.info(f"⚙️ File found at: {local_path}")
         
@@ -359,9 +435,17 @@ async def list_files_endpoint(current_user: User = Depends(get_current_user)):
         files = _read_local_file_metadata()
         logger.info(f"📂 Read {len(files)} files from local metadata")
         
-        # Disable Supabase fallback to ensure local files are displayed
-        # user_db.get_user_files() logic removed to prevent overwriting
-        pass
+        # Merge with Supabase files (for Vercel/Cloud persistence)
+        try:
+            supabase_files = user_db.get_user_files(current_user.id, user_token=current_user.access_token)
+            if supabase_files:
+                local_filenames = {f.get('filename') for f in files}
+                for sf in supabase_files:
+                    if sf.get('filename') not in local_filenames:
+                        files.append(sf)
+                logger.info(f"📂 Merged Supabase files. Total: {len(files)}")
+        except Exception as e:
+            logger.warning(f"Supabase file fetch failed (using local only): {e}")
         
         # Build stats from the files we have
         total_files = len(files)
