@@ -1,0 +1,14 @@
+[build]
+  command = "pip install -r requirements.txt"
+  functions = "functions"
+
+[dev]
+  command = "uvicorn main:app --reload"
+
+[functions]
+  external_code = ["."]  # Include root files in function build
+
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/netlify_app"
+  status = 200
