@@ -16,11 +16,6 @@
       "dest": "main.py"
     }
   ],
-  "env": {
-    "OPENAI_API_KEY": "@openai_api_key",
-    "PINECONE_API_KEY": "@pinecone_api_key",
-    "PINECONE_INDEX_NAME": "@pinecone_index_name"
-  },
   "buildCommand": "pip install -r requirements.txt",
   "installCommand": "pip install -r requirements.txt"
 }
