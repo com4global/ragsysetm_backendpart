@@ -63,10 +63,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
-UPLOAD_DIR = "uploads"
-PROCESSED_DIR = "processed"
+# Determine environment
+IS_VERCEL = os.environ.get("VERCEL") == "1" or os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+
+# Base paths
+BASE_DIR = Path("/tmp") if IS_VERCEL else Path(".")
+
+# Writable directories (always in /tmp on Vercel)
+UPLOAD_DIR = BASE_DIR / "uploads"
+PROCESSED_DIR = BASE_DIR / "processed"
+WRITE_RESOURCES_DIR = BASE_DIR / "resources"
+
+# Ensure writable directories exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
+os.makedirs(WRITE_RESOURCES_DIR, exist_ok=True)
+
+# Static resources (read-only in Vercel)
+STATIC_RESOURCES_DIR = Path("./resources")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -91,8 +105,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-RESOURCES_DIR = Path("./resources")
-RESOURCES_DIR.mkdir(exist_ok=True)
+# RESOURCES_DIR is split into WRITE and STATIC. 
+# Helpers will resolve paths dynamically.
 
 # === Models ===
 class FileMetadataRequest(BaseModel):
@@ -152,8 +166,8 @@ async def upload_file_endpoint(file: UploadFile = File(...), current_user: User 
         logger.info(f"📤 Upload started: {file.filename} by user {current_user.id}")
         
         # 1. Save file to local storage (resources directory root)
-        RESOURCES_DIR.mkdir(parents=True, exist_ok=True)
-        local_path = RESOURCES_DIR / file.filename
+        # Always write to writable directory
+        local_path = WRITE_RESOURCES_DIR / file.filename
         
         with open(local_path, "wb") as buffer:
             content = await file.read()
@@ -264,8 +278,12 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
             raise HTTPException(status_code=404, detail="File metadata not found")
 
         # 2. Resolve file path
-        local_path = RESOURCES_DIR / filename
-        user_temp_dir = RESOURCES_DIR / current_user.id
+        # Check writable first, then static
+        local_path = WRITE_RESOURCES_DIR / filename
+        if not local_path.exists():
+            local_path = STATIC_RESOURCES_DIR / filename
+
+        user_temp_dir = WRITE_RESOURCES_DIR / current_user.id
         
         if not local_path.exists():
             local_path = user_temp_dir / filename
@@ -367,7 +385,13 @@ async def chat_endpoint(request: QueryRequest, current_user: User = Depends(get_
 def _read_local_file_metadata():
     """Read file metadata from local .file_metadata.json"""
     import json as _json
-    metadata_path = RESOURCES_DIR / ".file_metadata.json"
+    """Read file metadata from local .file_metadata.json"""
+    import json as _json
+    # Check writable first, then static
+    metadata_path = WRITE_RESOURCES_DIR / ".file_metadata.json"
+    if not metadata_path.exists():
+         metadata_path = STATIC_RESOURCES_DIR / ".file_metadata.json"
+
     if not metadata_path.exists():
         return []
     
@@ -382,7 +406,11 @@ def _read_local_file_metadata():
                 continue
             
             # Get actual file size from disk
-            file_path = RESOURCES_DIR / filename
+            # Check writable first
+            file_path = WRITE_RESOURCES_DIR / filename
+            if not file_path.exists():
+                file_path = STATIC_RESOURCES_DIR / filename
+            
             file_size = int(file_path.stat().st_size) if file_path.exists() else file_meta.get("file_size", 0)
             
             files.append({
@@ -500,7 +528,8 @@ async def delete_file_endpoint(filename: str, current_user: User = Depends(get_c
         logger.info(f"🗑️ Removed {filename} from local metadata")
         
         # 3. Delete physical file from disk
-        local_path = RESOURCES_DIR / filename
+        # Only delete from writable
+        local_path = WRITE_RESOURCES_DIR / filename
         if local_path.exists():
             local_path.unlink()
             logger.info(f"🗑️ Deleted file from disk: {local_path}")
