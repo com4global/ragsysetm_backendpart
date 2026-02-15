@@ -433,7 +433,7 @@ def _read_local_file_metadata():
 def _save_local_file_metadata(files_list):
     """Save file metadata to local .file_metadata.json"""
     import json as _json
-    metadata_path = RESOURCES_DIR / ".file_metadata.json"
+    metadata_path = WRITE_RESOURCES_DIR / ".file_metadata.json"
     
     # Convert to storage format
     storage_files = []

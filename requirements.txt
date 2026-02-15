@@ -5,7 +5,7 @@ pydantic
 requests
 python-dotenv
 openai
-pinecone-client
+pinecone
 beautifulsoup4
 youtube-transcript-api
 mangum
