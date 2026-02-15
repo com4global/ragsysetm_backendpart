@@ -12,3 +12,4 @@ mangum
 pypdf
 numpy
 supabase
+openpyxl
