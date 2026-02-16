@@ -163,7 +163,6 @@ async def record_metadata(request: FileMetadataRequest, current_user: User = Dep
 
 @app.post("/api/upload")
 async def upload_file_endpoint(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...), 
     current_user: User = Depends(get_current_user)
 ):
@@ -200,95 +199,60 @@ async def upload_file_endpoint(
         _save_local_file_metadata(existing_files)
         logger.info(f"📤 Metadata saved locally for {file.filename}")
         
-        # 3. New Persistence: Upload to Supabase Storage (Background Task)
-        # We return success immediately so the UI doesn't hang.
-        # The upload happens in the background.
+        # 3. New Persistence: Upload to Supabase Storage (Blocking / Synchronous)
+        # We MUST block here, otherwise the frontend calls /process immediately and fails
+        # because the file isn't in Supabase yet (race condition on serverless).
+        blob_url = None
+        try:
+            # Re-read file content to upload
+            with open(local_path, "rb") as f:
+                file_content = f.read()
+
+            # Sanitize filename
+            clean_filename = f"{int(datetime.utcnow().timestamp())}_{file.filename}"
+            
+            # Use the user's token or service role
+            from supabase import create_client
+            import os
+            
+            service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+            url = os.getenv("SUPABASE_URL")
+            
+            if service_key:
+                uploader = create_client(url, service_key)
+            else:
+                uploader = create_client(url, os.getenv("SUPABASE_KEY"))
+                uploader.auth.set_session(current_user.access_token, "refresh_token_placeholder") 
+
+            # Upload (Blocking)
+            logger.info(f"☁️ Uploading {clean_filename} to Supabase (Sync)...")
+            uploader.storage.from_('uploads').upload(
+                path=clean_filename,
+                file=file_content,
+                file_options={"content-type": file.content_type or "application/octet-stream"}
+            )
+            
+            # Get Public URL
+            blob_url = uploader.storage.from_('uploads').get_public_url(clean_filename)
+            logger.info(f"☁️ Server-side upload success: {blob_url}")
+
+        except Exception as e:
+             logger.error(f"❌ Server-side upload failed: {e}")
+             # Don't fail completely? Or maybe fail so user knows?
+             # Let's proceed, maybe local processing works if on same instance (unlikely on serverless)
         
-        # Define background task function
-        def background_supabase_upload(local_file_path, filename, mime_type, user_id, user_token):
-             logger.info(f"☁️ [Background] Starting upload for {filename}")
-             try:
-                from supabase import create_client
-                import os
-                
-                service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-                url = os.getenv("SUPABASE_URL")
-                
-                # Init Client
-                if service_key:
-                    uploader = create_client(url, service_key)
-                else:
-                    # Fallback (less reliable for background tasks due to token expiry, but worth a shot)
-                    uploader = create_client(url, os.getenv("SUPABASE_KEY"))
-                    uploader.auth.set_session(user_token, "refresh_token_placeholder")
-
-                # Read from disk (it was just saved)
-                with open(local_file_path, "rb") as f:
-                    file_bytes = f.read()
-
-                clean_name = f"{int(datetime.utcnow().timestamp())}_{filename}"
-
-                # Upload
-                uploader.storage.from_('uploads').upload(
-                    path=clean_name,
-                    file=file_bytes,
-                    file_options={"content-type": mime_type}
-                )
-                
-                # Get URL
-                public_url = uploader.storage.from_('uploads').get_public_url(clean_name)
-                logger.info(f"☁️ [Background] Upload success: {public_url}")
-                
-                # Update DB Metadata with the URL
-                # We need to re-init user_db or just add it now?
-                # The file might have been added to DB already without URL?
-                # Actually, step 4 below adds it with None. We should UPDATE it.
-                # OR, we wait to add metadata until we have the URL? 
-                # Better: Add metadata with None now (Sync), allow UI to see it.
-                # Then update it later? 
-                # The 'user_db.add_user_file' functionality is to INSERT.
-                # Updating is harder without an dedicated update method.
-                
-                # ALTERNATIVE: Just do the DB Insert in the background too!
-                # But UI needs the 'file_record' to show it in the list immediately.
-                # If we insert with BlobURL=None, it works for local.
-                # If we want to update it, we need an update method in Database.
-                
-                # For now, let's keep it simple:
-                # We won't block the user.
-                # We will just upload to Storage. 
-                # If we can't update the DB easily, maybe we just don't populate blob_url in DB yet?
-                # Wait, if blob_url is missing, persistence fails on new machines.
-                
-                # Let's try to UPDATE the row.
-                uploader.table('user_files').update({"blob_url": public_url}).eq("filename", filename).eq("user_id", user_id).execute()
-                logger.info(f"☁️ [Background] DB Updated with URL.")
-
-             except Exception as e:
-                 logger.error(f"❌ [Background] Upload failed: {e}")
-
-        # Add to Background Tasks
-        background_tasks.add_task(
-            background_supabase_upload, 
-            str(local_path), 
-            file.filename, 
-            file.content_type or 'application/octet-stream',
-            current_user.id,
-            current_user.access_token
-        )
-        
-        # 4. Record metadata in Supabase (Sync, with empty URL for now)
+        # 4. Record metadata in Supabase (Sync)
         try:
             user_db.add_user_file(
                 user_id=current_user.id,
                 filename=file.filename,
                 file_type=file.content_type or 'application/octet-stream',
                 file_size=file_size,
-                blob_url=None, # Will be updated by background task
+                blob_url=blob_url, # Populated!
                 user_token=current_user.access_token
             )
         except Exception as e:
-            logger.warning(f"Supabase metadata record failed (local OK): {e}")
+            logger.warning(f"Supabase metadata record failed: {e}")
         
         return {
             "success": True,
