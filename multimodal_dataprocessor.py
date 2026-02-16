@@ -42,10 +42,30 @@ def _process_text_file(file_path: str, file_type: str, chunk_size: int = 900, ch
         embeddings = embed_chunks(chunks)
         print(f"🧠 Embedded {len(embeddings)} chunks")
         
+        # Prepare embedded_chunks structure (Adapting to vectorstore.py signature)
+        embedded_chunks = []
+        if len(chunks) == len(embeddings):
+            for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
+                embedded_chunks.append({
+                    "embedding": embedding,
+                    "metadata": {
+                        "text": chunk_text,
+                        "page": "N/A",  # Lost page info in this simple pipeline
+                        "doc_name": os.path.basename(file_path),
+                        "path": file_path
+                    }
+                })
+        
         # Store in Pinecone
         namespace = f"text_{file_type}"
-        store_in_pinecone(chunks, embeddings, namespace=namespace)
-        print(f"📌 Stored in Pinecone (namespace: {namespace})")
+        chunks_stored = 0
+        
+        if embedded_chunks:
+            store_in_pinecone(embedded_chunks, namespace=namespace)
+            chunks_stored = len(embedded_chunks)
+            print(f"📌 Stored in Pinecone (namespace: {namespace})")
+        else:
+            print(f"⚠️ No chunks/embeddings to store for {file_path}")
         
         return {
             "file_name": os.path.basename(file_path),

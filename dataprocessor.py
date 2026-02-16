@@ -111,9 +111,11 @@ def process_file(
             total_chunks += 1
 
     # 5. Store in Pinecone with user-specific namespace
-    store_in_pinecone(embedded_chunks, namespace)
-    
-    print(f"📌 Stored {total_chunks} chunks in namespace '{namespace}'")
+    if embedded_chunks:
+        store_in_pinecone(embedded_chunks, namespace)
+        print(f"📌 Stored {total_chunks} chunks in namespace '{namespace}'")
+    else:
+        print(f"⚠️ No chunks generated for {file_name}. Skipping Pinecone storage.")
 
     return {
         "file_name": file_name,
