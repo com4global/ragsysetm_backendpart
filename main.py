@@ -324,7 +324,12 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
                     logger.error(f"Failed to download blob: {e}")
                     raise HTTPException(status_code=404, detail="File download failed")
             else:
-                 raise HTTPException(status_code=404, detail=f"File {filename} not found on disk or blob")
+                 # Detailed error for user
+                 logger.warning(f"❌ File {filename} has metadata but no content (Blob URL missing)")
+                 raise HTTPException(
+                     status_code=404, 
+                     detail="File content not found. This file may have been uploaded before persistent storage was enabled. Please delete and re-upload it."
+                 )
         
         logger.info(f"⚙️ File found at: {local_path}")
         
@@ -356,9 +361,12 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
         return {"success": True, "result": result}
     except HTTPException:
         raise
+    except ValueError as ve:
+        logger.error(f"Validation error processing {filename}: {ve}")
+        raise HTTPException(status_code=422, detail=f"Processing failed: {str(ve)}")
     except Exception as e:
         logger.error(f"Error processing file {filename}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 @app.post("/chat", response_model=QueryResponse)
 async def chat_endpoint(request: QueryRequest, current_user: User = Depends(get_current_user)):
