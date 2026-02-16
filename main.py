@@ -319,11 +319,22 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
         file_meta = None
         blob_url = None
         try:
-            s_files = user_db.get_user_files(current_user.id, current_user.access_token)
-            file_meta = next((f for f in s_files if f['filename'] == filename or f.get('file_name') == filename), None)
-            if file_meta:
-                blob_url = file_meta.get('blob_url')
-                logger.info(f"✅ Found metadata in Supabase for {filename}")
+            # Add strict retry logic for "just uploaded" files
+            import time
+            retries = 3
+            for attempt in range(retries):
+                s_files = user_db.get_user_files(current_user.id, current_user.access_token)
+                # Flexible matching for filename/file_name
+                file_meta = next((f for f in s_files if f.get('filename') == filename or f.get('file_name') == filename), None)
+                
+                if file_meta:
+                    blob_url = file_meta.get('blob_url')
+                    logger.info(f"✅ Found metadata in Supabase for {filename} (Attempt {attempt+1})")
+                    break
+                else:
+                    logger.warning(f"Metadata not found in Supabase for {filename} (Attempt {attempt+1}/{retries})")
+                    time.sleep(1) # Wait for propagation if needed
+                    
         except Exception as e:
             logger.warning(f"Supabase metadata fetch failed: {e}")
 
@@ -336,10 +347,13 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
             )
             if file_meta:
                  blob_url = file_meta.get('blob_url')
-                 logger.info(f"✅ Found metadata in local storage for {filename}")
+                 logger.info(f"✅ Found metadata in local storage for {filename} (Fallback)")
         
         if not file_meta:
-            raise HTTPException(status_code=404, detail="File metadata not found")
+            # DEBUG INFO
+            logger.error(f"❌ CRITICAL: Metadata missing for {filename}")
+            logger.error(f"User ID: {current_user.id}")
+            raise HTTPException(status_code=404, detail=f"File metadata not found for {filename}. Please try uploading again.")
 
         # 3. Resolve file path
         # Check writable first, then static
