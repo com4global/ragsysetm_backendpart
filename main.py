@@ -26,7 +26,7 @@ Production-ready API with user isolation and security
 # from fastapi.staticfiles import StaticFiles
 # from datetime import datetime, timedelta
 # import uuid
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, status, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, status, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -102,7 +102,7 @@ app.add_middleware(
         "https://zenzeebot.netlify.app",
         "https://ragsystem-1f65p6bm4-com4globals-projects.vercel.app"
     ],
-    allow_origin_regex="https://.*-zenzeebot\.netlify\.app", # Allow Deploy Previews
+    allow_origin_regex=r"https://.*-zenzeebot\.netlify\.app", # Allow Deploy Previews
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -162,7 +162,11 @@ async def record_metadata(request: FileMetadataRequest, current_user: User = Dep
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/upload")
-async def upload_file_endpoint(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+async def upload_file_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), 
+    current_user: User = Depends(get_current_user)
+):
     """Upload a file via multipart/form-data, save locally, and record metadata"""
     try:
         from datetime import datetime
@@ -196,14 +200,91 @@ async def upload_file_endpoint(file: UploadFile = File(...), current_user: User 
         _save_local_file_metadata(existing_files)
         logger.info(f"📤 Metadata saved locally for {file.filename}")
         
-        # 3. Also try to record in Supabase (best effort)
+        # 3. New Persistence: Upload to Supabase Storage (Background Task)
+        # We return success immediately so the UI doesn't hang.
+        # The upload happens in the background.
+        
+        # Define background task function
+        def background_supabase_upload(local_file_path, filename, mime_type, user_id, user_token):
+             logger.info(f"☁️ [Background] Starting upload for {filename}")
+             try:
+                from supabase import create_client
+                import os
+                
+                service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+                url = os.getenv("SUPABASE_URL")
+                
+                # Init Client
+                if service_key:
+                    uploader = create_client(url, service_key)
+                else:
+                    # Fallback (less reliable for background tasks due to token expiry, but worth a shot)
+                    uploader = create_client(url, os.getenv("SUPABASE_KEY"))
+                    uploader.auth.set_session(user_token, "refresh_token_placeholder")
+
+                # Read from disk (it was just saved)
+                with open(local_file_path, "rb") as f:
+                    file_bytes = f.read()
+
+                clean_name = f"{int(datetime.utcnow().timestamp())}_{filename}"
+
+                # Upload
+                uploader.storage.from_('uploads').upload(
+                    path=clean_name,
+                    file=file_bytes,
+                    file_options={"content-type": mime_type}
+                )
+                
+                # Get URL
+                public_url = uploader.storage.from_('uploads').get_public_url(clean_name)
+                logger.info(f"☁️ [Background] Upload success: {public_url}")
+                
+                # Update DB Metadata with the URL
+                # We need to re-init user_db or just add it now?
+                # The file might have been added to DB already without URL?
+                # Actually, step 4 below adds it with None. We should UPDATE it.
+                # OR, we wait to add metadata until we have the URL? 
+                # Better: Add metadata with None now (Sync), allow UI to see it.
+                # Then update it later? 
+                # The 'user_db.add_user_file' functionality is to INSERT.
+                # Updating is harder without an dedicated update method.
+                
+                # ALTERNATIVE: Just do the DB Insert in the background too!
+                # But UI needs the 'file_record' to show it in the list immediately.
+                # If we insert with BlobURL=None, it works for local.
+                # If we want to update it, we need an update method in Database.
+                
+                # For now, let's keep it simple:
+                # We won't block the user.
+                # We will just upload to Storage. 
+                # If we can't update the DB easily, maybe we just don't populate blob_url in DB yet?
+                # Wait, if blob_url is missing, persistence fails on new machines.
+                
+                # Let's try to UPDATE the row.
+                uploader.table('user_files').update({"blob_url": public_url}).eq("filename", filename).eq("user_id", user_id).execute()
+                logger.info(f"☁️ [Background] DB Updated with URL.")
+
+             except Exception as e:
+                 logger.error(f"❌ [Background] Upload failed: {e}")
+
+        # Add to Background Tasks
+        background_tasks.add_task(
+            background_supabase_upload, 
+            str(local_path), 
+            file.filename, 
+            file.content_type or 'application/octet-stream',
+            current_user.id,
+            current_user.access_token
+        )
+        
+        # 4. Record metadata in Supabase (Sync, with empty URL for now)
         try:
             user_db.add_user_file(
                 user_id=current_user.id,
                 filename=file.filename,
                 file_type=file.content_type or 'application/octet-stream',
                 file_size=file_size,
-                blob_url=None,
+                blob_url=None, # Will be updated by background task
                 user_token=current_user.access_token
             )
         except Exception as e:
