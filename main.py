@@ -322,7 +322,12 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
                     logger.info(f"⬇️ Downloaded to {local_path}")
                 except Exception as e:
                     logger.error(f"Failed to download blob: {e}")
-                    raise HTTPException(status_code=404, detail="File download failed")
+                    error_detail = "File download failed."
+                    if "403" in str(e):
+                        error_detail = "Access Denied: Is your Supabase 'uploads' bucket set to Public?"
+                    elif "404" in str(e):
+                        error_detail = "File not found in storage. It may have been deleted."
+                    raise HTTPException(status_code=404, detail=error_detail)
             else:
                  # Detailed error for user
                  logger.warning(f"❌ File {filename} has metadata but no content (Blob URL missing)")
