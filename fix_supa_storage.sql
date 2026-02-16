@@ -5,10 +5,16 @@ ON CONFLICT (id) DO UPDATE
 SET public = true;
 
 -- 2. Add 'blob_url' to user_files table (Safe check)
-DO $$
-BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'user_files' AND column_name = 'blob_url') THEN
         ALTER TABLE user_files ADD COLUMN blob_url TEXT;
+    END IF;
+END $$;
+
+-- 2b. Add Unique Constraint for UPSERT (Required for database.py logic)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_user_filename') THEN
+        ALTER TABLE user_files ADD CONSTRAINT unique_user_filename UNIQUE (user_id, filename);
     END IF;
 END $$;
 
