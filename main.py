@@ -468,41 +468,123 @@ def _save_local_file_metadata(files_list):
     except Exception as e:
         logger.error(f"Error saving local file metadata: {e}")
 
+@app.post("/api/analyze-legal")
+async def analyze_legal_endpoint(
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
+    current_user: User = Depends(get_current_user)
+):
+    """Analyze a legal document (File or URL)"""
+    try:
+        from legal_service import analyze_legal_document
+        import json
+        
+        content = ""
+        
+        # 1. Handle File Upload
+        if file:
+            # Read file content (simple text extraction for now)
+            # For robust extraction, we should use file_processor.read_file
+            # But here we might just need quick text for analysis
+            file_content = await file.read()
+            
+            # fast/naive decode for text files
+            try:
+                content = file_content.decode('utf-8')
+            except:
+                # If binary/PDF, we should rely on our existing processors
+                # For this MVP, we will try to use file_processor if possible
+                # Saving temp
+                temp_path = BASE_DIR / f"temp_{file.filename}"
+                with open(temp_path, "wb") as f:
+                    f.write(file_content)
+                
+                try:
+                    from file_processor import read_file
+                    pages, _ = read_file(str(temp_path))
+                    content = "\n".join([p["text"] for p in pages])
+                finally:
+                    if temp_path.exists():
+                        temp_path.unlink()
+
+        # 2. Handle URL (not implemented fully yet, placeholder)
+        elif url:
+            content = f"Content from URL: {url}"
+
+        if not content:
+            raise HTTPException(status_code=400, detail="No content provided")
+
+        # 3. Analyze
+        analysis_json_str = analyze_legal_document(content)
+        
+        # Parse JSON string to dict
+        if isinstance(analysis_json_str, str):
+            analysis_result = json.loads(analysis_json_str)
+        else:
+            analysis_result = analysis_json_str
+
+        return {"success": True, "analysis": analysis_result}
+
+    except Exception as e:
+        logger.error(f"Legal Analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/files")
 async def list_files_endpoint(current_user: User = Depends(get_current_user)):
-    """List all files and stats for authenticated user"""
+    """List files strictly for the authenticated user (Supabase Source of Truth)"""
     try:
         logger.info(f"📂 /api/files called by user_id={current_user.id}, email={current_user.email}")
         
-        # Read from local .file_metadata.json (primary source)
-        files = _read_local_file_metadata()
-        logger.info(f"📂 Read {len(files)} files from local metadata")
-        
-        # Merge with Supabase files (for Vercel/Cloud persistence)
+        # 1. SOURCE OF TRUTH: Supabase
+        # We ONLY show files that actully belong to this user in the DB.
+        supabase_files = []
         try:
             supabase_files = user_db.get_user_files(current_user.id, user_token=current_user.access_token)
-            if supabase_files:
-                local_filenames = {f.get('filename') for f in files}
-                for sf in supabase_files:
-                    if sf.get('filename') not in local_filenames:
-                        files.append(sf)
-                logger.info(f"📂 Merged Supabase files. Total: {len(files)}")
+            logger.info(f"📂 Retrieved {len(supabase_files)} files from Supabase for user {current_user.id}")
         except Exception as e:
-            logger.warning(f"Supabase file fetch failed (using local only): {e}")
+            logger.error(f"❌ Critical: Supabase file fetch failed: {e}")
+            raise HTTPException(status_code=500, detail="Could not fetch user files")
+
+        # 2. Enrich with Local Metadata (Status/Progress) ONLY for these files
+        # We do NOT add files from local metadata that aren't in Supabase (prevents leaks)
+        local_files_map = {f.get('filename'): f for f in _read_local_file_metadata()}
         
-        # Build stats from the files we have
-        total_files = len(files)
-        processed_files = sum(1 for f in files if f.get('processed'))
-        total_chunks = sum(f.get('chunks_created', 0) for f in files)
-        total_size = sum(f.get('file_size', 0) for f in files)
+        final_files_list = []
         
+        for sf in supabase_files:
+            filename = sf.get('filename')
+            
+            # Base object from Supabase
+            file_obj = {
+                "filename": filename,
+                "file_name": filename, # frontend might use either
+                "file_type": sf.get('file_type', 'document'),
+                "file_size": sf.get('file_size', 0),
+                "blob_url": sf.get('blob_url'),
+                "uploaded_at": sf.get('created_at'),
+                "processed": sf.get('processed', False),
+                "chunks_created": sf.get('chunks_created', 0),
+                "status": "completed" if sf.get('processed') else "pending"
+            }
+            
+            # Enrich with local info if available (e.g. if currently processing)
+            if filename in local_files_map:
+                local_f = local_files_map[filename]
+                # If local says processed, trust it for UI update speed
+                if local_f.get('processed'):
+                    file_obj['processed'] = True
+                    file_obj['status'] = 'completed'
+                    file_obj['chunks_created'] = local_f.get('chunks_created', file_obj['chunks_created'])
+            
+            final_files_list.append(file_obj)
+        
+        # Stats
         stats = {
-            "total_files": total_files,
-            "processed_files": processed_files,
-            "total_chats": 0,
-            "total_chunks": total_chunks,
-            "total_size_bytes": total_size,
-            "files_this_week": 0
+            "total_files": len(final_files_list),
+            "processed_files": sum(1 for f in final_files_list if f.get('processed')),
+            "total_chunks": sum(f.get('chunks_created', 0) for f in final_files_list),
+            "total_size_bytes": sum(f.get('file_size', 0) for f in final_files_list),
         }
         
         # Try to get chat count from Supabase
@@ -512,8 +594,9 @@ async def list_files_endpoint(current_user: User = Depends(get_current_user)):
         except Exception:
             pass
         
-        logger.info(f"📂 Found {len(files)} files, stats={stats}")
-        return {"files": files, "stats": stats}
+        return {"files": final_files_list, "stats": stats}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing files: {e}")
         raise HTTPException(status_code=500, detail=str(e))
