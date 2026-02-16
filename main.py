@@ -264,23 +264,39 @@ async def register_file_endpoint(request: RegisterFileRequest, current_user: Use
 
 @app.post("/api/process-file")
 async def process_file_endpoint(filename: str, current_user: User = Depends(get_current_user)):
-    """Process a file for RAG — uses local metadata and file storage"""
+    """Process a file for RAG — uses Supabase for metadata and Blob/Local for content"""
     try:
         from dataprocessor import process_file
         
         logger.info(f"⚙️ Processing file: {filename} for user {current_user.id}")
         
-        # 1. Check local metadata for the file
-        existing_files = _read_local_file_metadata()
-        file_meta = next(
-            (f for f in existing_files if f.get('filename') == filename or f.get('file_name') == filename), 
-            None
-        )
+        # 1. Try to get metadata from Supabase (Primary for Vercel)
+        file_meta = None
+        blob_url = None
+        try:
+            s_files = user_db.get_user_files(current_user.id, current_user.access_token)
+            file_meta = next((f for f in s_files if f['filename'] == filename or f.get('file_name') == filename), None)
+            if file_meta:
+                blob_url = file_meta.get('blob_url')
+                logger.info(f"✅ Found metadata in Supabase for {filename}")
+        except Exception as e:
+            logger.warning(f"Supabase metadata fetch failed: {e}")
+
+        # 2. Fallback to local metadata (Legacy/Local Dev)
+        if not file_meta:
+            existing_files = _read_local_file_metadata()
+            file_meta = next(
+                (f for f in existing_files if f.get('filename') == filename or f.get('file_name') == filename), 
+                None
+            )
+            if file_meta:
+                 blob_url = file_meta.get('blob_url')
+                 logger.info(f"✅ Found metadata in local storage for {filename}")
         
         if not file_meta:
             raise HTTPException(status_code=404, detail="File metadata not found")
 
-        # 2. Resolve file path
+        # 3. Resolve file path
         # Check writable first, then static
         local_path = WRITE_RESOURCES_DIR / filename
         if not local_path.exists():
@@ -291,19 +307,8 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
         if not local_path.exists():
             local_path = user_temp_dir / filename
 
-        # 3. If local file missing, try to download from Blob URL
+        # 4. If local file missing, try to download from Blob URL
         if not local_path.exists():
-            blob_url = file_meta.get('blob_url')
-            # Check Supabase if local metadata missing blob_url
-            if not blob_url:
-                try:
-                    s_files = user_db.get_user_files(current_user.id, current_user.access_token)
-                    s_file = next((f for f in s_files if f['filename'] == filename), None)
-                    if s_file:
-                        blob_url = s_file.get('blob_url')
-                except:
-                    pass
-
             if blob_url:
                 logger.info(f"⬇️ Downloading from Blob: {blob_url}")
                 try:
@@ -323,20 +328,10 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
         
         logger.info(f"⚙️ File found at: {local_path}")
         
-        # 3. Process and Index with User Isolation
+        # 5. Process and Index with User Isolation
         result = process_file(str(local_path), user_id=current_user.id)
         
-        # 4. Update local metadata
-        for f in existing_files:
-            if f.get('filename') == filename or f.get('file_name') == filename:
-                f['processed'] = True
-                f['status'] = 'completed'
-                f['chunks_created'] = result.get("chunks_created", 0)
-                break
-        _save_local_file_metadata(existing_files)
-        logger.info(f"⚙️ Local metadata updated for {filename}: {result.get('chunks_created', 0)} chunks")
-        
-        # 5. Also try to update Supabase (best effort)
+        # 6. Update metadata (Supabase Primary)
         try:
             user_db.update_file_processed(
                 user_id=current_user.id,
@@ -344,8 +339,19 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
                 chunks_created=result["chunks_created"],
                 user_token=current_user.access_token
             )
+            logger.info(f"✅ usage Supabase updated for {filename}")
         except Exception as e:
-            logger.warning(f"Supabase update failed (local OK): {e}")
+            logger.warning(f"Supabase update failed: {e}")
+
+        # Update local (Best effort)
+        existing_files = _read_local_file_metadata()
+        for f in existing_files:
+            if f.get('filename') == filename or f.get('file_name') == filename:
+                f['processed'] = True
+                f['status'] = 'completed'
+                f['chunks_created'] = result.get("chunks_created", 0)
+                break
+        _save_local_file_metadata(existing_files)
             
         return {"success": True, "result": result}
     except HTTPException:
@@ -510,44 +516,63 @@ async def delete_file_endpoint(filename: str, current_user: User = Depends(get_c
     try:
         logger.info(f"🗑️ Delete requested: {filename} by user {current_user.id}")
         
-        # 1. Check local metadata for the file
-        existing_files = _read_local_file_metadata()
-        file_found = any(
-            f.get('filename') == filename or f.get('file_name') == filename 
-            for f in existing_files
-        )
+        # 1. Start with Supabase (Primary)
+        file_found = False
+        try:
+            file_found = user_db.file_belongs_to_user(current_user.id, filename, current_user.access_token)
+        except Exception as e:
+            logger.warning(f"Supabase check failed: {e}")
+
+        # 2. Check local if not in Supabase (Legacy)
+        if not file_found:
+            existing_files = _read_local_file_metadata()
+            file_found = any(
+                f.get('filename') == filename or f.get('file_name') == filename 
+                for f in existing_files
+            )
         
         if not file_found:
-            raise HTTPException(status_code=404, detail=f"File {filename} not found")
+             # If strictly not found anywhere, 404. 
+             # But for delete, we might want to be permissive to allow cleanup of "zombie" files
+             logger.warning(f"File {filename} not found in DBs, attempting cleanup anyway")
         
-        # 2. Remove from local .file_metadata.json
+        # 3. Delete from Supabase (Primary)
+        try:
+            user_db.delete_user_file(current_user.id, filename, user_token=current_user.access_token)
+            logger.info(f"🗑️ Removed {filename} from Supabase")
+        except Exception as e:
+             logger.error(f"Supabase deletion failed: {e}")
+
+        # 4. Remove from local .file_metadata.json
+        existing_files = _read_local_file_metadata()
         updated_files = [
             f for f in existing_files 
             if f.get('filename') != filename and f.get('file_name') != filename
         ]
-        _save_local_file_metadata(updated_files)
-        logger.info(f"🗑️ Removed {filename} from local metadata")
+        if len(existing_files) != len(updated_files):
+             _save_local_file_metadata(updated_files)
+             logger.info(f"🗑️ Removed {filename} from local metadata")
         
-        # 3. Delete physical file from disk
+        # 5. Delete physical file from disk (Cleanup)
         # Only delete from writable
         local_path = WRITE_RESOURCES_DIR / filename
         if local_path.exists():
             local_path.unlink()
             logger.info(f"🗑️ Deleted file from disk: {local_path}")
+            
+        # Also clean up user temp dir copy if exists
+        user_temp_file = WRITE_RESOURCES_DIR / current_user.id / filename
+        if user_temp_file.exists():
+            user_temp_file.unlink()
         
-        # 4. Delete vectors from Pinecone (best effort)
+        # 6. Delete vectors from Pinecone (Crucial)
         try:
             from dataprocessor import delete_user_file_vectors
             delete_user_file_vectors(current_user.id, filename)
+            logger.info(f"🗑️ Deleted vectors for {filename}")
         except Exception as ve:
             logger.warning(f"Vector deletion failed (non-critical): {ve}")
             
-        # 5. Delete from Supabase (best effort)
-        try:
-            user_db.delete_user_file(current_user.id, filename, user_token=current_user.access_token)
-        except Exception as e:
-            logger.warning(f"Supabase deletion failed (non-critical): {e}")
-        
         return {"success": True, "message": f"File {filename} deleted successfully"}
     except HTTPException:
         raise
