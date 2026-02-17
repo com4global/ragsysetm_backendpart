@@ -549,57 +549,59 @@ async def analyze_legal_endpoint(
     url: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user)
 ):
-    """Analyze a legal document (File or URL)"""
+    """Analyze a legal document (File or URL) with comprehensive structured analysis"""
     try:
         from legal_service import analyze_legal_document
+        from file_processor import read_file
         import json
         
         content = ""
+        page_count = None
         
         # 1. Handle File Upload
         if file:
-            # Read file content (simple text extraction for now)
-            # For robust extraction, we should use file_processor.read_file
-            # But here we might just need quick text for analysis
             file_content = await file.read()
             
-            # fast/naive decode for text files
+            # Always save to temp and use file_processor for proper extraction
+            temp_path = BASE_DIR / f"temp_{file.filename}"
             try:
-                content = file_content.decode('utf-8')
-            except:
-                # If binary/PDF, we should rely on our existing processors
-                # For this MVP, we will try to use file_processor if possible
-                # Saving temp
-                temp_path = BASE_DIR / f"temp_{file.filename}"
                 with open(temp_path, "wb") as f:
                     f.write(file_content)
                 
                 try:
-                    from file_processor import read_file
-                    pages, _ = read_file(str(temp_path))
-                    content = "\n".join([p["text"] for p in pages])
-                finally:
-                    if temp_path.exists():
-                        temp_path.unlink()
+                    pages, file_type = read_file(str(temp_path))
+                    page_count = len(pages)
+                    content = "\n\n".join([p["text"] for p in pages if p.get("text")])
+                    logger.info(f"Legal analysis: extracted {page_count} pages from {file.filename}")
+                except ValueError:
+                    # Unsupported file type — try plain text decode
+                    try:
+                        content = file_content.decode('utf-8')
+                    except UnicodeDecodeError:
+                        content = file_content.decode('latin-1', errors='ignore')
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
 
-        # 2. Handle URL (not implemented fully yet, placeholder)
+        # 2. Handle URL
         elif url:
             content = f"Content from URL: {url}"
 
-        if not content:
-            raise HTTPException(status_code=400, detail="No content provided")
+        if not content or not content.strip():
+            raise HTTPException(status_code=400, detail="No content could be extracted from the file")
 
-        # 3. Analyze
-        analysis_json_str = analyze_legal_document(content)
+        # 3. Analyze with enhanced service
+        logger.info(f"Legal analysis starting for {file.filename if file else url} ({len(content)} chars, {page_count} pages)")
+        analysis_result = analyze_legal_document(content, page_count=page_count)
         
-        # Parse JSON string to dict
-        if isinstance(analysis_json_str, str):
-            analysis_result = json.loads(analysis_json_str)
-        else:
-            analysis_result = analysis_json_str
+        # Parse if string
+        if isinstance(analysis_result, str):
+            analysis_result = json.loads(analysis_result)
 
         return {"success": True, "analysis": analysis_result}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Legal Analysis failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
