@@ -15,7 +15,7 @@ from vectorstore import store_in_pinecone
 from file_processor import read_file, get_file_type
 
 # Import multimodal processors
-from image_processor import process_single_image, process_images_in_directory
+from image_processor import process_single_image
 from audio_processor import process_audio
 from video_processor import process_video
 

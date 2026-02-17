@@ -9,7 +9,7 @@ from llm import query_llm_with_context
 from typing import Dict, Optional
 
 
-def process_user_query(query: str, user_id: Optional[str] = None) -> Dict:
+def process_user_query(query: str, user_id: Optional[str] = None, language: str = "en") -> Dict:
     """
     Process user query with optional user-specific context
     
@@ -77,12 +77,17 @@ def process_user_query(query: str, user_id: Optional[str] = None) -> Dict:
 
     # 4. Get answer from LLM
     if not context:
+        no_docs_msg = (
+            "தொடர்புடைய ஆவணங்களை என்னால் கண்டுபிடிக்க முடியவில்லை. தேவையான கோப்புகளை பதிவேற்றியுள்ளீர்கள் என்பதை உறுதிப்படுத்தவும்."
+            if language == "ta" else
+            "I couldn't find any relevant documents to answer this question. Please make sure you've uploaded the necessary files."
+        )
         return {
-            "answer": "I couldn't find any relevant documents to answer this question. Please make sure you've uploaded the necessary files.",
+            "answer": no_docs_msg,
             "sources": []
         }
 
-    answer = query_llm_with_context(query, context)
+    answer = query_llm_with_context(query, context, language=language)
     
     result = {
         "answer": answer,

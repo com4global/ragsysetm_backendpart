@@ -5,7 +5,7 @@ from typing import Optional
 from database import supabase, user_db
 
 # This is just for Swagger UI support
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
 # Pydantic models
 class Token(BaseModel):
@@ -35,12 +35,15 @@ class UserLogin(BaseModel):
     password: str
 
 # Dependency to get current user
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    
+    if not token:
+        raise credentials_exception
     
     if not supabase:
         raise HTTPException(

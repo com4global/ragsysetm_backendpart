@@ -2,7 +2,12 @@
 import os
 import base64
 from openai import OpenAI
-import pytesseract
+try:
+    import pytesseract
+    HAS_TESSERACT = True
+except ImportError:
+    HAS_TESSERACT = False
+    print("⚠️ pytesseract not installed — OCR will use GPT-4o Vision as fallback")
 from dotenv import load_dotenv
 from PIL import Image
 load_dotenv()
@@ -13,6 +18,8 @@ print(" clinet", client)
 
 def extract_image_text_tesseract(image_path: str) -> str:
     """Attempt local OCR using Tesseract"""
+    if not HAS_TESSERACT:
+        return ""
     try:
         # Optional: Add path if not in your Environment Variables
         # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'

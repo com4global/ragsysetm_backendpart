@@ -67,8 +67,25 @@ def process_file(
     print(f"👤 User ID: {user_id if user_id else 'None (legacy mode)'}")
     print(f"🔖 Namespace: {namespace}")
     print("=" * 70)
+    # Check if this is a multimodal file (image, audio, video)
+    MULTIMODAL_TYPES = {
+        'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp',           # images
+        'mp3', 'wav', 'ogg', 'flac', 'm4a',                    # audio
+        'mp4', 'avi', 'mov', 'mkv', 'webm', 'mpeg', 'mpga'     # video
+    }
+    
+    if file_type in MULTIMODAL_TYPES:
+        # Delegate to multimodal processor for non-text files
+        from multimodal_dataprocessor import process_multimodal_file
+        print(f"🎨 Detected multimodal file type '{file_type}', delegating to multimodal processor...")
+        result = process_multimodal_file(file_path)
+        # Enrich result with user info
+        result["user_id"] = user_id
+        result["namespace"] = namespace
+        result["chunks_created"] = result.get("chunks_created", 0)
+        return result
 
-    # 1. Read file
+    # 1. Read file (text-based files only)
     pages, _ = read_file(file_path)
     print(f"✅ Extracted {len(pages)} pages/rows/sections")
     

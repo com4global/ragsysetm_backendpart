@@ -21,8 +21,16 @@ CHUNK_SIZE = 8000
 SINGLE_PASS_LIMIT = 12000
 
 
-def _build_analysis_prompt():
+def _build_analysis_prompt(language="en"):
     """The master system prompt for structured legal analysis."""
+    tamil_instruction = ""
+    if language == "ta":
+        tamil_instruction = """\n\nCRITICAL LANGUAGE INSTRUCTION: You MUST respond in Tamil (தமிழ்).
+- ALL text values in your JSON response (summary, descriptions, findings, plain_english, impact, notes, suggestions, titles, document_type, finding, description, clause_name, original_text, issue, suggestion) MUST be written in Tamil (தமிழ்).
+- The risk_breakdown keys MUST be in Tamil: use "நிதி" instead of "Financial", "சட்டம்" instead of "Legal", "இணக்கம்" instead of "Compliance", "செயல்பாட்டு" instead of "Operational".
+- Keep only JSON structural keys (like "summary", "risk_score", "issues") in English.
+- Keep proper nouns, company names, and specific legal terms of art in English.
+- EVERYTHING ELSE must be in Tamil script. This is mandatory."""
     return """You are an expert Legal AI Assistant specializing in contract analysis, regulatory compliance, risk assessment, and financial auditing.
 
 Analyze the provided legal document text thoroughly and return a SINGLE valid JSON object with this EXACT structure:
@@ -116,11 +124,14 @@ RULES:
 - For spelling_grammar_issues: look for typos, grammatical errors, inconsistent use of defined terms, ambiguous pronouns, missing commas that change meaning.
 - For key_clauses: explain EVERY significant clause in plain English.
 - For critical_findings: identify the 3-5 MOST IMPORTANT things a non-lawyer should know about this document.
-- Severity/priority should reflect real legal impact, not just formality."""
+- Severity/priority should reflect real legal impact, not just formality.""" + tamil_instruction
 
 
-def _build_chunk_prompt():
+def _build_chunk_prompt(language="en"):
     """Prompt for analyzing individual chunks of a large document."""
+    tamil_instruction = ""
+    if language == "ta":
+        tamil_instruction = """\n\nCRITICAL LANGUAGE INSTRUCTION: You MUST respond in Tamil (தமிழ்). ALL text values in your JSON (summaries, descriptions, notes, titles, plain_english, issue, suggestion) MUST be in Tamil (தமிழ்). Keep only JSON structural keys in English. Keep proper nouns in English. Everything else MUST be Tamil."""
     return """You are an expert Legal AI Assistant. You are analyzing ONE SECTION of a larger legal document.
 
 Extract ALL findings from this section and return a JSON object with:
@@ -136,15 +147,15 @@ Extract ALL findings from this section and return a JSON object with:
   "risk_indicators": ["List of risk factors found in this section"]
 }
 
-Return ONLY valid JSON. Be thorough — identify everything relevant."""
+Return ONLY valid JSON. Be thorough — identify everything relevant.""" + tamil_instruction
 
 
-def _build_synthesis_prompt(chunk_count):
+def _build_synthesis_prompt(chunk_count, language="en"):
     """Prompt for synthesizing multiple chunk analyses into a final report."""
     return f"""You are an expert Legal AI Assistant. You have analyzed {chunk_count} sections of a legal document separately. 
 Now SYNTHESIZE all the section analyses below into ONE comprehensive final report.
 
-{_build_analysis_prompt()}
+{_build_analysis_prompt(language)}
 
 ADDITIONAL SYNTHESIS RULES:
 - Merge duplicate issues — if the same issue appears in multiple sections, combine them into one with the most complete description.
@@ -212,7 +223,7 @@ def _split_into_chunks(text, chunk_size=CHUNK_SIZE):
     return chunks
 
 
-def analyze_legal_document(text_content: str, page_count: int = None) -> dict:
+def analyze_legal_document(text_content: str, page_count: int = None, language: str = "en") -> dict:
     """
     Analyze a legal document using LLM with intelligent chunking for large documents.
     
@@ -247,7 +258,7 @@ def analyze_legal_document(text_content: str, page_count: int = None) -> dict:
             # Small document — single pass
             print(f"Legal analysis: single pass ({len(text)} chars, ~{estimated_pages} pages)")
             result_str = _call_llm(
-                _build_analysis_prompt(),
+                _build_analysis_prompt(language),
                 f"Analyze this legal document (~{estimated_pages} pages):\n\n{text}"
             )
             result = json.loads(result_str)
@@ -262,7 +273,7 @@ def analyze_legal_document(text_content: str, page_count: int = None) -> dict:
                 print(f"  Analyzing chunk {i+1}/{len(chunks)}...")
                 try:
                     chunk_result_str = _call_llm(
-                        _build_chunk_prompt(),
+                        _build_chunk_prompt(language),
                         f"Section {i+1} of {len(chunks)} from a legal document:\n\n{chunk}"
                     )
                     chunk_analyses.append(chunk_result_str)
@@ -277,7 +288,7 @@ def analyze_legal_document(text_content: str, page_count: int = None) -> dict:
                 combined_input += f"=== SECTION {i+1} ANALYSIS ===\n{analysis}\n\n"
             
             result_str = _call_llm(
-                _build_synthesis_prompt(len(chunks)),
+                _build_synthesis_prompt(len(chunks), language),
                 combined_input
             )
             result = json.loads(result_str)

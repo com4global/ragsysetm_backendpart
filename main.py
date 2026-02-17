@@ -93,19 +93,24 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="RAG HR Assistant", version="2.0", lifespan=lifespan)
 
 # CORS configuration
+origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "https://ragsysetm-backendpart.onrender.com",
+    "https://zenzeebot.netlify.app",
+    "https://ragsystem-1f65p6bm4-com4globals-projects.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "https://ragsysetm-backendpart.onrender.com",
-        "https://zenzeebot.netlify.app",
-        "https://ragsystem-1f65p6bm4-com4globals-projects.vercel.app"
-    ],
-    allow_origin_regex=r"https://.*-zenzeebot\.netlify\.app", # Allow Deploy Previews
+    allow_origins=origins,
+    allow_origin_regex=r"https://.*-zenzeebot\.netlify\.app",
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # RESOURCES_DIR is split into WRITE and STATIC. 
@@ -126,6 +131,7 @@ class RegisterFileRequest(BaseModel):
 class QueryRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
+    language: Optional[str] = "en"  # "en" for English, "ta" for Tamil
 
 class QueryResponse(BaseModel):
     response: str
@@ -452,7 +458,9 @@ async def chat_endpoint(request: QueryRequest, current_user: User = Depends(get_
         session_id = request.session_id or str(uuid.uuid4())
         
         # Process with user-specific context
-        result = process_user_query(request.query, user_id=current_user.id)
+        # Pass language preference to get response in selected language
+        language = request.language or "en"
+        result = process_user_query(request.query, user_id=current_user.id, language=language)
         
         # Save to history
         user_db.add_chat_message(
@@ -547,6 +555,7 @@ def _save_local_file_metadata(files_list):
 async def analyze_legal_endpoint(
     file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
+    language: Optional[str] = Form("en"),
     current_user: User = Depends(get_current_user)
 ):
     """Analyze a legal document (File or URL) with comprehensive structured analysis"""
@@ -593,7 +602,7 @@ async def analyze_legal_endpoint(
 
         # 3. Analyze with enhanced service
         logger.info(f"Legal analysis starting for {file.filename if file else url} ({len(content)} chars, {page_count} pages)")
-        analysis_result = analyze_legal_document(content, page_count=page_count)
+        analysis_result = analyze_legal_document(content, page_count=page_count, language=language or "en")
         
         # Parse if string
         if isinstance(analysis_result, str):

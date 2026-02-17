@@ -134,6 +134,15 @@
       "chunks_created": 6,
       "processed": true,
       "uploaded_at": "2026-02-15T05:23:38.184889"
+    },
+    {
+      "id": 16,
+      "file_name": "1.jpeg",
+      "file_type": "image/jpeg",
+      "file_size": 716421,
+      "chunks_created": 0,
+      "processed": true,
+      "uploaded_at": "2026-02-17T17:33:31.641821"
     }
   ]
 }
