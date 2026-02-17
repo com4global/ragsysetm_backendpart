@@ -409,6 +409,7 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
         result = process_file(str(local_path), user_id=current_user.id)
         
         # 6. Update metadata (Supabase Primary)
+        metadata_updated = False
         try:
             user_db.update_file_processed(
                 user_id=current_user.id,
@@ -416,9 +417,11 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
                 chunks_created=result["chunks_created"],
                 user_token=current_user.access_token
             )
-            logger.info(f"✅ usage Supabase updated for {filename}")
+            metadata_updated = True
+            logger.info(f"✅ Supabase status updated for {filename}")
         except Exception as e:
-            logger.warning(f"Supabase update failed: {e}")
+            logger.error(f"❌ Supabase status update failed for {filename}: {e}")
+            # Don't fail the whole processing, but flag the issue
 
         # Update local (Best effort)
         existing_files = _read_local_file_metadata()

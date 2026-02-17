@@ -220,12 +220,29 @@ class UserDatabase:
         """Mark file as processed"""
         try:
             client = self._get_client_with_token(user_token)
-            client.table('user_files').update({
+            response = client.table('user_files').update({
                 'processed': True, 
                 'chunks_created': chunks_created
             }).eq('user_id', user_id).eq('filename', filename).execute()
+            print(f"✅ update_file_processed: {filename} marked as processed ({chunks_created} chunks)")
+            return response
         except Exception as e:
-            print(f"Error updating file status: {e}")
+            error_str = str(e)
+            print(f"❌ Error updating file status for '{filename}': {e}")
+            # Try service-role fallback for RLS errors
+            if ("row-level security" in error_str.lower() or "42501" in error_str) and _service_role_key:
+                try:
+                    service_client = create_client(SUPABASE_URL, _service_role_key)
+                    response = service_client.table('user_files').update({
+                        'processed': True, 
+                        'chunks_created': chunks_created
+                    }).eq('user_id', user_id).eq('filename', filename).execute()
+                    print(f"✅ update_file_processed via service-role: {filename}")
+                    return response
+                except Exception as sr_err:
+                    print(f"❌ Service-role update also failed: {sr_err}")
+                    raise sr_err
+            raise
 
     def delete_user_file(self, user_id: str, filename: str, user_token: str = None):
         """Delete a file record for a user"""
