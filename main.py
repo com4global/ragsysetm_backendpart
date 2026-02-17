@@ -122,7 +122,6 @@ class RegisterFileRequest(BaseModel):
     file_type: str
     file_size: int
     blob_url: str
-    blob_url: str
 
 class QueryRequest(BaseModel):
     query: str
@@ -153,10 +152,13 @@ async def record_metadata(request: FileMetadataRequest, current_user: User = Dep
             filename=request.file_name,
             file_type=request.file_type,
             file_size=request.file_size,
-            blob_url=request.blob_url,
             user_token=current_user.access_token
         )
+        if not file_record:
+            raise HTTPException(status_code=500, detail="Failed to save file metadata to database")
         return {"success": True, "file": file_record}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error recording metadata: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -241,18 +243,24 @@ async def upload_file_endpoint(
              # Don't fail completely? Or maybe fail so user knows?
              # Let's proceed, maybe local processing works if on same instance (unlikely on serverless)
         
-        # 4. Record metadata in Supabase (Sync)
+        # 4. Record metadata in Supabase (Sync) — MUST succeed for process to work
         try:
-            user_db.add_user_file(
+            db_result = user_db.add_user_file(
                 user_id=current_user.id,
                 filename=file.filename,
                 file_type=file.content_type or 'application/octet-stream',
                 file_size=file_size,
-                blob_url=blob_url, # Populated!
+                blob_url=blob_url,
                 user_token=current_user.access_token
             )
+            if not db_result:
+                logger.error(f"❌ Supabase metadata save returned empty for {file.filename}")
+                raise Exception("Database metadata save returned empty result")
+            logger.info(f"✅ Supabase metadata recorded for {file.filename}")
         except Exception as e:
-            logger.warning(f"Supabase metadata record failed: {e}")
+            logger.error(f"❌ Supabase metadata record failed: {e}")
+            # Don't silently swallow — this is critical for process step
+            raise HTTPException(status_code=500, detail=f"File saved but metadata registration failed: {e}. Please try uploading again.")
         
         return {
             "success": True,

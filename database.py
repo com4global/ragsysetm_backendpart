@@ -76,29 +76,43 @@ class UserDatabase:
     # File Management
     def add_user_file(self, user_id: str, filename: str, file_type: str, file_size: int, blob_url: str = None, user_token: str = None) -> Dict:
         """Add a file record for a user"""
+        data = {
+            "user_id": user_id,
+            "filename": filename,
+            "file_type": file_type,
+            "file_size": file_size,
+            "uploaded_at": datetime.utcnow().isoformat(),
+            "chunks_created": 0,
+            "processed": False
+        }
+        # Only include blob_url if provided (column may not exist in older schemas)
+        if blob_url:
+            data["blob_url"] = blob_url
+        
         try:
-            data = {
-                "user_id": user_id,
-                "filename": filename,
-                "file_type": file_type,
-                "file_size": file_size,
-                "uploaded_at": datetime.utcnow().isoformat(),
-                "chunks_created": 0,
-                "processed": False
-            }
-            # Only include blob_url if the column exists in the table
-            # Note: blob_url column may not exist in schema — skip if None
-            if blob_url:
-                data["blob_url"] = blob_url
-            
             client = self._get_client_with_token(user_token)
             # Upsert based on (user_id, filename) unique constraint
             response = client.table('user_files').upsert(data, on_conflict='user_id, filename').execute()
             # Return the inserted data
-            return response.data[0] if response.data else data
+            result = response.data[0] if response.data else data
+            print(f"✅ add_user_file success: {filename} for user {user_id}")
+            return result
         except Exception as e:
-            print(f"Error adding user file: {e}")
-            return {}
+            print(f"❌ Error adding user file '{filename}': {e}")
+            # If blob_url column doesn't exist, retry without it
+            if blob_url and ("blob_url" in str(e) or "column" in str(e).lower()):
+                print(f"⚠️ Retrying without blob_url column...")
+                try:
+                    data.pop("blob_url", None)
+                    client = self._get_client_with_token(user_token)
+                    response = client.table('user_files').upsert(data, on_conflict='user_id, filename').execute()
+                    result = response.data[0] if response.data else data
+                    print(f"✅ add_user_file retry success (without blob_url): {filename}")
+                    return result
+                except Exception as retry_err:
+                    print(f"❌ Retry also failed: {retry_err}")
+                    raise retry_err
+            raise
 
     def get_user_files(self, user_id: str, user_token: str = None) -> List[Dict]:
         """Get all files for a specific user"""
