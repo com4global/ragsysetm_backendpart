@@ -1,5 +1,6 @@
-
 import os
+import json
+import base64
 from typing import Optional, Dict, List
 from datetime import datetime
 from supabase import create_client, Client
@@ -11,13 +12,58 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("Warning: SUPABASE_URL or SUPABASE_KEY not found in environment variables.")
+if not SUPABASE_URL:
+    print("Warning: SUPABASE_URL not found in environment variables.")
 
-# Use service role key if available (bypasses RLS), otherwise anon key
-_effective_key = SUPABASE_SERVICE_KEY or SUPABASE_KEY
-_key_type = "service_role" if SUPABASE_SERVICE_KEY else "anon"
-print(f"Supabase client using {_key_type} key")
+def _decode_jwt_role(token):
+    """Extract the 'role' claim from a Supabase JWT key."""
+    if not token:
+        return None
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            payload = parts[1]
+            payload += "=" * (4 - len(payload) % 4)
+            decoded = base64.b64decode(payload)
+            claims = json.loads(decoded)
+            return claims.get("role")
+    except Exception:
+        pass
+    return None
+
+# Auto-detect which key is actually the anon key vs service role key
+# by inspecting the JWT 'role' claim
+_anon_key = None
+_service_role_key = None
+
+for name, key in [("SUPABASE_KEY", SUPABASE_KEY), ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_KEY)]:
+    if not key:
+        continue
+    role = _decode_jwt_role(key)
+    if role == "service_role":
+        _service_role_key = key
+        print(f"  {name} -> role=service_role")
+    elif role == "anon":
+        _anon_key = key
+        print(f"  {name} -> role=anon")
+    else:
+        print(f"  {name} -> not a JWT or unknown role (starts with {key[:15]}...)")
+
+# Fallback: if no anon key found via JWT, use whatever is available
+if not _anon_key:
+    _anon_key = SUPABASE_SERVICE_KEY or SUPABASE_KEY
+
+# Pick the best key for the global client
+if _service_role_key:
+    _effective_key = _service_role_key
+    _key_type = "service_role"
+else:
+    _effective_key = _anon_key
+    _key_type = "anon"
+
+print(f"Supabase client using: {_key_type} key")
+if _key_type == "anon":
+    print("  Note: No service_role key found. RLS policies must allow user operations.")
 
 try:
     supabase: Client = create_client(SUPABASE_URL, _effective_key)
@@ -32,42 +78,29 @@ class UserDatabase:
     def _get_client_with_token(self, user_token: str = None):
         """Get a Supabase client with the user's JWT set for RLS.
         If using service_role key, token is not needed (RLS bypassed).
-        If using anon key, we need to set the user's JWT for RLS policies.
+        If using anon key, we MUST set the user's JWT for RLS auth.uid().
         """
         if _key_type == "service_role":
             return supabase
         
         if not user_token:
-            print("⚠️ No user token provided and using anon key — RLS may block writes!")
-            print("   Set SUPABASE_SERVICE_ROLE_KEY in your environment to bypass RLS.")
+            print("Warning: No user token provided and using anon key — RLS may block writes!")
             return supabase
         
-        # For anon key + user token: set the auth header so RLS sees auth.uid()
+        # Create a client with the anon key but authenticate as the user
         try:
-            client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            client = create_client(SUPABASE_URL, _anon_key)
             
-            # Method 1: Set PostgREST auth token
+            # Set the user's JWT for PostgREST auth
             client.postgrest.auth(user_token)
             
-            # Method 2: Also set the Authorization header directly on the PostgREST session
-            # This ensures auth.uid() resolves in RLS policies
+            # Also set Authorization header on the underlying HTTP session
             if hasattr(client.postgrest, 'session') and client.postgrest.session:
-                client.postgrest.session.headers.update({
-                    "Authorization": f"Bearer {user_token}"
-                })
-            
-            # Method 3: Set headers on the client's internal _headers dict if available
-            if hasattr(client, '_headers'):
-                client._headers["Authorization"] = f"Bearer {user_token}"
-            
-            # Method 4: Set on options if available (supabase-py v2+)
-            if hasattr(client, 'options') and hasattr(client.options, 'headers'):
-                client.options.headers["Authorization"] = f"Bearer {user_token}"
+                client.postgrest.session.headers["Authorization"] = f"Bearer {user_token}"
             
             return client
         except Exception as e:
             print(f"Error creating authenticated client: {e}")
-            print(f"⚠️ Falling back to global client — RLS may block writes!")
             return supabase
     
     # User Management
