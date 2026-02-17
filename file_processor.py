@@ -79,7 +79,68 @@ def read_pdf_file(file_path: str) -> List[dict]:
         except Exception as e:
             print(f"pdfplumber failed: {e}")
 
+    # Post-process: detect chapters/sections for each page
+    _detect_chapters(pages)
+    
     return pages
+
+
+def _detect_chapters(pages: List[dict]):
+    """
+    Scan pages for chapter/section headings and add 'chapter' metadata.
+    Supports patterns like:
+      - Chapter 1: Introduction
+      - CHAPTER 1 – OVERVIEW  
+      - Section 2.1: Data Processing
+      - 1. Introduction
+      - 1.1 Getting Started
+      - INTRODUCTION (all-caps lines at start of page)
+      - Part I: Foundations
+      - Unit 3: Neural Networks
+    """
+    import re
+    
+    chapter_patterns = [
+        # Chapter N: Title or Chapter N — Title  
+        re.compile(r'^(?:chapter|ch\.?)\s*(\d+)\s*[:\-–—.]\s*(.+)', re.IGNORECASE | re.MULTILINE),
+        # Part N: Title
+        re.compile(r'^(?:part|unit|module|lesson)\s*(\d+|[IVXLC]+)\s*[:\-–—.]\s*(.+)', re.IGNORECASE | re.MULTILINE),
+        # Section N.N: Title
+        re.compile(r'^(?:section)\s*([\d.]+)\s*[:\-–—.]\s*(.+)', re.IGNORECASE | re.MULTILINE),
+        # Numbered heading: 1. Introduction or 1.1 Getting Started
+        re.compile(r'^(\d+(?:\.\d+)?)\s*[.):\-–—]\s+([A-Z][A-Za-z\s]{3,50})$', re.MULTILINE),
+    ]
+    
+    current_chapter = "Introduction"
+    
+    for page_obj in pages:
+        text = page_obj["text"]
+        # Check first 500 chars for heading patterns
+        header_text = text[:500]
+        
+        found = False
+        for pattern in chapter_patterns:
+            match = pattern.search(header_text)
+            if match:
+                groups = match.groups()
+                if len(groups) >= 2:
+                    num, title = groups[0], groups[1].strip()
+                    current_chapter = f"{num}. {title}" if title else f"Section {num}"
+                else:
+                    current_chapter = groups[0].strip()
+                found = True
+                break
+        
+        # Fallback: check for ALL-CAPS title at the very start of the page
+        if not found:
+            first_line = text.strip().split('\n')[0].strip()
+            if (first_line.isupper() and 
+                5 < len(first_line) < 80 and 
+                not first_line.startswith('PAGE') and
+                not first_line.startswith('TABLE')):
+                current_chapter = first_line.title()
+        
+        page_obj["chapter"] = current_chapter
 
 
 # -------------------------------------------------

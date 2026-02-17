@@ -143,6 +143,15 @@
       "chunks_created": 0,
       "processed": true,
       "uploaded_at": "2026-02-17T17:33:31.641821"
+    },
+    {
+      "id": 17,
+      "file_name": "airelatedpdfbook1.pdf.pdf",
+      "file_type": "application/pdf",
+      "file_size": 31293058,
+      "chunks_created": 1685,
+      "processed": true,
+      "uploaded_at": "2026-02-17T20:21:13.204536"
     }
   ]
 }

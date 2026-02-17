@@ -35,7 +35,8 @@ def process_file(
     source: str = "single"
 ) -> Dict:
     """
-    Process ONE file and store it in Pinecone with user-specific namespace
+    Process ONE file and store it in Pinecone with user-specific namespace.
+    Supports large PDFs/textbooks via batch processing and chapter detection.
     
     Args:
         file_path: Path to the file
@@ -89,6 +90,16 @@ def process_file(
     pages, _ = read_file(file_path)
     print(f"✅ Extracted {len(pages)} pages/rows/sections")
     
+    # For large files, log chapter info if available
+    chapters_found = set()
+    for p in pages:
+        ch = p.get("chapter", "")
+        if ch:
+            chapters_found.add(ch)
+    if chapters_found:
+        print(f"📚 Detected {len(chapters_found)} chapters/sections: {list(chapters_found)[:10]}")
+    
+    BATCH_SIZE = 50  # Process in batches to avoid memory/timeout issues
     embedded_chunks = []
     total_chunks = 0
 
@@ -109,13 +120,18 @@ def process_file(
             
             vector = vector_list[0] 
             
-            # 4. Attach Metadata (including user_id for filtering)
+            # 4. Attach Metadata (including chapter and user_id)
             metadata = {
                 "text": text_chunk,
                 "page": str(page_obj["page"]), 
                 "doc_name": page_obj["doc_name"],
                 "path": page_obj["path"]
             }
+            
+            # Add chapter info if available
+            chapter = page_obj.get("chapter", "")
+            if chapter:
+                metadata["chapter"] = chapter
             
             # Add user_id to metadata for additional filtering
             if user_id:
@@ -126,19 +142,27 @@ def process_file(
                 "metadata": metadata
             })
             total_chunks += 1
+            
+            # 5. Batch upsert — flush every BATCH_SIZE chunks
+            if len(embedded_chunks) >= BATCH_SIZE:
+                store_in_pinecone(embedded_chunks, namespace)
+                print(f"  📌 Batch stored: {total_chunks} chunks so far...")
+                embedded_chunks = []
 
-    # 5. Store in Pinecone with user-specific namespace
+    # 6. Store remaining chunks
     if embedded_chunks:
         store_in_pinecone(embedded_chunks, namespace)
-        print(f"📌 Stored {total_chunks} chunks in namespace '{namespace}'")
-    else:
-        print(f"⚠️ No chunks generated for {file_name}. Skipping Pinecone storage.")
+    
+    print(f"📌 Stored {total_chunks} total chunks in namespace '{namespace}'")
+    if chapters_found:
+        print(f"📚 Chapters indexed: {len(chapters_found)}")
 
     return {
         "file_name": file_name,
         "file_path": file_path,
         "file_type": file_type,
         "chunks_created": total_chunks,
+        "chapters_found": len(chapters_found),
         "namespace": namespace,
         "user_id": user_id
     }

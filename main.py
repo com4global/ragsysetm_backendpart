@@ -551,6 +551,301 @@ def _save_local_file_metadata(files_list):
     except Exception as e:
         logger.error(f"Error saving local file metadata: {e}")
 
+# ============================================================
+# EDTECH AI TEACHER ENDPOINTS
+# ============================================================
+
+@app.get("/api/edtech/documents")
+async def edtech_list_documents(
+    current_user: User = Depends(get_current_user)
+):
+    """List user's processed documents available for AI Teacher lessons."""
+    try:
+        # Get files from Supabase (the same source used by admin panel)
+        supabase_files = user_db.get_user_files(current_user.id, user_token=current_user.access_token)
+        
+        # Only show processed files (those with chunks in the vector DB)
+        processed_docs = []
+        for f in supabase_files:
+            if f.get('processed'):
+                processed_docs.append({
+                    "filename": f.get('filename'),
+                    "file_type": f.get('file_type', 'document'),
+                    "chunks_created": f.get('chunks_created', 0),
+                    "uploaded_at": f.get('created_at')
+                })
+        
+        return {"success": True, "documents": processed_docs}
+    
+    except Exception as e:
+        logger.error(f"EdTech document list failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/edtech/chapters")
+async def edtech_get_chapters(
+    doc_name: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Get all chapters/sections detected in a processed document."""
+    try:
+        from vectorstore import index, get_user_namespaces
+        from collections import defaultdict
+        import re as _re
+
+        namespaces = get_user_namespaces(current_user.id)
+        all_chunks = []
+
+        for ns in namespaces:
+            try:
+                dummy_vec = [0.0] * 1536
+                res = index.query(
+                    vector=dummy_vec,
+                    top_k=10000,
+                    include_metadata=True,
+                    namespace=ns,
+                    filter={"doc_name": {"$eq": doc_name}}
+                )
+                for match in res.matches:
+                    meta = match.metadata
+                    text = meta.get("text", "")
+                    page = meta.get("page", "")
+                    chapter = meta.get("chapter", "")
+                    if text:
+                        all_chunks.append({
+                            "text": text,
+                            "page": page,
+                            "chapter": chapter
+                        })
+            except Exception as e:
+                logger.warning(f"Namespace {ns} query failed: {e}")
+                continue
+
+        if not all_chunks:
+            return {"success": True, "chapters": [], "message": f"No chunks found for document '{doc_name}'."}
+
+        # Group chunks by chapter
+        chapter_groups = defaultdict(list)
+        for c in all_chunks:
+            ch = c.get("chapter", "") or "Untitled Section"
+            chapter_groups[ch].append(c)
+
+        def _page_num(p):
+            nums = _re.findall(r'\d+', str(p))
+            return int(nums[0]) if nums else 0
+
+        # Build chapter list with metadata
+        chapters = []
+        for ch_name, ch_chunks in chapter_groups.items():
+            page_nums = [_page_num(c.get("page", "0")) for c in ch_chunks]
+            page_nums = [p for p in page_nums if p > 0]
+            chapters.append({
+                "name": ch_name,
+                "chunk_count": len(ch_chunks),
+                "page_start": min(page_nums) if page_nums else 0,
+                "page_end": max(page_nums) if page_nums else 0,
+                "preview": ch_chunks[0]["text"][:200] + "..." if ch_chunks else ""
+            })
+
+        # Sort by page_start to maintain book order
+        chapters.sort(key=lambda x: x["page_start"])
+
+        logger.info(f"📚 EdTech: Found {len(chapters)} chapters in '{doc_name}' ({len(all_chunks)} total chunks)")
+
+        return {
+            "success": True,
+            "chapters": chapters,
+            "document": doc_name,
+            "total_chunks": len(all_chunks)
+        }
+
+    except Exception as e:
+        logger.error(f"EdTech chapter listing failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/edtech/topics")
+async def edtech_extract_topics(
+    doc_name: str,
+    current_user: User = Depends(get_current_user),
+    language: str = "en",
+    chapter: str = ""
+):
+    """
+    Extract teaching topics from a document.
+    If 'chapter' is provided, extracts DETAILED topics from only that chapter's chunks.
+    Otherwise, samples across the entire document (fallback for small docs).
+    """
+    try:
+        from edtech_service import extract_topics
+        from vectorstore import index, get_user_namespaces
+        import re as _re
+
+        namespaces = get_user_namespaces(current_user.id)
+        all_chunks = []
+
+        # Build Pinecone filter — optionally filter by chapter
+        if chapter:
+            pinecone_filter = {
+                "$and": [
+                    {"doc_name": {"$eq": doc_name}},
+                    {"chapter": {"$eq": chapter}}
+                ]
+            }
+        else:
+            pinecone_filter = {"doc_name": {"$eq": doc_name}}
+
+        for ns in namespaces:
+            try:
+                dummy_vec = [0.0] * 1536
+                res = index.query(
+                    vector=dummy_vec,
+                    top_k=10000,
+                    include_metadata=True,
+                    namespace=ns,
+                    filter=pinecone_filter
+                )
+                for match in res.matches:
+                    meta = match.metadata
+                    text = meta.get("text", "")
+                    page = meta.get("page", "")
+                    ch = meta.get("chapter", "")
+                    if text:
+                        all_chunks.append({
+                            "text": text,
+                            "page": page,
+                            "chapter": ch
+                        })
+            except Exception as e:
+                logger.warning(f"Namespace {ns} query failed: {e}")
+                continue
+
+        if not all_chunks:
+            msg = f"No chunks found for chapter '{chapter}'" if chapter else f"No chunks found for '{doc_name}'"
+            return {"success": True, "topics": [], "message": msg}
+
+        # Sort by page number
+        def _page_num(x):
+            nums = _re.findall(r'\d+', str(x.get("page", "0")))
+            return int(nums[0]) if nums else 0
+        all_chunks.sort(key=_page_num)
+
+        logger.info(f"📚 EdTech topics: {len(all_chunks)} chunks for '{doc_name}'" +
+                     (f" chapter='{chapter}'" if chapter else ""))
+
+        CHAR_BUDGET = 15000
+
+        if chapter:
+            # CHAPTER-SPECIFIC: use all chunks from this chapter for detailed topics
+            content_parts = []
+            total_chars = 0
+            for c in all_chunks:
+                part = f"[Page {c['page']}]\n{c['text']}"
+                if total_chars + len(part) > CHAR_BUDGET:
+                    break
+                content_parts.append(part)
+                total_chars += len(part)
+        else:
+            # WHOLE DOC fallback: sample strategically
+            MAX_SAMPLE = 40
+            if len(all_chunks) > MAX_SAMPLE:
+                step = max(1, len(all_chunks) // MAX_SAMPLE)
+                sampled = [all_chunks[i] for i in range(0, len(all_chunks), step)][:MAX_SAMPLE]
+            else:
+                sampled = all_chunks
+
+            content_parts = []
+            total_chars = 0
+            for c in sampled:
+                ch_label = f" | Chapter: {c['chapter']}" if c.get('chapter') else ""
+                part = f"[Page {c['page']}{ch_label}]\n{c['text']}"
+                if total_chars + len(part) > CHAR_BUDGET:
+                    break
+                content_parts.append(part)
+                total_chars += len(part)
+
+        combined = "\n\n---\n\n".join(content_parts)
+        logger.info(f"📚 Sending {len(content_parts)} chunks ({total_chars} chars) to LLM" +
+                     (f" [chapter: {chapter}]" if chapter else " [whole doc]"))
+
+        topics = extract_topics(combined, language, [doc_name])
+
+        return {
+            "success": True,
+            "topics": topics,
+            "document": doc_name,
+            "chapter": chapter,
+            "chunks_used": len(content_parts),
+            "total_chunks": len(all_chunks)
+        }
+
+    except Exception as e:
+        logger.error(f"EdTech topic extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/edtech/generate-lesson")
+async def edtech_generate_lesson(
+    topic: str = Form(...),
+    language: str = Form("en"),
+    current_user: User = Depends(get_current_user)
+):
+    """Generate an AI teacher dialogue lesson for a specific topic."""
+    try:
+        from edtech_service import generate_teacher_dialogue
+        from embedder import embed_User_query
+        from vectorstore import search_user_documents
+
+        # Search for relevant chunks about this topic
+        query_vec = embed_User_query(topic)
+        results = search_user_documents(query_vec, current_user.id, top_k=10)
+
+        if not results:
+            return {"success": False, "detail": "No relevant content found for this topic. Please process more documents."}
+
+        # Include document references so the dialogue is grounded
+        chunks_with_refs = []
+        for r in results:
+            text = r.get("text", "")
+            doc_name = r.get("doc_name", "Unknown")
+            page = r.get("page", "")
+            if text:
+                chunks_with_refs.append(f"[From: {doc_name}, Page: {page}]\n{text}")
+
+        if not chunks_with_refs:
+            return {"success": False, "detail": "No relevant content found for this topic."}
+
+        combined = "\n\n---\n\n".join(chunks_with_refs)
+        lesson = generate_teacher_dialogue(topic, combined, language)
+
+        return {"success": True, "lesson": lesson}
+
+    except Exception as e:
+        logger.error(f"EdTech lesson generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/edtech/ask")
+async def edtech_ask_question(
+    question: str = Form(...),
+    topic: str = Form(""),
+    language: str = Form("en"),
+    current_user: User = Depends(get_current_user)
+):
+    """Answer a student's question using RAG within the lesson context."""
+    try:
+        from QueryProcessor import process_user_query
+
+        # Enhance question with topic context
+        enhanced_q = f"[Topic: {topic}] {question}" if topic else question
+        result = process_user_query(enhanced_q, user_id=current_user.id, language=language)
+
+        return {"success": True, "answer": result.get("answer", ""), "sources": result.get("sources", [])}
+
+    except Exception as e:
+        logger.error(f"EdTech Q&A failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/analyze-legal")
 async def analyze_legal_endpoint(
     file: Optional[UploadFile] = File(None),
