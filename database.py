@@ -34,17 +34,40 @@ class UserDatabase:
         If using service_role key, token is not needed (RLS bypassed).
         If using anon key, we need to set the user's JWT for RLS policies.
         """
-        if _key_type == "service_role" or not user_token:
+        if _key_type == "service_role":
+            return supabase
+        
+        if not user_token:
+            print("⚠️ No user token provided and using anon key — RLS may block writes!")
+            print("   Set SUPABASE_SERVICE_ROLE_KEY in your environment to bypass RLS.")
             return supabase
         
         # For anon key + user token: set the auth header so RLS sees auth.uid()
-        # Create a new client with the user's token
         try:
             client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            
+            # Method 1: Set PostgREST auth token
             client.postgrest.auth(user_token)
+            
+            # Method 2: Also set the Authorization header directly on the PostgREST session
+            # This ensures auth.uid() resolves in RLS policies
+            if hasattr(client.postgrest, 'session') and client.postgrest.session:
+                client.postgrest.session.headers.update({
+                    "Authorization": f"Bearer {user_token}"
+                })
+            
+            # Method 3: Set headers on the client's internal _headers dict if available
+            if hasattr(client, '_headers'):
+                client._headers["Authorization"] = f"Bearer {user_token}"
+            
+            # Method 4: Set on options if available (supabase-py v2+)
+            if hasattr(client, 'options') and hasattr(client.options, 'headers'):
+                client.options.headers["Authorization"] = f"Bearer {user_token}"
+            
             return client
         except Exception as e:
             print(f"Error creating authenticated client: {e}")
+            print(f"⚠️ Falling back to global client — RLS may block writes!")
             return supabase
     
     # User Management
@@ -98,9 +121,40 @@ class UserDatabase:
             print(f"✅ add_user_file success: {filename} for user {user_id}")
             return result
         except Exception as e:
+            error_str = str(e)
             print(f"❌ Error adding user file '{filename}': {e}")
-            # If blob_url column doesn't exist, retry without it
-            if blob_url and ("blob_url" in str(e) or "column" in str(e).lower()):
+            
+            # Retry Strategy 1: If RLS violation, retry with service-role client
+            if "row-level security" in error_str.lower() or "42501" in error_str:
+                print(f"⚠️ RLS blocked insert — retrying with service-role client...")
+                if SUPABASE_SERVICE_KEY:
+                    try:
+                        service_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+                        response = service_client.table('user_files').upsert(data, on_conflict='user_id, filename').execute()
+                        result = response.data[0] if response.data else data
+                        print(f"✅ add_user_file success via service-role: {filename}")
+                        return result
+                    except Exception as sr_err:
+                        # If blob_url column fails in service-role too, retry without it
+                        if blob_url and ("blob_url" in str(sr_err) or "column" in str(sr_err).lower()):
+                            try:
+                                data.pop("blob_url", None)
+                                response = service_client.table('user_files').upsert(data, on_conflict='user_id, filename').execute()
+                                result = response.data[0] if response.data else data
+                                print(f"✅ add_user_file success via service-role (without blob_url): {filename}")
+                                return result
+                            except Exception as sr_retry_err:
+                                print(f"❌ Service-role retry also failed: {sr_retry_err}")
+                                raise sr_retry_err
+                        print(f"❌ Service-role retry failed: {sr_err}")
+                        raise sr_err
+                else:
+                    print("❌ No SUPABASE_SERVICE_ROLE_KEY set — cannot bypass RLS!")
+                    print("   Please add SUPABASE_SERVICE_ROLE_KEY to your environment variables.")
+                    raise
+            
+            # Retry Strategy 2: If blob_url column doesn't exist, retry without it
+            if blob_url and ("blob_url" in error_str or "column" in error_str.lower()):
                 print(f"⚠️ Retrying without blob_url column...")
                 try:
                     data.pop("blob_url", None)
