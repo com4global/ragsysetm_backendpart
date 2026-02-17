@@ -554,6 +554,7 @@ async def analyze_legal_endpoint(
         from legal_service import analyze_legal_document
         from file_processor import read_file
         import json
+        import traceback
         
         content = ""
         page_count = None
@@ -565,8 +566,8 @@ async def analyze_legal_endpoint(
             # Always save to temp and use file_processor for proper extraction
             temp_path = BASE_DIR / f"temp_{file.filename}"
             try:
-                with open(temp_path, "wb") as f:
-                    f.write(file_content)
+                with open(temp_path, "wb") as tmp_f:
+                    tmp_f.write(file_content)
                 
                 try:
                     pages, file_type = read_file(str(temp_path))
@@ -604,6 +605,7 @@ async def analyze_legal_endpoint(
         raise
     except Exception as e:
         logger.error(f"Legal Analysis failed: {e}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 
