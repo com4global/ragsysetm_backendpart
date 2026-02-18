@@ -402,7 +402,11 @@ def get_cached_video(user_id: str, doc_name: str, topic: str) -> Optional[Dict]:
 import re
 
 # Directory for cached TTS audio files
-TTS_AUDIO_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "static" / "tts_audio"
+# On production (Linux), the app dir is read-only — use /tmp instead
+if os.name == "nt":
+    TTS_AUDIO_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "static" / "tts_audio"
+else:
+    TTS_AUDIO_DIR = Path("/tmp") / "tts_audio"
 TTS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # TTS Cache file (separate from HeyGen cache)

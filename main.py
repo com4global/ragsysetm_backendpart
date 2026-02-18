@@ -114,8 +114,12 @@ app.add_middleware(
 )
 
 # Mount static files for TTS audio
+# On production (Linux), use /tmp since app dir is read-only
 import pathlib as _pathlib
-_tts_audio_dir = _pathlib.Path(__file__).parent / "static" / "tts_audio"
+if os.name == "nt":
+    _tts_audio_dir = _pathlib.Path(__file__).parent / "static" / "tts_audio"
+else:
+    _tts_audio_dir = _pathlib.Path("/tmp") / "tts_audio"
 _tts_audio_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/static/tts_audio", StaticFiles(directory=str(_tts_audio_dir)), name="tts_audio")
 
