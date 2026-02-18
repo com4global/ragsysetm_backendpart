@@ -793,6 +793,68 @@ async def edtech_extract_topics(
         logger.error(f"EdTech topic extraction failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ══════════════════════════════════════════════════════════════════════
+# ▸ Lesson Cache Helpers (Supabase DB + Storage)
+# ══════════════════════════════════════════════════════════════════════
+
+def _lesson_cache_key(user_id: str, doc_name: str, topic: str, language: str, lesson_type: str) -> str:
+    """Generate a deterministic cache key."""
+    import hashlib
+    raw = f"{user_id}:{doc_name}:{topic}:{language}:{lesson_type}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _get_cached_lesson(cache_key: str):
+    """Check lesson_cache table for a matching entry. Returns dict or None."""
+    try:
+        result = supabase.table("lesson_cache").select("*").eq("cache_key", cache_key).limit(1).execute()
+        if result.data and len(result.data) > 0:
+            return result.data[0]
+    except Exception as e:
+        logger.warning(f"Lesson cache lookup failed (non-fatal): {e}")
+    return None
+
+
+def _save_lesson_cache(
+    user_id: str, cache_key: str, topic: str, doc_name: str,
+    language: str, lesson_type: str, lesson_json: dict,
+    audio_storage_paths: list = None
+):
+    """Save a lesson to the cache table."""
+    try:
+        supabase.table("lesson_cache").upsert({
+            "user_id": user_id,
+            "cache_key": cache_key,
+            "topic": topic,
+            "doc_name": doc_name,
+            "language": language,
+            "lesson_type": lesson_type,
+            "lesson_json": lesson_json,
+            "audio_storage_paths": audio_storage_paths or [],
+            "updated_at": datetime.utcnow().isoformat()
+        }, on_conflict="cache_key").execute()
+        logger.info(f"✅ Lesson cached: {topic} ({lesson_type})")
+    except Exception as e:
+        logger.warning(f"Lesson cache save failed (non-fatal): {e}")
+
+
+def _upload_audio_to_storage(local_path: str, storage_path: str) -> str:
+    """Upload an audio file to Supabase Storage 'tts-cache' bucket. Returns public URL."""
+    try:
+        with open(local_path, "rb") as f:
+            audio_bytes = f.read()
+        supabase.storage.from_("tts-cache").upload(
+            path=storage_path,
+            file=audio_bytes,
+            file_options={"content-type": "audio/mpeg", "upsert": "true"}
+        )
+        # Build public URL
+        sb_url = os.getenv("SUPABASE_URL", "")
+        return f"{sb_url}/storage/v1/object/public/tts-cache/{storage_path}"
+    except Exception as e:
+        logger.warning(f"Audio upload to Storage failed: {e}")
+        return ""
+
 
 @app.post("/api/edtech/generate-lesson")
 async def edtech_generate_lesson(
@@ -805,6 +867,16 @@ async def edtech_generate_lesson(
         from edtech_service import generate_teacher_dialogue
         from embedder import embed_User_query
         from vectorstore import search_user_documents
+
+        # ── 1. Check cache first ──
+        cache_key = _lesson_cache_key(current_user.id, "", topic, language, "conversation")
+        cached = _get_cached_lesson(cache_key)
+        if cached:
+            logger.info(f"🎯 Lesson cache HIT: {topic}")
+            return {"success": True, "lesson": cached["lesson_json"], "cached": True}
+
+        # ── 2. Cache miss — generate from scratch ──
+        logger.info(f"🔄 Lesson cache MISS: {topic}")
 
         # Search for relevant chunks about this topic
         query_vec = embed_User_query(topic)
@@ -828,13 +900,14 @@ async def edtech_generate_lesson(
         combined = "\n\n---\n\n".join(chunks_with_refs)
         lesson = generate_teacher_dialogue(topic, combined, language)
 
-        # ── Generate TTS audio for each dialogue line ──
+        # ── 3. Generate TTS audio for each dialogue line ──
         audio_urls = []
+        audio_storage_paths = []
         voice_map = lesson.get("voice_map", {})
         dialogue = lesson.get("dialogue", [])
         if dialogue and voice_map:
             try:
-                from heygen_service import generate_dialogue_audio
+                from heygen_service import generate_dialogue_audio, TTS_AUDIO_DIR
                 audio_files = generate_dialogue_audio(
                     dialogue_lines=dialogue,
                     voice_map=voice_map,
@@ -842,15 +915,40 @@ async def edtech_generate_lesson(
                     user_id=current_user.id,
                     doc_name=doc_name
                 )
-                # Convert filenames to URLs
-                audio_urls = [
-                    f"/static/tts_audio/{f}" if f else "" for f in audio_files
-                ]
+                # Upload each audio file to Supabase Storage
+                for f in audio_files:
+                    if f:
+                        local_file = TTS_AUDIO_DIR / f
+                        storage_path = f"dialogue/{current_user.id}/{f}"
+                        public_url = _upload_audio_to_storage(str(local_file), storage_path)
+                        if public_url:
+                            audio_urls.append(public_url)
+                            audio_storage_paths.append(storage_path)
+                        else:
+                            # Fallback to local static path
+                            audio_urls.append(f"/static/tts_audio/{f}")
+                            audio_storage_paths.append("")
+                    else:
+                        audio_urls.append("")
+                        audio_storage_paths.append("")
             except Exception as audio_err:
                 logger.warning(f"Dialogue audio generation failed (non-fatal): {audio_err}")
                 audio_urls = []
 
         lesson["audio_urls"] = audio_urls
+
+        # ── 4. Save to cache ──
+        _save_lesson_cache(
+            user_id=current_user.id,
+            cache_key=cache_key,
+            topic=topic,
+            doc_name=doc_name if chunks_with_refs else "",
+            language=language,
+            lesson_type="conversation",
+            lesson_json=lesson,
+            audio_storage_paths=audio_storage_paths
+        )
+
         return {"success": True, "lesson": lesson}
 
     except Exception as e:
@@ -1042,9 +1140,19 @@ async def edtech_generate_tts_video(
     This is synchronous — no polling needed (takes ~5-10 seconds).
     """
     try:
-        from heygen_service import generate_tts_video_for_topic
+        from heygen_service import generate_tts_video_for_topic, TTS_AUDIO_DIR
         from embedder import embed_User_query
         from vectorstore import search_user_documents
+
+        # ── 1. Check cache first ──
+        cache_key = _lesson_cache_key(current_user.id, doc_name, topic, language, "tts_video")
+        cached = _get_cached_lesson(cache_key)
+        if cached:
+            logger.info(f"🎯 TTS video cache HIT: {topic}")
+            return {"success": True, **cached["lesson_json"], "cached": True}
+
+        # ── 2. Cache miss — generate from scratch ──
+        logger.info(f"🔄 TTS video cache MISS: {topic}")
 
         # Search for relevant chunks
         query_vec = embed_User_query(topic)
@@ -1083,10 +1191,34 @@ async def edtech_generate_tts_video(
             voice=voice
         )
 
+        # ── 3. Upload audio to Supabase Storage + build response ──
+        audio_storage_paths = []
         if result.get("status") == "completed" and result.get("audio_filename"):
-            result["audio_url"] = f"/static/tts_audio/{result['audio_filename']}"
+            local_file = TTS_AUDIO_DIR / result["audio_filename"]
+            storage_path = f"tts_video/{current_user.id}/{result['audio_filename']}"
+            public_url = _upload_audio_to_storage(str(local_file), storage_path)
+            if public_url:
+                result["audio_url"] = public_url
+                audio_storage_paths = [storage_path]
+            else:
+                result["audio_url"] = f"/static/tts_audio/{result['audio_filename']}"
 
-        return {"success": result.get("status") != "failed", **result}
+        response = {"success": result.get("status") != "failed", **result}
+
+        # ── 4. Save to cache ──
+        if result.get("status") == "completed":
+            _save_lesson_cache(
+                user_id=current_user.id,
+                cache_key=cache_key,
+                topic=topic,
+                doc_name=doc_name,
+                language=language,
+                lesson_type="tts_video",
+                lesson_json=response,
+                audio_storage_paths=audio_storage_paths
+            )
+
+        return response
 
     except Exception as e:
         logger.error(f"TTS video generation failed: {e}")
