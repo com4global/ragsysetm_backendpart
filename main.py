@@ -113,6 +113,12 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
+# Mount static files for TTS audio
+import pathlib as _pathlib
+_tts_audio_dir = _pathlib.Path(__file__).parent / "static" / "tts_audio"
+_tts_audio_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/static/tts_audio", StaticFiles(directory=str(_tts_audio_dir)), name="tts_audio")
+
 # RESOURCES_DIR is split into WRITE and STATIC. 
 # Helpers will resolve paths dynamically.
 
@@ -818,6 +824,29 @@ async def edtech_generate_lesson(
         combined = "\n\n---\n\n".join(chunks_with_refs)
         lesson = generate_teacher_dialogue(topic, combined, language)
 
+        # ── Generate TTS audio for each dialogue line ──
+        audio_urls = []
+        voice_map = lesson.get("voice_map", {})
+        dialogue = lesson.get("dialogue", [])
+        if dialogue and voice_map:
+            try:
+                from heygen_service import generate_dialogue_audio
+                audio_files = generate_dialogue_audio(
+                    dialogue_lines=dialogue,
+                    voice_map=voice_map,
+                    topic=topic,
+                    user_id=current_user.id,
+                    doc_name=doc_name
+                )
+                # Convert filenames to URLs
+                audio_urls = [
+                    f"/static/tts_audio/{f}" if f else "" for f in audio_files
+                ]
+            except Exception as audio_err:
+                logger.warning(f"Dialogue audio generation failed (non-fatal): {audio_err}")
+                audio_urls = []
+
+        lesson["audio_urls"] = audio_urls
         return {"success": True, "lesson": lesson}
 
     except Exception as e:
@@ -845,6 +874,220 @@ async def edtech_ask_question(
     except Exception as e:
         logger.error(f"EdTech Q&A failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# HEYGEN VIDEO GENERATION ENDPOINTS
+# ============================================================
+
+@app.post("/api/edtech/generate-video")
+async def edtech_generate_video(
+    topic: str = Form(...),
+    doc_name: str = Form(""),
+    language: str = Form("en"),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Generate an AI teaching video for a specific topic.
+    Uses HeyGen Video Agent API.
+    Pipeline: chunks → LLM script → HeyGen → video_id (async)
+    """
+    try:
+        from heygen_service import generate_video_for_topic, get_cached_video
+        from embedder import embed_User_query
+        from vectorstore import search_user_documents
+
+        # 1. Check cache — return immediately if video exists
+        cached = get_cached_video(current_user.id, doc_name, topic)
+        if cached and cached.get("video_url"):
+            return {
+                "success": True,
+                "status": "completed",
+                "video_url": cached["video_url"],
+                "video_id": cached.get("video_id", ""),
+                "cached": True,
+                "message": "Video already generated!"
+            }
+
+        # 2. Search for relevant chunks about this topic (same as lesson generation)
+        query_vec = embed_User_query(topic)
+        results = search_user_documents(query_vec, current_user.id, top_k=10)
+
+        if not results:
+            return {
+                "success": False,
+                "status": "failed",
+                "error": "No relevant content found for this topic. Please process more documents."
+            }
+
+        # 3. Combine chunks with source references
+        chunks_with_refs = []
+        for r in results:
+            text = r.get("text", "")
+            source = r.get("doc_name", "Unknown")
+            page = r.get("page", "")
+            if text:
+                chunks_with_refs.append(f"[From: {source}, Page: {page}]\n{text}")
+
+        if not chunks_with_refs:
+            return {
+                "success": False,
+                "status": "failed",
+                "error": "No relevant content found for this topic."
+            }
+
+        combined_content = "\n\n---\n\n".join(chunks_with_refs)
+
+        # 4. Generate video (script + HeyGen call)
+        result = generate_video_for_topic(
+            topic=topic,
+            content=combined_content,
+            user_id=current_user.id,
+            doc_name=doc_name,
+            language=language
+        )
+
+        return {
+            "success": result.get("status") != "failed",
+            **result
+        }
+
+    except Exception as e:
+        logger.error(f"EdTech video generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/edtech/video-status")
+async def edtech_video_status(
+    video_id: str,
+    topic: str = "",
+    doc_name: str = "",
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Check the status of a HeyGen video generation.
+    The frontend polls this endpoint until status = 'completed' or 'failed'.
+    When completed, the video URL is cached for future use.
+    """
+    try:
+        from heygen_service import check_video_status, update_video_cache
+
+        result = check_video_status(video_id)
+
+        # If video is completed, cache the URL for future requests
+        if result.get("status") == "completed" and result.get("video_url"):
+            if topic and current_user.id:
+                update_video_cache(
+                    user_id=current_user.id,
+                    doc_name=doc_name,
+                    topic=topic,
+                    video_url=result["video_url"],
+                    video_id=video_id,
+                    thumbnail_url=result.get("thumbnail_url", "")
+                )
+
+        return {"success": True, **result}
+
+    except Exception as e:
+        logger.error(f"Video status check failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/edtech/video-cache")
+async def edtech_video_cache(
+    topic: str,
+    doc_name: str = "",
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Quick check: does a completed video already exist for this topic?
+    Used by the frontend to show 'Play Video' vs 'Generate Video' button.
+    """
+    try:
+        from heygen_service import get_cached_video
+
+        cached = get_cached_video(current_user.id, doc_name, topic)
+
+        if cached and cached.get("video_url"):
+            return {
+                "success": True,
+                "has_video": True,
+                "video_url": cached["video_url"],
+                "video_id": cached.get("video_id", ""),
+                "thumbnail_url": cached.get("thumbnail_url", "")
+            }
+
+        return {"success": True, "has_video": False}
+
+    except Exception as e:
+        logger.error(f"Video cache check failed: {e}")
+        return {"success": True, "has_video": False}
+
+
+@app.post("/api/edtech/generate-tts-video")
+async def edtech_generate_tts_video(
+    topic: str = Form(...),
+    doc_name: str = Form(""),
+    language: str = Form("en"),
+    voice: str = Form("nova"),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Generate a TTS teaching video (script + audio) using OpenAI TTS.
+    Returns audio URL + sentences for subtitle sync.
+    This is synchronous — no polling needed (takes ~5-10 seconds).
+    """
+    try:
+        from heygen_service import generate_tts_video_for_topic
+        from embedder import embed_User_query
+        from vectorstore import search_user_documents
+
+        # Search for relevant chunks
+        query_vec = embed_User_query(topic)
+        results = search_user_documents(query_vec, current_user.id, top_k=10)
+
+        if not results:
+            return {
+                "success": False,
+                "status": "failed",
+                "error": "No relevant content found for this topic."
+            }
+
+        chunks_with_refs = []
+        for r in results:
+            text = r.get("text", "")
+            source = r.get("doc_name", "Unknown")
+            page = r.get("page", "")
+            if text:
+                chunks_with_refs.append(f"[From: {source}, Page: {page}]\n{text}")
+
+        if not chunks_with_refs:
+            return {
+                "success": False,
+                "status": "failed",
+                "error": "No relevant content found."
+            }
+
+        combined_content = "\n\n---\n\n".join(chunks_with_refs)
+
+        result = generate_tts_video_for_topic(
+            topic=topic,
+            content=combined_content,
+            user_id=current_user.id,
+            doc_name=doc_name,
+            language=language,
+            voice=voice
+        )
+
+        if result.get("status") == "completed" and result.get("audio_filename"):
+            result["audio_url"] = f"/static/tts_audio/{result['audio_filename']}"
+
+        return {"success": result.get("status") != "failed", **result}
+
+    except Exception as e:
+        logger.error(f"TTS video generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/analyze-legal")
 async def analyze_legal_endpoint(

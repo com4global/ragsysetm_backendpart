@@ -19,6 +19,56 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL = "gpt-4o-mini"
 logger = logging.getLogger(__name__)
 
+# ── Teacher Pair Pool ────────────────────────────────────────────────
+# Each pair has unique names, emojis, roles, personalities, and OpenAI TTS voices.
+# Voices: alloy, echo, fable, onyx, nova, shimmer
+TEACHER_PAIRS = [
+    {
+        "a": {"name": "Priya", "emoji": "👩‍🏫", "role": "Concept Explorer", "personality": "Enthusiastic, uses real-world analogies, asks thought-provoking questions", "voice": "nova"},
+        "b": {"name": "Arjun", "emoji": "🧑‍🔬", "role": "Deep Diver", "personality": "Analytical, provides deep explanations from the document, uses examples", "voice": "onyx"},
+    },
+    {
+        "a": {"name": "Maya", "emoji": "🌟", "role": "Storyteller", "personality": "Turns every concept into a memorable story or narrative, engaging and dramatic", "voice": "shimmer"},
+        "b": {"name": "Ravi", "emoji": "📚", "role": "Scholar", "personality": "Precise and methodical, breaks down complex ideas into structured steps", "voice": "echo"},
+    },
+    {
+        "a": {"name": "Zara", "emoji": "🎯", "role": "Challenger", "personality": "Loves to challenge assumptions, asks 'what if' questions, provocative thinker", "voice": "alloy"},
+        "b": {"name": "Dev", "emoji": "💡", "role": "Innovator", "personality": "Creative problem-solver, connects concepts to cutting-edge applications", "voice": "fable"},
+    },
+    {
+        "a": {"name": "Ananya", "emoji": "🦋", "role": "Simplifier", "personality": "Makes complex topics feel effortless, uses everyday examples students love", "voice": "nova"},
+        "b": {"name": "Kabir", "emoji": "🔭", "role": "Explorer", "personality": "Curious and wide-ranging, connects topics to broader themes and discoveries", "voice": "echo"},
+    },
+    {
+        "a": {"name": "Diya", "emoji": "✨", "role": "Motivator", "personality": "Energetic and encouraging, celebrates every learning moment, builds confidence", "voice": "shimmer"},
+        "b": {"name": "Sai", "emoji": "🧠", "role": "Analyst", "personality": "Logical thinker, loves data and evidence, provides structured breakdowns", "voice": "onyx"},
+    },
+    {
+        "a": {"name": "Isha", "emoji": "🎨", "role": "Visualizer", "personality": "Thinks in pictures and diagrams, paints vivid mental images of concepts", "voice": "alloy"},
+        "b": {"name": "Vikram", "emoji": "⚡", "role": "Energizer", "personality": "Fast-paced and exciting, makes even dry topics feel thrilling", "voice": "fable"},
+    },
+    {
+        "a": {"name": "Neha", "emoji": "🌍", "role": "Connector", "personality": "Links topics to real-world events and global contexts, culturally aware", "voice": "nova"},
+        "b": {"name": "Rohit", "emoji": "🔬", "role": "Experimenter", "personality": "Hands-on thinker, suggests experiments and practical demonstrations", "voice": "echo"},
+    },
+    {
+        "a": {"name": "Kavya", "emoji": "🎭", "role": "Performer", "personality": "Dramatic and expressive, makes lessons feel like a show, uses humor", "voice": "shimmer"},
+        "b": {"name": "Aditya", "emoji": "📐", "role": "Architect", "personality": "Builds understanding brick by brick, systematic and thorough", "voice": "onyx"},
+    },
+]
+
+
+def get_random_teacher_pair(topic: str) -> dict:
+    """
+    Pick a teacher pair deterministically based on the topic string.
+    Same topic always gets the same pair for consistency.
+    Different topics get different pairs for variety.
+    """
+    import hashlib
+    topic_hash = int(hashlib.md5(topic.lower().strip().encode()).hexdigest(), 16)
+    idx = topic_hash % len(TEACHER_PAIRS)
+    return TEACHER_PAIRS[idx]
+
 
 def extract_topics(chunks_text: str, language: str = "en", doc_names: Optional[List[str]] = None) -> List[Dict]:
     """
@@ -72,7 +122,7 @@ DOCUMENT CONTENT:
                 {"role": "system", "content": "You extract teaching topics STRICTLY from provided document content. You NEVER invent or hallucinate topics. Every topic must be traceable to the provided text. Return valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,  # Very low temperature for strict extraction
+            temperature=0.1,
             response_format={"type": "json_object"}
         )
         result = json.loads(response.choices[0].message.content)
@@ -90,7 +140,13 @@ def generate_teacher_dialogue(topic: str, content: str, language: str = "en") ->
     """
     Generate an engaging dialogue between two AI teachers about a topic.
     The dialogue MUST be grounded in the actual document content provided.
+    Teachers are randomly selected from the pool based on the topic.
     """
+    # Pick a random teacher pair for this topic
+    pair = get_random_teacher_pair(topic)
+    teacher_a = pair["a"]
+    teacher_b = pair["b"]
+
     lang_instruction = ""
     if language == "ta":
         lang_instruction = """
@@ -113,13 +169,13 @@ CRITICAL RULES:
 5. Teachers should quote or paraphrase actual content from the documents.
 
 TEACHER ROLES:
-- Teacher A (👩‍🏫 Priya): Enthusiastic, uses real-world analogies, asks thought-provoking questions
-- Teacher B (🧑‍🔬 Arjun): Analytical, provides deep explanations from the document, uses examples
+- Teacher A ({teacher_a['emoji']} {teacher_a['name']}): {teacher_a['personality']}
+- Teacher B ({teacher_b['emoji']} {teacher_b['name']}): {teacher_b['personality']}
 
 DIALOGUE RULES:
 - 8-12 exchanges long
 - Include at least one "aha moment" where a complex concept becomes simple
-- End with a quiz question BASED ON the document content
+- End with quiz questions BASED ON the document content
 - Make it conversational and fun, NOT a lecture
 {lang_instruction}
 
@@ -127,19 +183,33 @@ Return as JSON:
 {{
   "title": "Lesson title based on the document topic",
   "teachers": [
-    {{"name": "Priya", "emoji": "👩‍🏫", "role": "Concept Explorer"}},
-    {{"name": "Arjun", "emoji": "🧑‍🔬", "role": "Deep Diver"}}
+    {{"name": "{teacher_a['name']}", "emoji": "{teacher_a['emoji']}", "role": "{teacher_a['role']}"}},
+    {{"name": "{teacher_b['name']}", "emoji": "{teacher_b['emoji']}", "role": "{teacher_b['role']}"}}
   ],
   "dialogue": [
-    {{"speaker": "Priya", "text": "...", "type": "question"}},
-    {{"speaker": "Arjun", "text": "...", "type": "explanation"}}
+    {{"speaker": "{teacher_a['name']}", "text": "...", "type": "question"}},
+    {{"speaker": "{teacher_b['name']}", "text": "...", "type": "explanation"}}
   ],
-  "quiz": {{
-    "question": "Question based on the document content",
-    "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
-    "correct": 0,
-    "explanation": "Explanation from the document content"
-  }},
+  "quiz": [
+    {{
+      "question": "First quiz question from the document content",
+      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+      "correct": 0,
+      "explanation": "Explanation from the document"
+    }},
+    {{
+      "question": "Second quiz question from the document content",
+      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+      "correct": 2,
+      "explanation": "Explanation from the document"
+    }},
+    {{
+      "question": "Third quiz question from the document content",
+      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+      "correct": 1,
+      "explanation": "Explanation from the document"
+    }}
+  ],
   "key_takeaways": ["Takeaway from document", "Another takeaway", "Third takeaway"]
 }}
 
@@ -157,6 +227,11 @@ Type can be: "question", "explanation", "analogy", "story", "aha_moment", "summa
             response_format={"type": "json_object"}
         )
         result = json.loads(response.choices[0].message.content)
+        # Attach voice mappings so frontend can use them for TTS
+        result["voice_map"] = {
+            teacher_a["name"]: teacher_a["voice"],
+            teacher_b["name"]: teacher_b["voice"]
+        }
         return result
     except Exception as e:
         logger.error(f"Dialogue generation failed: {e}")
