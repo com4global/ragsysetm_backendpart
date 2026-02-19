@@ -1387,6 +1387,107 @@ async def edtech_ask_question(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/edtech/ask-doubt")
+async def edtech_ask_doubt(
+    question: str = Form(...),
+    topic: str = Form(""),
+    language: str = Form("en"),
+    current_user: User = Depends(get_current_user)
+):
+    """Answer a mid-lesson doubt using direct LLM (general knowledge + topic context)."""
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        loop = asyncio.get_event_loop()
+
+        lang_instruction = ""
+        if language == "ta":
+            lang_instruction = "\nIMPORTANT: Answer in Tamil (தமிழ்). Use simple, conversational Tamil."
+
+        system_msg = (
+            "You are a helpful, friendly teacher answering a student's doubt during a lesson. "
+            "Use your general knowledge to give a clear, concise answer. "
+            "Keep your answer focused and under 150 words unless a longer explanation is truly needed. "
+            "Do NOT mention anything about documents, sources, or whether the information comes from uploaded files."
+            f"{lang_instruction}"
+        )
+
+        user_msg = f"Topic being studied: {topic}\n\nStudent's question: {question}" if topic else question
+
+        def _ask():
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=0.7,
+                max_tokens=500
+            )
+            return resp.choices[0].message.content.strip()
+
+        answer = await loop.run_in_executor(None, _ask)
+        return {"success": True, "answer": answer}
+
+    except Exception as e:
+        logger.error(f"Doubt Q&A failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/edtech/speak-answer")
+async def edtech_speak_answer(
+    text: str = Form(...),
+    language: str = Form("en"),
+    current_user: User = Depends(get_current_user)
+):
+    """Convert an LLM answer to TTS audio and return the public URL."""
+    try:
+        import hashlib
+        from openai import OpenAI
+        from heygen_service import TTS_AUDIO_DIR
+        client = OpenAI()
+
+        loop = asyncio.get_event_loop()
+
+        # Generate a short hash for caching
+        text_hash = hashlib.md5(f"{current_user.id}:{text[:200]}".encode()).hexdigest()[:12]
+        audio_filename = f"answer_{text_hash}.mp3"
+        audio_path = TTS_AUDIO_DIR / audio_filename
+        storage_path = f"answers/{current_user.id}/{audio_filename}"
+
+        # Check local cache first
+        if not audio_path.exists():
+            # Truncate very long answers to keep TTS reasonable
+            tts_text = text[:1500] if len(text) > 1500 else text
+            voice = "shimmer" if language == "ta" else "nova"
+
+            def _generate():
+                resp = client.audio.speech.create(
+                    model="tts-1",
+                    voice=voice,
+                    input=tts_text,
+                    response_format="mp3"
+                )
+                resp.stream_to_file(str(audio_path))
+
+            await loop.run_in_executor(None, _generate)
+
+        # Upload to Supabase Storage
+        public_url = await loop.run_in_executor(
+            None, lambda: _upload_audio_to_storage(str(audio_path), storage_path)
+        )
+
+        if not public_url:
+            # Fallback to local static path
+            public_url = f"/static/tts_audio/{audio_filename}"
+
+        return {"success": True, "audio_url": public_url}
+
+    except Exception as e:
+        logger.error(f"Speak-answer TTS failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============================================================
 # HEYGEN VIDEO GENERATION ENDPOINTS
 # ============================================================
