@@ -12,9 +12,11 @@ from typing import Dict, List
 import hashlib
 
 from chunker import chunk_pages
-from embedder import embed_chunks
+from embedder import embed_chunks_batch
 from vectorstore import store_in_pinecone
 from file_processor import read_file, get_file_type
+
+PROCESS_BATCH_SIZE = 50  # Chunks per embedding API call AND per Pinecone upsert
 
 
 def create_user_namespace(user_id: str, file_type: str) -> str:
@@ -32,21 +34,20 @@ def process_file(
     user_id: str = None,
     chunk_size: int = 900, 
     chunk_overlap: int = 150, 
-    source: str = "single"
+    source: str = "single",
+    progress_callback=None
 ) -> Dict:
     """
     Process ONE file and store it in Pinecone with user-specific namespace.
-    Supports large PDFs/textbooks via batch processing and chapter detection.
+    Uses batch embedding (50 chunks per API call) for speed.
     
     Args:
         file_path: Path to the file
-        user_id: User ID for isolation (required for multi-user systems)
+        user_id: User ID for isolation
         chunk_size: Size of text chunks
         chunk_overlap: Overlap between chunks
         source: Source identifier
-        
-    Returns:
-        Dictionary with processing results
+        progress_callback: Optional async callback(stage, percent, message)
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
@@ -59,7 +60,6 @@ def process_file(
     if user_id:
         namespace = create_user_namespace(user_id, file_type)
     else:
-        # Legacy mode - no user isolation
         namespace = file_type
     
     print("\n" + "=" * 70)
@@ -68,44 +68,40 @@ def process_file(
     print(f"👤 User ID: {user_id if user_id else 'None (legacy mode)'}")
     print(f"🔖 Namespace: {namespace}")
     print("=" * 70)
+    
     # Check if this is a multimodal file (image, audio, video)
     MULTIMODAL_TYPES = {
-        'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp',           # images
-        'mp3', 'wav', 'ogg', 'flac', 'm4a',                    # audio
-        'mp4', 'avi', 'mov', 'mkv', 'webm', 'mpeg', 'mpga'     # video
+        'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp',
+        'mp3', 'wav', 'ogg', 'flac', 'm4a',
+        'mp4', 'avi', 'mov', 'mkv', 'webm', 'mpeg', 'mpga'
     }
     
     if file_type in MULTIMODAL_TYPES:
-        # Delegate to multimodal processor for non-text files
         from multimodal_dataprocessor import process_multimodal_file
         print(f"🎨 Detected multimodal file type '{file_type}', delegating to multimodal processor...")
         result = process_multimodal_file(file_path)
-        # Enrich result with user info
         result["user_id"] = user_id
         result["namespace"] = namespace
         result["chunks_created"] = result.get("chunks_created", 0)
         return result
 
-    # 1. Read file (text-based files only)
+    # ─── STEP 1: Extract text ───
     pages, _ = read_file(file_path)
     print(f"✅ Extracted {len(pages)} pages/rows/sections")
     
-    # For large files, log chapter info if available
     chapters_found = set()
     for p in pages:
         ch = p.get("chapter", "")
         if ch:
             chapters_found.add(ch)
     if chapters_found:
-        print(f"📚 Detected {len(chapters_found)} chapters/sections: {list(chapters_found)[:10]}")
+        print(f"📚 Detected {len(chapters_found)} chapters/sections")
     
-    BATCH_SIZE = 50  # Process in batches to avoid memory/timeout issues
-    embedded_chunks = []
-    total_chunks = 0
-
-    # 2. Process Page by Page to preserve metadata
+    # ─── STEP 2: Chunk all pages (collect text + metadata) ───
+    all_chunk_texts = []
+    all_chunk_metadata = []
+    
     for page_obj in pages:
-        # Use our fixed chunk_pages function
         chunks_from_this_page = chunk_pages(
             page_obj["text"], 
             chunk_size=chunk_size, 
@@ -113,47 +109,68 @@ def process_file(
         )
         
         for text_chunk in chunks_from_this_page:
-            # 3. Embed this specific chunk
-            vector_list = embed_chunks([text_chunk])
-            if not vector_list: 
-                continue
-            
-            vector = vector_list[0] 
-            
-            # 4. Attach Metadata (including chapter and user_id)
             metadata = {
                 "text": text_chunk,
                 "page": str(page_obj["page"]), 
                 "doc_name": page_obj["doc_name"],
                 "path": page_obj["path"]
             }
-            
-            # Add chapter info if available
             chapter = page_obj.get("chapter", "")
             if chapter:
                 metadata["chapter"] = chapter
-            
-            # Add user_id to metadata for additional filtering
             if user_id:
                 metadata["user_id"] = user_id
             
+            all_chunk_texts.append(text_chunk)
+            all_chunk_metadata.append(metadata)
+    
+    total_chunks = len(all_chunk_texts)
+    print(f"✂️ Created {total_chunks} chunks total")
+    
+    if total_chunks == 0:
+        print("⚠️ No chunks created — file may be empty or unreadable")
+        return {
+            "file_name": file_name, "file_path": file_path, "file_type": file_type,
+            "chunks_created": 0, "chapters_found": len(chapters_found),
+            "namespace": namespace, "user_id": user_id
+        }
+    
+    # ─── STEP 3: Batch embed + store (50 chunks per API call) ───
+    stored_count = 0
+    
+    for i in range(0, total_chunks, PROCESS_BATCH_SIZE):
+        batch_texts = all_chunk_texts[i:i + PROCESS_BATCH_SIZE]
+        batch_metadata = all_chunk_metadata[i:i + PROCESS_BATCH_SIZE]
+        
+        # Single API call for up to 50 embeddings
+        batch_embeddings = embed_chunks_batch(batch_texts, batch_size=len(batch_texts))
+        
+        # Build embedded chunks for Pinecone
+        embedded_chunks = []
+        for embedding, metadata in zip(batch_embeddings, batch_metadata):
             embedded_chunks.append({
-                "embedding": vector,
+                "embedding": embedding,
                 "metadata": metadata
             })
-            total_chunks += 1
-            
-            # 5. Batch upsert — flush every BATCH_SIZE chunks
-            if len(embedded_chunks) >= BATCH_SIZE:
-                store_in_pinecone(embedded_chunks, namespace)
-                print(f"  📌 Batch stored: {total_chunks} chunks so far...")
-                embedded_chunks = []
-
-    # 6. Store remaining chunks
-    if embedded_chunks:
+        
+        # Batch upsert to Pinecone
         store_in_pinecone(embedded_chunks, namespace)
+        stored_count += len(embedded_chunks)
+        
+        pct = int((stored_count / total_chunks) * 100)
+        print(f"  📌 Batch stored: {stored_count}/{total_chunks} chunks ({pct}%)")
+        
+        # Report progress if callback provided
+        if progress_callback:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(progress_callback("embedding", pct, f"Embedded {stored_count}/{total_chunks} chunks"))
+            except Exception:
+                pass
     
-    print(f"📌 Stored {total_chunks} total chunks in namespace '{namespace}'")
+    print(f"📌 Stored {stored_count} total chunks in namespace '{namespace}'")
     if chapters_found:
         print(f"📚 Chapters indexed: {len(chapters_found)}")
 
@@ -161,7 +178,7 @@ def process_file(
         "file_name": file_name,
         "file_path": file_path,
         "file_type": file_type,
-        "chunks_created": total_chunks,
+        "chunks_created": stored_count,
         "chapters_found": len(chapters_found),
         "namespace": namespace,
         "user_id": user_id

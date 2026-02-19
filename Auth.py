@@ -21,6 +21,7 @@ class User(BaseModel):
     email: str
     full_name: Optional[str] = None
     company: Optional[str] = None
+    role: str = "student"  # 'student' or 'teacher'
     is_active: bool = True
     access_token: Optional[str] = None  # Store JWT for RLS-authenticated DB calls
 
@@ -70,6 +71,7 @@ async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)):
                 email=user_data.email,
                 full_name=user_data.user_metadata.get('full_name'),
                 company=None,
+                role='student',
                 access_token=token  # Keep the JWT for database RLS
             )
 
@@ -78,6 +80,7 @@ async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)):
             email=profile.get('email'),
             full_name=profile.get('full_name'),
             company=profile.get('company'),
+            role=profile.get('role', 'student'),
             is_active=profile.get('is_active', True),
             access_token=token  # Keep the JWT for database RLS
         )

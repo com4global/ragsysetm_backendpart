@@ -77,13 +77,11 @@ def process_user_query(query: str, user_id: Optional[str] = None, language: str 
 
     # 4. Get answer from LLM
     if not context:
-        no_docs_msg = (
-            "தொடர்புடைய ஆவணங்களை என்னால் கண்டுபிடிக்க முடியவில்லை. தேவையான கோப்புகளை பதிவேற்றியுள்ளீர்கள் என்பதை உறுதிப்படுத்தவும்."
-            if language == "ta" else
-            "I couldn't find any relevant documents to answer this question. Please make sure you've uploaded the necessary files."
-        )
+        # No documents found — fall back to LLM's general knowledge
+        print("ℹ️ No relevant documents found — falling back to LLM general knowledge")
+        answer = query_llm_with_context(query, "(No documents uploaded yet. Answer purely from your general knowledge.)", language=language)
         return {
-            "answer": no_docs_msg,
+            "answer": answer,
             "sources": []
         }
 

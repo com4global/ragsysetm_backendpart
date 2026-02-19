@@ -590,38 +590,28 @@ def generate_dialogue_audio(
 ) -> list:
     """
     Generate individual TTS audio files for each dialogue line.
-    
-    Args:
-        dialogue_lines: List of dicts with 'speaker' and 'text'
-        voice_map:      Dict mapping speaker name to OpenAI TTS voice
-        topic:          Topic title (for file naming)
-        user_id:        User ID (for cache key prefix)
-        doc_name:       Source document name
-    
-    Returns:
-        List of audio filenames (one per dialogue line), empty string if failed
+    Uses parallel threads for faster generation.
     """
-    audio_files = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     topic_slug = hashlib.md5(f"{user_id}:{doc_name}:{topic}".encode()).hexdigest()[:10]
-    
-    for idx, line in enumerate(dialogue_lines):
+    audio_files = [""] * len(dialogue_lines)  # Pre-size list to maintain order
+
+    def _generate_one(idx, line):
         speaker = line.get("speaker", "")
         text = line.get("text", "")
-        voice = voice_map.get(speaker, "nova")  # Default to nova if speaker not in map
-        
+        voice = voice_map.get(speaker, "nova")
+
         if not text.strip():
-            audio_files.append("")
-            continue
-        
-        # Check if this line's audio already exists
+            return idx, ""
+
         audio_filename = f"dialogue_{topic_slug}_{idx}.mp3"
         audio_path = TTS_AUDIO_DIR / audio_filename
-        
+
         if audio_path.exists():
             logger.info(f"🎯 Dialogue audio cache hit: line {idx} ({speaker})")
-            audio_files.append(audio_filename)
-            continue
-        
+            return idx, audio_filename
+
         try:
             logger.info(f"🔊 Generating dialogue audio: line {idx} ({speaker}, voice={voice})")
             response = client.audio.speech.create(
@@ -631,10 +621,17 @@ def generate_dialogue_audio(
                 response_format="mp3"
             )
             response.stream_to_file(str(audio_path))
-            audio_files.append(audio_filename)
+            return idx, audio_filename
         except Exception as e:
             logger.error(f"Dialogue TTS line {idx} failed: {e}")
-            audio_files.append("")  # Empty = no audio for this line
-    
+            return idx, ""
+
+    # Run all TTS calls in parallel (max 5 concurrent)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(_generate_one, i, line) for i, line in enumerate(dialogue_lines)]
+        for fut in as_completed(futures):
+            idx, filename = fut.result()
+            audio_files[idx] = filename
+
     logger.info(f"✅ Generated {sum(1 for f in audio_files if f)} / {len(dialogue_lines)} dialogue audio files")
     return audio_files

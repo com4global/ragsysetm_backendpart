@@ -152,6 +152,15 @@
       "chunks_created": 1685,
       "processed": true,
       "uploaded_at": "2026-02-17T20:21:13.204536"
+    },
+    {
+      "id": 18,
+      "file_name": "developers-google-com-machine-learning-glossary_hl=en....pdf",
+      "file_type": "application/pdf",
+      "file_size": 4243133,
+      "chunks_created": 0,
+      "processed": false,
+      "uploaded_at": "2026-02-19T02:43:27.578025"
     }
   ]
 }

@@ -84,11 +84,38 @@ STATIC_RESOURCES_DIR = Path("./resources")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _job_queue, _worker_tasks
     # Startup
     logger.info("Starting up...")
+    _job_queue = asyncio.Queue()
+    
+    # Start worker pool
+    for i in range(MAX_CONCURRENT_WORKERS):
+        task = asyncio.create_task(_job_worker(i))
+        _worker_tasks.append(task)
+    logger.info(f"🚀 Started {MAX_CONCURRENT_WORKERS} background processing workers")
+    
+    # Recovery: re-queue any stale jobs from previous runs
+    try:
+        stale = supabase.table("batch_jobs").select("*").in_("status", ["queued", "processing"]).execute()
+        for job in (stale.data or []):
+            _update_batch_status(job["id"], "queued", progress=0)
+            logger.info(f"♻️ Re-queued stale job: {job.get('doc_name', 'unknown')} ({job['id']})")
+            # Note: we can't re-queue without access_token; mark as failed instead
+            _update_batch_status(job["id"], "failed", error="Server restarted. Please re-process this file.")
+    except Exception as e:
+        logger.warning(f"Stale job recovery skipped: {e}")
+    
     yield
-    # Shutdown
-    logger.info("Shutting down...")
+    
+    # Shutdown: stop workers gracefully
+    logger.info("Shutting down workers...")
+    for _ in range(MAX_CONCURRENT_WORKERS):
+        await _job_queue.put(None)  # Poison pill
+    for task in _worker_tasks:
+        task.cancel()
+    _worker_tasks.clear()
+    logger.info("Workers stopped.")
 
 app = FastAPI(title="RAG HR Assistant", version="2.0", lifespan=lifespan)
 
@@ -150,6 +177,343 @@ class QueryResponse(BaseModel):
     session_id: Optional[str] = None
 
 # === Endpoints ===
+
+import asyncio
+
+# ── Job Queue for Background Processing ──
+# Limits concurrent processing to avoid overwhelming OpenAI rate limits
+MAX_CONCURRENT_WORKERS = 3
+_processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+_job_queue: asyncio.Queue = None  # Initialized in lifespan
+_worker_tasks: list = []
+
+async def _job_worker(worker_id: int):
+    """Background worker that pulls jobs from the queue and processes them."""
+    logger.info(f"👷 Worker {worker_id} started")
+    while True:
+        try:
+            job = await _job_queue.get()
+            if job is None:  # Poison pill for shutdown
+                break
+            
+            user_id, filename, access_token, job_id = job
+            logger.info(f"👷 Worker {worker_id} picked up: {filename} (job {job_id})")
+            
+            async with _processing_semaphore:
+                try:
+                    await _background_process_and_pregenerate(user_id, filename, access_token, job_id)
+                except Exception as e:
+                    logger.error(f"❌ Worker {worker_id} failed on {filename}: {e}")
+                    _update_batch_status(job_id, "failed", error=str(e))
+            
+            _job_queue.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"❌ Worker {worker_id} unexpected error: {e}")
+    logger.info(f"👷 Worker {worker_id} stopped")
+
+def _enqueue_processing(user_id: str, filename: str, access_token: str, job_id: str):
+    """Queue a file for background processing. Returns immediately."""
+    if _job_queue is not None:
+        _job_queue.put_nowait((user_id, filename, access_token, job_id))
+        logger.info(f"📥 Queued {filename} for processing (job {job_id}, queue size: ~{_job_queue.qsize()})")
+    else:
+        # Fallback if queue not initialized
+        asyncio.create_task(_background_process_and_pregenerate(user_id, filename, access_token, job_id))
+        logger.warning(f"⚠️ Job queue not ready, falling back to direct task for {filename}")
+
+
+# ── Background Processing Helpers ──
+
+def _update_batch_status(job_id: str, status: str, progress: int = 0,
+                         completed_steps: int = 0, total_steps: int = 0, error: str = None):
+    """Update batch job status in Supabase."""
+    try:
+        data = {
+            "status": status,
+            "progress": progress,
+            "completed_steps": completed_steps,
+            "total_steps": total_steps,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        if error:
+            data["error"] = error
+        supabase.table("batch_jobs").update(data).eq("id", job_id).execute()
+    except Exception as e:
+        logger.warning(f"Batch status update failed: {e}")
+
+
+async def _background_process_and_pregenerate(user_id: str, filename: str, access_token: str, job_id: str):
+    """
+    Background worker: process document → extract topics → pre-generate lessons & videos.
+    Runs as an asyncio task after upload returns to user.
+    """
+    import asyncio
+    try:
+        logger.info(f"🔄 Background processing started: {filename} for user {user_id}")
+        _update_batch_status(job_id, "processing", progress=5, total_steps=4, completed_steps=0)
+
+        # ── Step 1: Process file (chunking + embedding) ──
+        from dataprocessor import process_file
+        import time as _time
+
+        # Get file metadata
+        file_meta = None
+        blob_url = None
+        s_files = user_db.get_user_files(user_id, access_token)
+        file_meta = next((f for f in s_files if f.get('filename') == filename or f.get('file_name') == filename), None)
+        if file_meta:
+            blob_url = file_meta.get('blob_url')
+
+        # Resolve local path
+        local_path = WRITE_RESOURCES_DIR / filename
+        if not local_path.exists():
+            local_path = STATIC_RESOURCES_DIR / filename
+        user_temp_dir = WRITE_RESOURCES_DIR / user_id
+        if not local_path.exists():
+            local_path = user_temp_dir / filename
+        if not local_path.exists() and blob_url:
+            logger.info(f"⬇️ [BG] Downloading from blob: {blob_url}")
+            response = requests.get(blob_url)
+            response.raise_for_status()
+            user_temp_dir.mkdir(exist_ok=True)
+            local_path = user_temp_dir / filename
+            with open(local_path, 'wb') as f:
+                f.write(response.content)
+
+        if not local_path.exists():
+            _update_batch_status(job_id, "failed", error="File not found locally or in storage")
+            return
+
+        # Run chunking + embedding in a THREAD POOL (this is CPU/IO-bound!)
+        # Without run_in_executor, this blocks the entire event loop → backend unresponsive
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: process_file(str(local_path), user_id=user_id))
+        chunks_created = result.get("chunks_created", 0)
+
+        # Update file metadata
+        try:
+            user_db.update_file_processed(user_id=user_id, filename=filename,
+                                          chunks_created=chunks_created, user_token=access_token)
+        except Exception as e:
+            logger.warning(f"[BG] Metadata update failed: {e}")
+
+        _update_batch_status(job_id, "extracting_topics", progress=30, completed_steps=1)
+        logger.info(f"✅ [BG] Step 1 done: {filename} chunked ({chunks_created} chunks)")
+
+        # ── Step 2: Extract chapters + topics ──
+        from edtech_service import extract_topics
+        from vectorstore import index, get_user_namespaces
+        import re as _re
+
+        # First get chapters
+        namespaces = get_user_namespaces(user_id)
+        all_chunks = []
+        doc_name = filename.rsplit('.', 1)[0]  # Remove extension for doc_name matching
+
+        for ns in namespaces:
+            try:
+                dummy_vec = [0.0] * 1536
+                res = await loop.run_in_executor(None, lambda ns=ns: index.query(
+                    vector=dummy_vec, top_k=10000, include_metadata=True,
+                    namespace=ns, filter={"doc_name": {"$eq": filename}}
+                ))
+                for match in res.matches:
+                    meta = match.metadata
+                    text = meta.get("text", "")
+                    page = meta.get("page", "")
+                    ch = meta.get("chapter", "")
+                    if text:
+                        all_chunks.append({"text": text, "page": page, "chapter": ch})
+            except Exception:
+                continue
+
+        if not all_chunks:
+            _update_batch_status(job_id, "completed", progress=100, completed_steps=4, total_steps=4)
+            logger.info(f"⚠️ [BG] No chunks found for {filename}, skipping pre-generation")
+            return
+
+        # Get unique chapters
+        chapters = list(set(c.get("chapter", "") for c in all_chunks if c.get("chapter")))
+        if not chapters:
+            chapters = [""]  # Single unnamed chapter
+
+        # Extract topics for each chapter
+        all_topics = []
+        CHAR_BUDGET = 15000
+        for chapter in chapters:
+            chapter_chunks = [c for c in all_chunks if c.get("chapter") == chapter] if chapter else all_chunks
+            content_parts = []
+            total_chars = 0
+            for c in chapter_chunks:
+                part = f"[Page {c['page']}]\n{c['text']}"
+                if total_chars + len(part) > CHAR_BUDGET:
+                    break
+                content_parts.append(part)
+                total_chars += len(part)
+
+            if content_parts:
+                combined = "\n\n---\n\n".join(content_parts)
+                try:
+                    topics = await loop.run_in_executor(None, lambda: extract_topics(combined, "en", [filename]))
+                    all_topics.extend(topics)
+                except Exception as e:
+                    logger.warning(f"[BG] Topic extraction failed for chapter '{chapter}': {e}")
+
+        _update_batch_status(job_id, "generating_lessons", progress=50, completed_steps=2,
+                             total_steps=4)
+        logger.info(f"✅ [BG] Step 2 done: {len(all_topics)} topics extracted")
+
+        if not all_topics:
+            _update_batch_status(job_id, "completed", progress=100, completed_steps=4, total_steps=4)
+            return
+
+        # ── Step 3: Pre-generate lessons (conversation) for each topic ──
+        from edtech_service import generate_teacher_dialogue
+        from heygen_service import generate_dialogue_audio, TTS_AUDIO_DIR
+        from embedder import embed_User_query
+        from vectorstore import search_user_documents
+
+        generated = 0
+        for topic_name in all_topics[:20]:  # Cap at 20 topics to avoid overloading
+            try:
+                cache_key = _lesson_cache_key(user_id, "", topic_name, "en", "conversation")
+                if _get_cached_lesson(cache_key):
+                    generated += 1
+                    continue  # Already cached
+
+                # Search chunks
+                query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic_name))
+                results = await loop.run_in_executor(None, lambda: search_user_documents(query_vec, user_id, top_k=10))
+                if not results:
+                    continue
+
+                chunks_refs = []
+                for r in results:
+                    text = r.get("text", "")
+                    dn = r.get("doc_name", "Unknown")
+                    pg = r.get("page", "")
+                    if text:
+                        chunks_refs.append(f"[From: {dn}, Page: {pg}]\n{text}")
+
+                if not chunks_refs:
+                    continue
+
+                combined = "\n\n---\n\n".join(chunks_refs)
+                lesson = await loop.run_in_executor(None, lambda: generate_teacher_dialogue(topic_name, combined, "en"))
+
+                # Generate TTS audio for dialogue
+                audio_urls = []
+                audio_storage_paths = []
+                voice_map = lesson.get("voice_map", {})
+                dialogue = lesson.get("dialogue", [])
+                if dialogue and voice_map:
+                    try:
+                        audio_files = await loop.run_in_executor(None, lambda: generate_dialogue_audio(
+                            dialogue_lines=dialogue, voice_map=voice_map,
+                            topic=topic_name, user_id=user_id, doc_name=filename
+                        ))
+                        for f_name in audio_files:
+                            if f_name:
+                                local_file = TTS_AUDIO_DIR / f_name
+                                storage_path = f"dialogue/{user_id}/{f_name}"
+                                public_url = _upload_audio_to_storage(str(local_file), storage_path)
+                                if public_url:
+                                    audio_urls.append(public_url)
+                                    audio_storage_paths.append(storage_path)
+                                else:
+                                    audio_urls.append(f"/static/tts_audio/{f_name}")
+                                    audio_storage_paths.append("")
+                            else:
+                                audio_urls.append("")
+                                audio_storage_paths.append("")
+                    except Exception as ae:
+                        logger.warning(f"[BG] Audio gen failed for '{topic_name}': {ae}")
+
+                lesson["audio_urls"] = audio_urls
+
+                _save_lesson_cache(
+                    user_id=user_id, cache_key=cache_key, topic=topic_name,
+                    doc_name=filename, language="en", lesson_type="conversation",
+                    lesson_json=lesson, audio_storage_paths=audio_storage_paths
+                )
+                generated += 1
+                pct = 50 + int((generated / min(len(all_topics), 20)) * 25)
+                _update_batch_status(job_id, "generating_lessons", progress=pct, completed_steps=2)
+                logger.info(f"📝 [BG] Lesson {generated}/{len(all_topics)}: {topic_name}")
+
+                # Tiny sleep to avoid rate-limiting OpenAI
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                logger.warning(f"[BG] Lesson pre-gen failed for '{topic_name}': {e}")
+
+        _update_batch_status(job_id, "generating_videos", progress=80, completed_steps=3)
+        logger.info(f"✅ [BG] Step 3 done: {generated} lessons pre-generated")
+
+        # ── Step 4: Pre-generate TTS videos for first N topics ──
+        from heygen_service import generate_tts_video_for_topic
+        video_count = 0
+        for topic_name in all_topics[:10]:  # Cap at 10 videos
+            try:
+                cache_key = _lesson_cache_key(user_id, filename, topic_name, "en", "tts_video")
+                if _get_cached_lesson(cache_key):
+                    video_count += 1
+                    continue
+
+                query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic_name))
+                results = await loop.run_in_executor(None, lambda: search_user_documents(query_vec, user_id, top_k=10))
+                if not results:
+                    continue
+
+                chunks_refs = []
+                for r in results:
+                    text = r.get("text", "")
+                    src = r.get("doc_name", "Unknown")
+                    pg = r.get("page", "")
+                    if text:
+                        chunks_refs.append(f"[From: {src}, Page: {pg}]\n{text}")
+
+                if not chunks_refs:
+                    continue
+
+                combined = "\n\n---\n\n".join(chunks_refs)
+                result = await loop.run_in_executor(None, lambda: generate_tts_video_for_topic(
+                    topic=topic_name, content=combined, user_id=user_id,
+                    doc_name=filename, language="en", voice="nova"
+                ))
+
+                if result.get("status") == "completed" and result.get("audio_filename"):
+                    local_file = TTS_AUDIO_DIR / result["audio_filename"]
+                    storage_path = f"tts_video/{user_id}/{result['audio_filename']}"
+                    public_url = _upload_audio_to_storage(str(local_file), storage_path)
+                    if public_url:
+                        result["audio_url"] = public_url
+                    response_data = {"success": True, **result}
+                    _save_lesson_cache(
+                        user_id=user_id, cache_key=cache_key, topic=topic_name,
+                        doc_name=filename, language="en", lesson_type="tts_video",
+                        lesson_json=response_data, audio_storage_paths=[storage_path]
+                    )
+                    video_count += 1
+                    pct = 80 + int((video_count / min(len(all_topics), 10)) * 20)
+                    _update_batch_status(job_id, "generating_videos", progress=pct, completed_steps=3)
+                    logger.info(f"🎬 [BG] Video {video_count}: {topic_name}")
+
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                logger.warning(f"[BG] TTS video pre-gen failed for '{topic_name}': {e}")
+
+        _update_batch_status(job_id, "completed", progress=100, completed_steps=4, total_steps=4)
+        logger.info(f"🎉 [BG] Background processing complete: {filename} "
+                     f"({generated} lessons, {video_count} videos)")
+
+    except Exception as e:
+        logger.error(f"❌ [BG] Background processing failed for {filename}: {e}")
+        _update_batch_status(job_id, "failed", error=str(e))
+
 
 @app.get("/")
 def read_root():
@@ -278,13 +642,43 @@ async def upload_file_endpoint(
             # Don't silently swallow — this is critical for process step
             raise HTTPException(status_code=500, detail=f"File saved but metadata registration failed: {e}. Please try uploading again.")
         
+        # 5. Create batch job and fire background processing
+        batch_job_id = None
+        try:
+            job_result = supabase.table("batch_jobs").insert({
+                "user_id": current_user.id,
+                "doc_name": file.filename,
+                "status": "queued",
+                "progress": 0,
+                "total_steps": 4,
+                "completed_steps": 0
+            }).execute()
+            if job_result.data:
+                batch_job_id = job_result.data[0]["id"]
+                logger.info(f"📋 Batch job created: {batch_job_id}")
+        except Exception as e:
+            logger.warning(f"Batch job creation failed (non-fatal): {e}")
+
+        # Fire background processing (non-blocking)
+        if batch_job_id:
+            asyncio.create_task(
+                _background_process_and_pregenerate(
+                    user_id=current_user.id,
+                    filename=file.filename,
+                    access_token=current_user.access_token,
+                    job_id=batch_job_id
+                )
+            )
+            logger.info(f"🚀 Background processing fired for {file.filename}")
+
         return {
             "success": True,
             "file_name": file.filename,
             "filename": file.filename,
             "file_size": file_size,
             "file_type": file.content_type,
-            "message": f"File {file.filename} uploaded successfully"
+            "batch_job_id": batch_job_id,
+            "message": f"File {file.filename} uploaded! Processing in background."
         }
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
@@ -292,11 +686,11 @@ async def upload_file_endpoint(
 
 @app.post("/api/register-file")
 async def register_file_endpoint(request: RegisterFileRequest, current_user: User = Depends(get_current_user)):
-    """Register a file uploaded to Vercel Blob"""
+    """Register a file uploaded to Supabase Storage and auto-queue processing"""
     try:
-        logger.info(f"📝 Registering blob file: {request.filename} ({request.blob_url})")
+        logger.info(f"📝 Registering file: {request.filename} ({request.blob_url})")
         
-        # 1. Save to Supabase (Primary for Blob)
+        # 1. Save to Supabase (Primary)
         try:
             user_db.add_user_file(
                 user_id=current_user.id,
@@ -310,7 +704,7 @@ async def register_file_endpoint(request: RegisterFileRequest, current_user: Use
             logger.error(f"Failed to register in Supabase: {e}")
             raise HTTPException(status_code=500, detail="Database registration failed")
 
-        # 2. Update local metadata (for hybrid visibility)
+        # 2. Update local metadata
         existing_files = _read_local_file_metadata()
         existing_files = [f for f in existing_files if f.get('filename') != request.filename]
         existing_files.append({
@@ -320,144 +714,112 @@ async def register_file_endpoint(request: RegisterFileRequest, current_user: Use
             "file_size": request.file_size,
             "chunks_created": 0,
             "processed": False,
-            "status": "pending",
+            "status": "queued",
             "uploaded_at": datetime.utcnow().isoformat(),
             "blob_url": request.blob_url
         })
         _save_local_file_metadata(existing_files)
         
-        return {"success": True, "message": "File registered successfully"}
+        # 3. Auto-queue processing (NEW: no more manual "Process" click needed)
+        batch_job_id = str(uuid.uuid4())
+        try:
+            supabase.table("batch_jobs").insert({
+                "id": batch_job_id,
+                "user_id": current_user.id,
+                "doc_name": request.filename,
+                "status": "queued",
+                "progress": 0,
+                "total_steps": 4,
+                "completed_steps": 0
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Batch job creation failed: {e}")
+        
+        _enqueue_processing(current_user.id, request.filename, current_user.access_token, batch_job_id)
+        
+        return {
+            "success": True, 
+            "message": "File registered and queued for processing",
+            "batch_job_id": batch_job_id,
+            "status": "queued"
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error registering file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/process-file")
 async def process_file_endpoint(filename: str, current_user: User = Depends(get_current_user)):
-    """Process a file for RAG — uses Supabase for metadata and Blob/Local for content"""
+    """Queue a file for processing (non-blocking). Returns batch_job_id for polling."""
     try:
-        from dataprocessor import process_file
+        logger.info(f"⚙️ Queuing file for processing: {filename} for user {current_user.id}")
         
-        logger.info(f"⚙️ Processing file: {filename} for user {current_user.id}")
-        
-        # 1. Try to get metadata from Supabase (Primary for Vercel)
-        file_meta = None
-        blob_url = None
+        # Create batch job
+        batch_job_id = str(uuid.uuid4())
         try:
-            # Add strict retry logic for "just uploaded" files
-            import time
-            retries = 3
-            for attempt in range(retries):
-                s_files = user_db.get_user_files(current_user.id, current_user.access_token)
-                # Flexible matching for filename/file_name
-                file_meta = next((f for f in s_files if f.get('filename') == filename or f.get('file_name') == filename), None)
-                
-                if file_meta:
-                    blob_url = file_meta.get('blob_url')
-                    logger.info(f"✅ Found metadata in Supabase for {filename} (Attempt {attempt+1})")
-                    break
-                else:
-                    logger.warning(f"Metadata not found in Supabase for {filename} (Attempt {attempt+1}/{retries})")
-                    time.sleep(1) # Wait for propagation if needed
-                    
+            supabase.table("batch_jobs").insert({
+                "id": batch_job_id,
+                "user_id": current_user.id,
+                "doc_name": filename,
+                "status": "queued",
+                "progress": 0,
+                "total_steps": 4,
+                "completed_steps": 0
+            }).execute()
         except Exception as e:
-            logger.warning(f"Supabase metadata fetch failed: {e}")
-
-        # 2. Fallback to local metadata (Legacy/Local Dev)
-        if not file_meta:
-            existing_files = _read_local_file_metadata()
-            file_meta = next(
-                (f for f in existing_files if f.get('filename') == filename or f.get('file_name') == filename), 
-                None
-            )
-            if file_meta:
-                 blob_url = file_meta.get('blob_url')
-                 logger.info(f"✅ Found metadata in local storage for {filename} (Fallback)")
+            logger.warning(f"Batch job creation failed: {e}")
         
-        if not file_meta:
-            # DEBUG INFO
-            logger.error(f"❌ CRITICAL: Metadata missing for {filename}")
-            logger.error(f"User ID: {current_user.id}")
-            raise HTTPException(status_code=404, detail=f"File metadata not found for {filename}. Please try uploading again.")
-
-        # 3. Resolve file path
-        # Check writable first, then static
-        local_path = WRITE_RESOURCES_DIR / filename
-        if not local_path.exists():
-            local_path = STATIC_RESOURCES_DIR / filename
-
-        user_temp_dir = WRITE_RESOURCES_DIR / current_user.id
+        # Enqueue for background processing (returns immediately)
+        _enqueue_processing(current_user.id, filename, current_user.access_token, batch_job_id)
         
-        if not local_path.exists():
-            local_path = user_temp_dir / filename
-
-        # 4. If local file missing, try to download from Blob URL
-        if not local_path.exists():
-            if blob_url:
-                logger.info(f"⬇️ Downloading from Blob: {blob_url}")
-                try:
-                    response = requests.get(blob_url)
-                    response.raise_for_status()
-                    # Ensure user directory
-                    user_temp_dir.mkdir(exist_ok=True)
-                    local_path = user_temp_dir / filename
-                    with open(local_path, 'wb') as f:
-                        f.write(response.content)
-                    logger.info(f"⬇️ Downloaded to {local_path}")
-                except Exception as e:
-                    logger.error(f"Failed to download blob: {e}")
-                    error_detail = "File download failed."
-                    if "403" in str(e):
-                        error_detail = "Access Denied: Is your Supabase 'uploads' bucket set to Public?"
-                    elif "404" in str(e):
-                        error_detail = "File not found in storage. It may have been deleted."
-                    raise HTTPException(status_code=404, detail=error_detail)
-            else:
-                 # Detailed error for user
-                 logger.warning(f"❌ File {filename} has metadata but no content (Blob URL missing)")
-                 raise HTTPException(
-                     status_code=404, 
-                     detail="File content not found. This file may have been uploaded before persistent storage was enabled. Please delete and re-upload it."
-                 )
-        
-        logger.info(f"⚙️ File found at: {local_path}")
-        
-        # 5. Process and Index with User Isolation
-        result = process_file(str(local_path), user_id=current_user.id)
-        
-        # 6. Update metadata (Supabase Primary)
-        metadata_updated = False
-        try:
-            user_db.update_file_processed(
-                user_id=current_user.id,
-                filename=filename,
-                chunks_created=result["chunks_created"],
-                user_token=current_user.access_token
-            )
-            metadata_updated = True
-            logger.info(f"✅ Supabase status updated for {filename}")
-        except Exception as e:
-            logger.error(f"❌ Supabase status update failed for {filename}: {e}")
-            # Don't fail the whole processing, but flag the issue
-
-        # Update local (Best effort)
-        existing_files = _read_local_file_metadata()
-        for f in existing_files:
-            if f.get('filename') == filename or f.get('file_name') == filename:
-                f['processed'] = True
-                f['status'] = 'completed'
-                f['chunks_created'] = result.get("chunks_created", 0)
-                break
-        _save_local_file_metadata(existing_files)
-            
-        return {"success": True, "result": result}
-    except HTTPException:
-        raise
-    except ValueError as ve:
-        logger.error(f"Validation error processing {filename}: {ve}")
-        raise HTTPException(status_code=422, detail=f"Processing failed: {str(ve)}")
+        return {
+            "success": True, 
+            "queued": True,
+            "batch_job_id": batch_job_id,
+            "message": f"File {filename} queued for processing"
+        }
     except Exception as e:
-        logger.error(f"Error processing file {filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+        logger.error(f"Error queuing file {filename}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/batch-status")
+async def batch_status_endpoint(
+    doc_name: str = "",
+    job_id: str = "",
+    current_user: User = Depends(get_current_user)
+):
+    """Get background processing job status."""
+    try:
+        if job_id:
+            result = supabase.table("batch_jobs").select("*").eq("id", job_id).eq("user_id", current_user.id).execute()
+        elif doc_name:
+            result = supabase.table("batch_jobs").select("*").eq("doc_name", doc_name).eq("user_id", current_user.id).order("created_at", desc=True).limit(1).execute()
+        else:
+            # Return all recent jobs for user
+            result = supabase.table("batch_jobs").select("*").eq("user_id", current_user.id).order("created_at", desc=True).limit(10).execute()
+
+        jobs = result.data if result.data else []
+
+        # Map status to user-friendly message
+        status_labels = {
+            "queued": "Waiting to start...",
+            "processing": "📄 Chunking & embedding document...",
+            "extracting_topics": "🔍 Extracting chapters & topics...",
+            "generating_lessons": "📝 Pre-generating AI lessons...",
+            "generating_videos": "🎬 Pre-generating teaching videos...",
+            "completed": "✅ Ready! All lessons & videos pre-built.",
+            "failed": "❌ Processing failed."
+        }
+
+        for job in jobs:
+            job["status_label"] = status_labels.get(job.get("status", ""), job.get("status", ""))
+
+        return {"success": True, "jobs": jobs}
+    except Exception as e:
+        logger.error(f"Batch status error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/chat", response_model=QueryResponse)
 async def chat_endpoint(request: QueryRequest, current_user: User = Depends(get_current_user)):
@@ -591,6 +953,10 @@ async def edtech_list_documents(
         logger.error(f"EdTech document list failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# In-memory caches for chapters/topics (results don't change once doc is processed)
+_chapters_cache: dict = {}   # key: "user_id:doc_name" → {"data": response, "ts": time}
+_topics_cache: dict = {}     # key: "user_id:doc_name:chapter:language" → {"data": response, "ts": time}
+_EDTECH_CACHE_TTL = 1800     # 30 minutes (chapters/topics don't change)
 
 @app.get("/api/edtech/chapters")
 async def edtech_get_chapters(
@@ -598,6 +964,12 @@ async def edtech_get_chapters(
     current_user: User = Depends(get_current_user)
 ):
     """Get all chapters/sections detected in a processed document."""
+    import time as _time
+    cache_key = f"{current_user.id}:{doc_name}"
+    cached = _chapters_cache.get(cache_key)
+    if cached and (_time.time() - cached["ts"]) < _EDTECH_CACHE_TTL:
+        logger.info(f"🎯 Chapters cache HIT: {doc_name}")
+        return cached["data"]
     try:
         from vectorstore import index, get_user_namespaces
         from collections import defaultdict
@@ -605,17 +977,18 @@ async def edtech_get_chapters(
 
         namespaces = get_user_namespaces(current_user.id)
         all_chunks = []
+        loop = asyncio.get_event_loop()
 
         for ns in namespaces:
             try:
                 dummy_vec = [0.0] * 1536
-                res = index.query(
+                res = await loop.run_in_executor(None, lambda _ns=ns: index.query(
                     vector=dummy_vec,
                     top_k=10000,
                     include_metadata=True,
-                    namespace=ns,
+                    namespace=_ns,
                     filter={"doc_name": {"$eq": doc_name}}
-                )
+                ))
                 for match in res.matches:
                     meta = match.metadata
                     text = meta.get("text", "")
@@ -662,12 +1035,15 @@ async def edtech_get_chapters(
 
         logger.info(f"📚 EdTech: Found {len(chapters)} chapters in '{doc_name}' ({len(all_chunks)} total chunks)")
 
-        return {
+        response = {
             "success": True,
             "chapters": chapters,
             "document": doc_name,
             "total_chunks": len(all_chunks)
         }
+        # Cache the result
+        _chapters_cache[cache_key] = {"data": response, "ts": _time.time()}
+        return response
 
     except Exception as e:
         logger.error(f"EdTech chapter listing failed: {e}")
@@ -686,6 +1062,12 @@ async def edtech_extract_topics(
     If 'chapter' is provided, extracts DETAILED topics from only that chapter's chunks.
     Otherwise, samples across the entire document (fallback for small docs).
     """
+    import time as _time
+    topic_cache_key = f"{current_user.id}:{doc_name}:{chapter}:{language}"
+    cached = _topics_cache.get(topic_cache_key)
+    if cached and (_time.time() - cached["ts"]) < _EDTECH_CACHE_TTL:
+        logger.info(f"🎯 Topics cache HIT: {doc_name} / {chapter or 'whole doc'}")
+        return cached["data"]
     try:
         from edtech_service import extract_topics
         from vectorstore import index, get_user_namespaces
@@ -693,6 +1075,7 @@ async def edtech_extract_topics(
 
         namespaces = get_user_namespaces(current_user.id)
         all_chunks = []
+        loop = asyncio.get_event_loop()
 
         # Build Pinecone filter — optionally filter by chapter
         if chapter:
@@ -708,13 +1091,13 @@ async def edtech_extract_topics(
         for ns in namespaces:
             try:
                 dummy_vec = [0.0] * 1536
-                res = index.query(
+                res = await loop.run_in_executor(None, lambda _ns=ns: index.query(
                     vector=dummy_vec,
                     top_k=10000,
                     include_metadata=True,
-                    namespace=ns,
+                    namespace=_ns,
                     filter=pinecone_filter
-                )
+                ))
                 for match in res.matches:
                     meta = match.metadata
                     text = meta.get("text", "")
@@ -778,9 +1161,9 @@ async def edtech_extract_topics(
         logger.info(f"📚 Sending {len(content_parts)} chunks ({total_chars} chars) to LLM" +
                      (f" [chapter: {chapter}]" if chapter else " [whole doc]"))
 
-        topics = extract_topics(combined, language, [doc_name])
+        topics = await loop.run_in_executor(None, lambda: extract_topics(combined, language, [doc_name]))
 
-        return {
+        response = {
             "success": True,
             "topics": topics,
             "document": doc_name,
@@ -788,14 +1171,21 @@ async def edtech_extract_topics(
             "chunks_used": len(content_parts),
             "total_chunks": len(all_chunks)
         }
+        # Cache the result
+        _topics_cache[topic_cache_key] = {"data": response, "ts": _time.time()}
+        return response
 
     except Exception as e:
         logger.error(f"EdTech topic extraction failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ══════════════════════════════════════════════════════════════════════
-# ▸ Lesson Cache Helpers (Supabase DB + Storage)
+# ▸ Lesson Cache Helpers (Supabase DB + Storage + In-Memory LRU)
 # ══════════════════════════════════════════════════════════════════════
+
+# In-memory cache: {cache_key: {"data": ..., "ts": time.time()}}
+_lesson_mem_cache: dict = {}
+_LESSON_CACHE_TTL = 300  # 5 minutes
 
 def _lesson_cache_key(user_id: str, doc_name: str, topic: str, language: str, lesson_type: str) -> str:
     """Generate a deterministic cache key."""
@@ -805,10 +1195,18 @@ def _lesson_cache_key(user_id: str, doc_name: str, topic: str, language: str, le
 
 
 def _get_cached_lesson(cache_key: str):
-    """Check lesson_cache table for a matching entry. Returns dict or None."""
+    """Check in-memory cache first, then Supabase. Returns dict or None."""
+    import time as _time
+    # 1. Check in-memory cache
+    mem = _lesson_mem_cache.get(cache_key)
+    if mem and (_time.time() - mem["ts"]) < _LESSON_CACHE_TTL:
+        return mem["data"]
+    # 2. Fallback to Supabase
     try:
         result = supabase.table("lesson_cache").select("*").eq("cache_key", cache_key).limit(1).execute()
         if result.data and len(result.data) > 0:
+            # Populate in-memory cache
+            _lesson_mem_cache[cache_key] = {"data": result.data[0], "ts": _time.time()}
             return result.data[0]
     except Exception as e:
         logger.warning(f"Lesson cache lookup failed (non-fatal): {e}")
@@ -833,6 +1231,13 @@ def _save_lesson_cache(
             "audio_storage_paths": audio_storage_paths or [],
             "updated_at": datetime.utcnow().isoformat()
         }, on_conflict="cache_key").execute()
+        # Update in-memory cache too
+        import time as _time
+        _lesson_mem_cache[cache_key] = {
+            "data": {"cache_key": cache_key, "lesson_json": lesson_json,
+                     "audio_storage_paths": audio_storage_paths or []},
+            "ts": _time.time()
+        }
         logger.info(f"✅ Lesson cached: {topic} ({lesson_type})")
     except Exception as e:
         logger.warning(f"Lesson cache save failed (non-fatal): {e}")
@@ -877,10 +1282,11 @@ async def edtech_generate_lesson(
 
         # ── 2. Cache miss — generate from scratch ──
         logger.info(f"🔄 Lesson cache MISS: {topic}")
+        loop = asyncio.get_event_loop()
 
         # Search for relevant chunks about this topic
-        query_vec = embed_User_query(topic)
-        results = search_user_documents(query_vec, current_user.id, top_k=10)
+        query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic))
+        results = await loop.run_in_executor(None, lambda: search_user_documents(query_vec, current_user.id, top_k=10))
 
         if not results:
             return {"success": False, "detail": "No relevant content found for this topic. Please process more documents."}
@@ -898,7 +1304,7 @@ async def edtech_generate_lesson(
             return {"success": False, "detail": "No relevant content found for this topic."}
 
         combined = "\n\n---\n\n".join(chunks_with_refs)
-        lesson = generate_teacher_dialogue(topic, combined, language)
+        lesson = await loop.run_in_executor(None, lambda: generate_teacher_dialogue(topic, combined, language))
 
         # ── 3. Generate TTS audio for each dialogue line ──
         audio_urls = []
@@ -908,29 +1314,32 @@ async def edtech_generate_lesson(
         if dialogue and voice_map:
             try:
                 from heygen_service import generate_dialogue_audio, TTS_AUDIO_DIR
-                audio_files = generate_dialogue_audio(
+                audio_files = await loop.run_in_executor(None, lambda: generate_dialogue_audio(
                     dialogue_lines=dialogue,
                     voice_map=voice_map,
                     topic=topic,
                     user_id=current_user.id,
                     doc_name=doc_name
-                )
-                # Upload each audio file to Supabase Storage
-                for f in audio_files:
-                    if f:
-                        local_file = TTS_AUDIO_DIR / f
-                        storage_path = f"dialogue/{current_user.id}/{f}"
-                        public_url = _upload_audio_to_storage(str(local_file), storage_path)
-                        if public_url:
-                            audio_urls.append(public_url)
-                            audio_storage_paths.append(storage_path)
-                        else:
-                            # Fallback to local static path
-                            audio_urls.append(f"/static/tts_audio/{f}")
-                            audio_storage_paths.append("")
+                ))
+                # Upload all audio files to Supabase Storage in parallel
+                async def _upload_one(f_name):
+                    if not f_name:
+                        return "", ""
+                    local_file = TTS_AUDIO_DIR / f_name
+                    storage_path = f"dialogue/{current_user.id}/{f_name}"
+                    public_url = await loop.run_in_executor(
+                        None, lambda lf=str(local_file), sp=storage_path: _upload_audio_to_storage(lf, sp)
+                    )
+                    if public_url:
+                        return public_url, storage_path
                     else:
-                        audio_urls.append("")
-                        audio_storage_paths.append("")
+                        return f"/static/tts_audio/{f_name}", ""
+
+                upload_results = await asyncio.gather(
+                    *[_upload_one(f) for f in audio_files]
+                )
+                audio_urls = [r[0] for r in upload_results]
+                audio_storage_paths = [r[1] for r in upload_results]
             except Exception as audio_err:
                 logger.warning(f"Dialogue audio generation failed (non-fatal): {audio_err}")
                 audio_urls = []
@@ -1153,10 +1562,11 @@ async def edtech_generate_tts_video(
 
         # ── 2. Cache miss — generate from scratch ──
         logger.info(f"🔄 TTS video cache MISS: {topic}")
+        loop = asyncio.get_event_loop()
 
         # Search for relevant chunks
-        query_vec = embed_User_query(topic)
-        results = search_user_documents(query_vec, current_user.id, top_k=10)
+        query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic))
+        results = await loop.run_in_executor(None, lambda: search_user_documents(query_vec, current_user.id, top_k=10))
 
         if not results:
             return {
@@ -1182,14 +1592,14 @@ async def edtech_generate_tts_video(
 
         combined_content = "\n\n---\n\n".join(chunks_with_refs)
 
-        result = generate_tts_video_for_topic(
+        result = await loop.run_in_executor(None, lambda: generate_tts_video_for_topic(
             topic=topic,
             content=combined_content,
             user_id=current_user.id,
             doc_name=doc_name,
             language=language,
             voice=voice
-        )
+        ))
 
         # ── 3. Upload audio to Supabase Storage + build response ──
         audio_storage_paths = []
@@ -1442,6 +1852,340 @@ async def history_endpoint(session_id: Optional[str] = None, current_user: User 
     except Exception as e:
         logger.error(f"History error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ══════════════════════════════════════════════════════════════════════
+# ▸ CLASSROOM / LMS ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════
+
+import string, random as _random
+
+def _generate_join_code(length: int = 6) -> str:
+    """Generate a random alphanumeric join code."""
+    return ''.join(_random.choices(string.ascii_uppercase + string.digits, k=length))
+
+
+# ── Role Management ──
+
+@app.patch("/api/users/role")
+async def update_user_role(
+    role: str = Form(...),
+    current_user: User = Depends(get_current_user)
+):
+    """Switch user role to 'teacher' or 'student'."""
+    if role not in ("teacher", "student"):
+        raise HTTPException(status_code=400, detail="Role must be 'teacher' or 'student'")
+    try:
+        supabase.table("profiles").update({"role": role}).eq("id", current_user.id).execute()
+        return {"success": True, "role": role}
+    except Exception as e:
+        logger.error(f"Role update failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/users/me")
+async def get_current_user_info(current_user: User = Depends(get_current_user)):
+    """Get current user info including role."""
+    return {
+        "success": True,
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email,
+            "full_name": current_user.full_name,
+            "role": current_user.role
+        }
+    }
+
+
+# ── Classroom CRUD ──
+
+@app.post("/api/classrooms")
+async def create_classroom(
+    name: str = Form(...),
+    description: str = Form(""),
+    doc_name: str = Form(""),
+    current_user: User = Depends(get_current_user)
+):
+    """Create a new classroom (teacher only)."""
+    if current_user.role != "teacher":
+        raise HTTPException(status_code=403, detail="Only teachers can create classrooms")
+    try:
+        join_code = _generate_join_code()
+        # Ensure unique join code
+        for _ in range(5):
+            existing = supabase.table("classrooms").select("id").eq("join_code", join_code).execute()
+            if not existing.data:
+                break
+            join_code = _generate_join_code()
+
+        result = supabase.table("classrooms").insert({
+            "teacher_id": current_user.id,
+            "name": name,
+            "description": description,
+            "doc_name": doc_name,
+            "join_code": join_code
+        }).execute()
+
+        return {"success": True, "classroom": result.data[0] if result.data else None}
+    except Exception as e:
+        logger.error(f"Classroom creation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/classrooms")
+async def list_classrooms(current_user: User = Depends(get_current_user)):
+    """List classrooms — teacher sees owned, student sees joined."""
+    try:
+        if current_user.role == "teacher":
+            result = supabase.table("classrooms").select("*").eq("teacher_id", current_user.id).order("created_at", desc=True).execute()
+            classrooms = result.data or []
+            # Attach student count
+            for cls in classrooms:
+                count = supabase.table("classroom_students").select("id", count="exact").eq("classroom_id", cls["id"]).execute()
+                cls["student_count"] = count.count if count.count is not None else 0
+        else:
+            # Student: get classrooms they've joined
+            memberships = supabase.table("classroom_students").select("classroom_id").eq("student_id", current_user.id).execute()
+            classroom_ids = [m["classroom_id"] for m in (memberships.data or [])]
+            if classroom_ids:
+                result = supabase.table("classrooms").select("*").in_("id", classroom_ids).execute()
+                classrooms = result.data or []
+            else:
+                classrooms = []
+            # Attach teacher name
+            for cls in classrooms:
+                teacher = supabase.table("profiles").select("full_name").eq("id", cls["teacher_id"]).limit(1).execute()
+                cls["teacher_name"] = teacher.data[0]["full_name"] if teacher.data else "Teacher"
+
+        return {"success": True, "classrooms": classrooms}
+    except Exception as e:
+        logger.error(f"List classrooms failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/classrooms/join")
+async def join_classroom(
+    join_code: str = Form(...),
+    current_user: User = Depends(get_current_user)
+):
+    """Student joins a classroom via join code."""
+    try:
+        # Find classroom
+        result = supabase.table("classrooms").select("*").eq("join_code", join_code.upper().strip()).limit(1).execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Invalid join code")
+        classroom = result.data[0]
+
+        # Check not already joined
+        existing = supabase.table("classroom_students").select("id").eq("classroom_id", classroom["id"]).eq("student_id", current_user.id).execute()
+        if existing.data:
+            return {"success": True, "message": "Already joined", "classroom": classroom}
+
+        # Add membership
+        supabase.table("classroom_students").insert({
+            "classroom_id": classroom["id"],
+            "student_id": current_user.id
+        }).execute()
+
+        return {"success": True, "message": "Joined successfully!", "classroom": classroom}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Join classroom failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/classrooms/{classroom_id}")
+async def get_classroom_detail(classroom_id: str, current_user: User = Depends(get_current_user)):
+    """Get full classroom details including students and assignments."""
+    try:
+        # Get classroom
+        cls_result = supabase.table("classrooms").select("*").eq("id", classroom_id).limit(1).execute()
+        if not cls_result.data:
+            raise HTTPException(status_code=404, detail="Classroom not found")
+        classroom = cls_result.data[0]
+
+        # Get students
+        students_result = supabase.table("classroom_students").select("student_id, joined_at").eq("classroom_id", classroom_id).execute()
+        students = []
+        for s in (students_result.data or []):
+            profile = supabase.table("profiles").select("id, full_name, email").eq("id", s["student_id"]).limit(1).execute()
+            if profile.data:
+                student_info = profile.data[0]
+                student_info["joined_at"] = s["joined_at"]
+                students.append(student_info)
+
+        # Get assignments
+        assignments_result = supabase.table("assignments").select("*").eq("classroom_id", classroom_id).order("created_at", desc=True).execute()
+
+        classroom["students"] = students
+        classroom["assignments"] = assignments_result.data or []
+
+        return {"success": True, "classroom": classroom}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Classroom detail failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Assignments ──
+
+@app.post("/api/classrooms/{classroom_id}/assignments")
+async def create_assignment(
+    classroom_id: str,
+    chapter_title: str = Form(...),
+    topics: str = Form("[]"),  # JSON array string
+    due_date: str = Form(""),
+    current_user: User = Depends(get_current_user)
+):
+    """Teacher creates an assignment (chapter + topics + optional due date)."""
+    if current_user.role != "teacher":
+        raise HTTPException(status_code=403, detail="Only teachers can create assignments")
+    try:
+        import json as _json
+        topics_list = _json.loads(topics) if topics else []
+        assignment_data = {
+            "classroom_id": classroom_id,
+            "chapter_title": chapter_title,
+            "topics": topics_list,
+        }
+        if due_date:
+            assignment_data["due_date"] = due_date
+
+        result = supabase.table("assignments").insert(assignment_data).execute()
+        return {"success": True, "assignment": result.data[0] if result.data else None}
+    except Exception as e:
+        logger.error(f"Assignment creation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Progress Tracking ──
+
+@app.post("/api/progress/update")
+async def update_student_progress(
+    classroom_id: str = Form(...),
+    topic: str = Form(...),
+    activity_type: str = Form(...),  # 'conversation', 'video', or 'quiz'
+    quiz_score: int = Form(0),
+    quiz_answers: str = Form("{}"),  # JSON string
+    current_user: User = Depends(get_current_user)
+):
+    """Record a student's activity completion for a topic."""
+    try:
+        import json as _json
+
+        # Upsert progress
+        existing = supabase.table("student_progress").select("*").eq("student_id", current_user.id).eq("classroom_id", classroom_id).eq("topic", topic).limit(1).execute()
+
+        update_data = {"updated_at": datetime.utcnow().isoformat()}
+
+        if activity_type == "conversation":
+            update_data["conversation_completed"] = True
+        elif activity_type == "video":
+            update_data["video_completed"] = True
+        elif activity_type == "quiz":
+            update_data["quiz_score"] = quiz_score
+            update_data["quiz_answers"] = _json.loads(quiz_answers) if quiz_answers else {}
+
+        if existing.data:
+            # Update existing
+            progress = existing.data[0]
+            supabase.table("student_progress").update(update_data).eq("id", progress["id"]).execute()
+            # Check if fully completed
+            merged = {**progress, **update_data}
+            if merged.get("conversation_completed") and merged.get("video_completed") and merged.get("quiz_score", 0) > 0:
+                supabase.table("student_progress").update({"completed_at": datetime.utcnow().isoformat()}).eq("id", progress["id"]).execute()
+        else:
+            # Insert new
+            insert_data = {
+                "student_id": current_user.id,
+                "classroom_id": classroom_id,
+                "topic": topic,
+                **update_data
+            }
+            # Try to find the assignment this topic belongs to
+            assignments = supabase.table("assignments").select("id, topics").eq("classroom_id", classroom_id).execute()
+            for a in (assignments.data or []):
+                if topic in (a.get("topics") or []):
+                    insert_data["assignment_id"] = a["id"]
+                    break
+            supabase.table("student_progress").insert(insert_data).execute()
+
+        return {"success": True, "message": "Progress updated"}
+    except Exception as e:
+        logger.error(f"Progress update failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/progress/me")
+async def get_my_progress(
+    classroom_id: str = "",
+    current_user: User = Depends(get_current_user)
+):
+    """Get own progress — optionally filtered by classroom."""
+    try:
+        query = supabase.table("student_progress").select("*").eq("student_id", current_user.id)
+        if classroom_id:
+            query = query.eq("classroom_id", classroom_id)
+        result = query.execute()
+        return {"success": True, "progress": result.data or []}
+    except Exception as e:
+        logger.error(f"Get progress failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/classrooms/{classroom_id}/progress")
+async def get_classroom_progress(
+    classroom_id: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Teacher gets all students' progress for a classroom."""
+    try:
+        # Get all students in classroom
+        students_result = supabase.table("classroom_students").select("student_id").eq("classroom_id", classroom_id).execute()
+        student_ids = [s["student_id"] for s in (students_result.data or [])]
+
+        if not student_ids:
+            return {"success": True, "progress": [], "students": []}
+
+        # Get all progress records for this classroom
+        progress_result = supabase.table("student_progress").select("*").eq("classroom_id", classroom_id).execute()
+
+        # Get student names
+        students = []
+        for sid in student_ids:
+            profile = supabase.table("profiles").select("id, full_name, email").eq("id", sid).limit(1).execute()
+            if profile.data:
+                students.append(profile.data[0])
+
+        # Get assignments for topic list
+        assignments = supabase.table("assignments").select("*").eq("classroom_id", classroom_id).execute()
+
+        # Calculate per-student summary
+        student_summaries = []
+        for student in students:
+            student_progress = [p for p in (progress_result.data or []) if p["student_id"] == student["id"]]
+            total_topics = sum(len(a.get("topics") or []) for a in (assignments.data or []))
+            completed_topics = sum(1 for p in student_progress if p.get("completed_at"))
+            pct = round((completed_topics / total_topics * 100)) if total_topics > 0 else 0
+            student_summaries.append({
+                **student,
+                "completed_topics": completed_topics,
+                "total_topics": total_topics,
+                "progress_percent": pct,
+                "details": student_progress
+            })
+
+        return {
+            "success": True,
+            "students": student_summaries,
+            "assignments": assignments.data or [],
+            "progress": progress_result.data or []
+        }
+    except Exception as e:
+        logger.error(f"Classroom progress failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
