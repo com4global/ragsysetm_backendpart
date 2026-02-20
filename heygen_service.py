@@ -478,17 +478,19 @@ def generate_sarvam_tts(text: str, audio_path: Path, language: str = "ta") -> No
     audio_segments = []
 
     for chunk in chunks:
-        # ── Correct payload for bulbul:v3 ──
+        # ── Correct payload for bulbul:v2 ──
+        # bulbul:v2 uses "text" (string) + supports "anushka" speaker + "target_language_code"
+        # bulbul:v1 would need "inputs": [text] — different format entirely
         payload = {
-            "text": chunk,                     # v3 uses "text" (string), NOT "inputs" (array)
+            "text": chunk,
             "target_language_code": "ta-IN",
-            "speaker": "anushka",              # Female Tamil teacher voice
+            "speaker": "anushka",              # anushka is a bulbul:v2 Tamil female speaker
             "pitch": 0,
             "pace": 1.0,
             "loudness": 1.5,
             "speech_sample_rate": 22050,
             "enable_preprocessing": True,
-            "model": "bulbul:v1"               # v1 still active — use this if v3 gives 400
+            "model": "bulbul:v2"               # ← MUST be v2 to use text field + anushka
         }
 
         try:
