@@ -1412,9 +1412,11 @@ async def edtech_generate_lesson(
         if dialogue and voice_map:
             try:
                 from heygen_service import generate_dialogue_audio, TTS_AUDIO_DIR
+                # Inject language so Sarvam routing works for Tamil
+                voice_map_with_lang = {**voice_map, "__language__": language}
                 audio_files = await loop.run_in_executor(None, lambda: generate_dialogue_audio(
                     dialogue_lines=dialogue,
-                    voice_map=voice_map,
+                    voice_map=voice_map_with_lang,
                     topic=topic,
                     user_id=current_user.id,
                     doc_name=doc_name

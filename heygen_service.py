@@ -63,9 +63,9 @@ def _save_cache(cache: Dict):
         logger.warning(f"Cache save failed: {e}")
 
 
-def _cache_key(user_id: str, doc_name: str, topic: str) -> str:
-    """Generate a deterministic cache key for a video."""
-    raw = f"{user_id}|{doc_name}|{topic}".lower().strip()
+def _cache_key(user_id: str, doc_name: str, topic: str, language: str = "en") -> str:
+    """Generate a deterministic cache key for a video (language-aware)."""
+    raw = f"{user_id}|{doc_name}|{topic}|{language}".lower().strip()
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -551,7 +551,7 @@ def generate_tts_audio(
         Dict with: audio_filename, sentences[], script, duration_estimate
     """
     # ── Check TTS cache ──
-    cache_key = _cache_key(user_id, doc_name, topic)
+    cache_key = _cache_key(user_id, doc_name, topic, language)
     tts_cache = _load_tts_cache()
     
     if cache_key in tts_cache:
@@ -634,7 +634,7 @@ def generate_tts_video_for_topic(
         voice = available_voices[topic_hash % len(available_voices)]
 
     # ── Check if already cached ──
-    cache_key = _cache_key(user_id, doc_name, topic)
+    cache_key = _cache_key(user_id, doc_name, topic, language)
     tts_cache = _load_tts_cache()
     
     if cache_key in tts_cache:
@@ -689,6 +689,8 @@ def generate_dialogue_audio(
 
     # Detect language from dialogue_lines metadata (passed via voice_map extra key)
     lang = voice_map.get("__language__", "en")
+    # Include language in slug so Tamil and English never share cached files
+    lang_topic_slug = hashlib.md5(f"{user_id}:{doc_name}:{topic}:{lang}".encode()).hexdigest()[:10]
 
     def _generate_one(idx, line):
         speaker = line.get("speaker", "")
@@ -698,7 +700,7 @@ def generate_dialogue_audio(
         if not text.strip():
             return idx, ""
 
-        audio_filename = f"dialogue_{topic_slug}_{idx}.mp3"
+        audio_filename = f"dialogue_{lang_topic_slug}_{idx}.mp3"
         audio_path = TTS_AUDIO_DIR / audio_filename
 
         if audio_path.exists():
