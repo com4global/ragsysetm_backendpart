@@ -463,17 +463,46 @@ def generate_sarvam_tts(text: str, audio_path: Path, language: str = "ta") -> No
         "Content-Type": "application/json"
     }
 
-    # bulbul:v3 accepts up to ~2000 chars in one call — chunk only if very long
-    CHUNK_SIZE = 1800
-    words = text.split()
-    chunks, current = [], []
-    for word in words:
-        current.append(word)
-        if len(" ".join(current)) >= CHUNK_SIZE:
-            chunks.append(" ".join(current))
-            current = []
-    if current:
-        chunks.append(" ".join(current))
+    # ── Text chunking ──
+    # Sarvam bulbul:v2 silently truncates requests over ~450 characters.
+    # The comment about "2000 chars" was wrong (that was for an older v3 doc).
+    # Safe limit: 400 characters per API call.
+    # We split on sentence boundaries (। . ! ?) so sentences aren't cut mid-word.
+    CHUNK_SIZE = 400
+
+    import re as _re
+    # Split into sentences first
+    sentence_list = _re.split(r'(?<=[.!?।])\s+', text.strip())
+    sentence_list = [s.strip() for s in sentence_list if s.strip()]
+
+    chunks = []
+    current_chunk = ""
+    for sentence in sentence_list:
+        # If a single sentence exceeds CHUNK_SIZE, break it by words
+        if len(sentence) > CHUNK_SIZE:
+            words = sentence.split()
+            for word in words:
+                if len(current_chunk) + len(word) + 1 > CHUNK_SIZE:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = word
+                else:
+                    current_chunk = (current_chunk + " " + word).strip()
+        else:
+            if len(current_chunk) + len(sentence) + 1 > CHUNK_SIZE:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence
+            else:
+                current_chunk = (current_chunk + " " + sentence).strip()
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    logger.info(f"🔢 Sarvam TTS: splitting {len(text)} chars into {len(chunks)} chunks of ≤{CHUNK_SIZE} chars")
+    for i, ch in enumerate(chunks):
+        logger.info(f"   Chunk {i+1}/{len(chunks)}: {len(ch)} chars — '{ch[:60]}...'")
+
 
     audio_segments = []
 
