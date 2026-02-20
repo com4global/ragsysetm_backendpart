@@ -43,6 +43,8 @@ from contextlib import asynccontextmanager
 from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+import string
+import random
 
 # Local modules
 from database import user_db, supabase
@@ -61,6 +63,11 @@ from Auth import get_current_user, User
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _generate_join_code(length: int = 6) -> str:
+    """Generate a random uppercase alphanumeric join code."""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 # Constants
 # Determine environment
@@ -683,6 +690,97 @@ async def upload_file_endpoint(
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Web URL Ingestion ──
+
+@app.post("/api/ingest-url")
+async def ingest_url(
+    url: str = Form(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    current_user: User = Depends(get_current_user)
+):
+    """Extract text from a web page URL and process it through the embedding pipeline."""
+    try:
+        logger.info(f"🌐 Ingesting URL: {url} for user {current_user.id}")
+
+        # Fetch the web page
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; EdTechBot/1.0)"}
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+
+        # Extract readable text with BeautifulSoup
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Remove script, style, nav, footer elements
+        for tag in soup(["script", "style", "nav", "footer", "header", "iframe", "noscript"]):
+            tag.decompose()
+
+        # Get page title
+        title = soup.title.string.strip() if soup.title and soup.title.string else "Web Page"
+
+        # Extract main text content
+        text_parts = []
+        for element in soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th", "blockquote", "pre", "article"]):
+            text = element.get_text(strip=True)
+            if len(text) > 20:  # Skip very short fragments
+                text_parts.append(text)
+
+        full_text = f"# {title}\n\nSource: {url}\n\n" + "\n\n".join(text_parts)
+
+        if len(full_text) < 100:
+            raise HTTPException(status_code=400, detail="Could not extract enough text from this URL")
+
+        # Save as a .txt file
+        safe_name = re.sub(r"[^a-zA-Z0-9]", "_", title)[:50]
+        filename = f"web_{safe_name}.txt"
+        user_dir = WRITE_RESOURCES_DIR / current_user.id
+        user_dir.mkdir(parents=True, exist_ok=True)
+        file_path = user_dir / filename
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(full_text)
+
+        file_size = len(full_text.encode("utf-8"))
+        logger.info(f"📝 Extracted {len(text_parts)} sections, {file_size} bytes from {url}")
+
+        # Register the file in the database
+        try:
+            user_db.add_user_file(
+                user_id=current_user.id,
+                filename=filename,
+                file_type="txt",
+                file_size=file_size,
+                user_token=current_user.access_token
+            )
+        except Exception as e:
+            logger.warning(f"File registration warning: {e}")
+
+        # Queue background processing (chunking + embedding)
+        job_id = str(uuid.uuid4())
+        _update_batch_status(job_id, "queued", progress=0)
+        background_tasks.add_task(
+            _process_document_background,
+            filename, current_user.id, job_id, current_user.access_token
+        )
+
+        return {
+            "success": True,
+            "title": title,
+            "filename": filename,
+            "text_length": len(full_text),
+            "sections": len(text_parts),
+            "batch_job_id": job_id,
+            "message": f"Web page '{title}' extracted! Processing in background."
+        }
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error(f"URL fetch failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Could not fetch URL: {str(e)}")
+    except Exception as e:
+        logger.error(f"URL ingestion failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/register-file")
 async def register_file_endpoint(request: RegisterFileRequest, current_user: User = Depends(get_current_user)):
