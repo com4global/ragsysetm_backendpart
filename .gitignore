@@ -30,6 +30,7 @@ uploads/
 processed/
 resources/*/
 !resources/
+resources/.file_metadata.json
 
 # User database (local dev only)
 users.db
