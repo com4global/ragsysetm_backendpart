@@ -635,3 +635,139 @@ def generate_dialogue_audio(
 
     logger.info(f"✅ Generated {sum(1 for f in audio_files if f)} / {len(dialogue_lines)} dialogue audio files")
     return audio_files
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ▸ Wikipedia Image Enrichment — Free, CDN-cached, No API Key Needed
+# ══════════════════════════════════════════════════════════════════════
+
+from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+def fetch_wikipedia_image(concept: str, language: str = "en") -> dict:
+    """
+    Fetch a Wikipedia thumbnail image URL for a given concept keyword.
+    Uses the Wikipedia REST API — free, no key needed, globally CDN-cached.
+
+    Returns: { "url": str, "caption": str } or empty dict if not found.
+    """
+    if not concept or not concept.strip():
+        return {}
+
+    # Use English Wikipedia for images even for Tamil lessons (better coverage)
+    wiki_lang = "en"
+    concept_encoded = concept.strip().replace(" ", "_")
+
+    try:
+        url = f"https://{wiki_lang}.wikipedia.org/api/rest_v1/page/summary/{concept_encoded}"
+        resp = requests.get(url, timeout=5, headers={"User-Agent": "ZenzeeEdTech/1.0"})
+        if resp.status_code == 200:
+            data = resp.json()
+            thumbnail = data.get("thumbnail", {})
+            img_url = thumbnail.get("source", "")
+            if img_url:
+                # Upscale to ~400px for better quality
+                img_url = img_url.replace("/100px-", "/400px-").replace("/150px-", "/400px-").replace("/200px-", "/400px-")
+                caption = data.get("title", concept)
+                return {"url": img_url, "caption": caption}
+    except Exception as e:
+        logger.debug(f"Wikipedia image fetch failed for '{concept}': {e}")
+
+    return {}
+
+
+def extract_visual_concepts(sentences: list, topic: str, language: str = "en") -> list:
+    """
+    Use GPT to extract one search keyword per sentence for image lookup.
+    Returns a list of concept strings, one per sentence.
+    Groups them into a single GPT call for efficiency.
+    """
+    if not sentences:
+        return []
+
+    numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(sentences))
+    prompt = f"""You are helping an educational platform find relevant images for each sentence in a lesson about "{topic}".
+
+For each numbered sentence below, output ONE short, specific English search keyword (1-3 words) that best represents the VISUAL concept in that sentence. This keyword will be used to find a Wikipedia image.
+
+Rules:
+- Output ONLY the keyword, one per line, numbered to match
+- Use clear, concrete nouns (e.g. "mitochondria", "water cycle", "Eiffel Tower")
+- If a sentence is a greeting or transition with no visual concept, output: none
+- Always output exactly {len(sentences)} lines
+
+Sentences:
+{numbered}
+
+Keywords (one per line):"""
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=len(sentences) * 10  # ~10 tokens per concept
+        )
+        raw = response.choices[0].message.content.strip().split("\n")
+        concepts = []
+        for line in raw:
+            line = line.strip()
+            # Strip leading number and punctuation: "1. mitochondria" → "mitochondria"
+            if line and line[0].isdigit():
+                line = line.split(".", 1)[-1].strip()
+            concepts.append(line if line.lower() != "none" else "")
+        # Pad or trim to match sentence count
+        while len(concepts) < len(sentences):
+            concepts.append("")
+        return concepts[:len(sentences)]
+    except Exception as e:
+        logger.warning(f"Concept extraction failed: {e}")
+        return [""] * len(sentences)
+
+
+def enrich_sentences_with_images(sentences: list, topic: str, language: str = "en") -> list:
+    """
+    Enrich a list of sentence strings with Wikipedia image URLs.
+    Each sentence dict (or string) gets an `image_url` and `image_caption` field.
+
+    Input:  ["sentence 1", "sentence 2", ...]  OR  [{"text": ..., ...}, ...]
+    Output: [{"text": ..., "image_url": ..., "image_caption": ...}, ...]
+    """
+    if not sentences:
+        return []
+
+    # Normalize to list of dicts
+    normalized = []
+    for s in sentences:
+        if isinstance(s, dict):
+            normalized.append(dict(s))
+        else:
+            normalized.append({"text": str(s)})
+
+    # 1. Extract one concept keyword per sentence (single GPT call)
+    texts = [item["text"] for item in normalized]
+    concepts = extract_visual_concepts(texts, topic, language)
+
+    # 2. Deduplicate concepts for parallel Wikipedia lookups
+    unique_concepts = list(set(c for c in concepts if c))
+    concept_image_map = {}
+
+    def _fetch_one(concept):
+        result = fetch_wikipedia_image(concept, language)
+        return concept, result
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_one, c): c for c in unique_concepts}
+        for fut in _as_completed(futures):
+            concept, result = fut.result()
+            if result:
+                concept_image_map[concept] = result
+
+    # 3. Attach image data to each sentence
+    for i, item in enumerate(normalized):
+        concept = concepts[i] if i < len(concepts) else ""
+        img = concept_image_map.get(concept, {})
+        item["image_url"] = img.get("url", "")
+        item["image_caption"] = img.get("caption", "")
+
+    logger.info(f"✅ Image enrichment: {sum(1 for s in normalized if s.get('image_url'))} / {len(normalized)} sentences got images")
+    return normalized

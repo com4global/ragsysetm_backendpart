@@ -1444,6 +1444,22 @@ async def edtech_generate_lesson(
 
         lesson["audio_urls"] = audio_urls
 
+        # ── 3b. Enrich dialogue bubbles with Wikipedia images ──
+        try:
+            from heygen_service import enrich_sentences_with_images
+            dialogue_texts = [line.get("text", "") for line in dialogue]
+            enriched = await loop.run_in_executor(
+                None, lambda: enrich_sentences_with_images(dialogue_texts, topic, language)
+            )
+            # Merge image data back into dialogue lines
+            for i, line in enumerate(dialogue):
+                if i < len(enriched):
+                    line["image_url"] = enriched[i].get("image_url", "")
+                    line["image_caption"] = enriched[i].get("image_caption", "")
+            lesson["dialogue"] = dialogue
+        except Exception as img_err:
+            logger.warning(f"Image enrichment failed (non-fatal): {img_err}")
+
         # ── 4. Save to cache ──
         _save_lesson_cache(
             user_id=current_user.id,
@@ -1813,6 +1829,18 @@ async def edtech_generate_tts_video(
                 result["audio_url"] = f"/static/tts_audio/{result['audio_filename']}"
 
         response = {"success": result.get("status") != "failed", **result}
+
+        # ── 3b. Enrich TTS sentences with Wikipedia images ──
+        try:
+            from heygen_service import enrich_sentences_with_images
+            raw_sentences = result.get("sentences", [])
+            if raw_sentences:
+                enriched = await loop.run_in_executor(
+                    None, lambda: enrich_sentences_with_images(raw_sentences, topic, language)
+                )
+                response["sentences"] = enriched  # Replace plain strings with enriched dicts
+        except Exception as img_err:
+            logger.warning(f"TTS image enrichment failed (non-fatal): {img_err}")
 
         # ── 4. Save to cache ──
         if result.get("status") == "completed":
