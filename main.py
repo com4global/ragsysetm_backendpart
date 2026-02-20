@@ -1363,6 +1363,7 @@ def _upload_audio_to_storage(local_path: str, storage_path: str) -> str:
 async def edtech_generate_lesson(
     topic: str = Form(...),
     language: str = Form("en"),
+    doc_name: str = Form(""),
     current_user: User = Depends(get_current_user)
 ):
     """Generate an AI teacher dialogue lesson for a specific topic."""
