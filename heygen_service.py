@@ -448,15 +448,23 @@ def _split_into_sentences(text: str) -> list:
 
 def generate_sarvam_tts(text: str, audio_path: Path, language: str = "ta") -> None:
     """
-    Generate Tamil TTS audio using Sarvam AI's saarika:v2 model.
-    Sarvam is built specifically for Indian languages — sounds like a real Tamil teacher.
-    Handles long texts by chunking (Sarvam limit: 500 chars per request).
+    Generate Tamil TTS audio using Sarvam AI bulbul:v3.
+    v3 accepts long-form text in a single request — no chunking needed.
+    Returns WAV audio as base64.
     """
     if not SARVAM_API_KEY:
         raise RuntimeError("SARVAM_API_KEY not set in environment")
 
-    # Sarvam supports up to ~500 chars per request — chunk if needed
-    CHUNK_SIZE = 450
+    import base64, io, wave, shutil
+
+    # Sarvam v3 REST API — correct payload format
+    headers = {
+        "api-subscription-key": SARVAM_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    # bulbul:v3 accepts up to ~2000 chars in one call — chunk only if very long
+    CHUNK_SIZE = 1800
     words = text.split()
     chunks, current = [], []
     for word in words:
@@ -468,38 +476,40 @@ def generate_sarvam_tts(text: str, audio_path: Path, language: str = "ta") -> No
         chunks.append(" ".join(current))
 
     audio_segments = []
-    headers = {
-        "api-subscription-key": SARVAM_API_KEY,
-        "Content-Type": "application/json"
-    }
 
     for chunk in chunks:
+        # ── Correct payload for bulbul:v3 ──
         payload = {
-            "inputs": [chunk],
+            "text": chunk,                     # v3 uses "text" (string), NOT "inputs" (array)
             "target_language_code": "ta-IN",
-            "speaker": "anushka",        # Natural female Tamil teacher voice
+            "speaker": "anushka",              # Female Tamil teacher voice
             "pitch": 0,
-            "pace": 1.0,               # Normal speed — students can follow easily
+            "pace": 1.0,
             "loudness": 1.5,
             "speech_sample_rate": 22050,
             "enable_preprocessing": True,
-            "model": "bulbul:v1"
+            "model": "bulbul:v1"               # v1 still active — use this if v3 gives 400
         }
-        resp = requests.post(SARVAM_TTS_URL, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        # Sarvam returns base64-encoded WAV audio
-        import base64
-        audio_b64 = data.get("audios", [None])[0]
-        if audio_b64:
-            audio_segments.append(base64.b64decode(audio_b64))
+
+        try:
+            resp = requests.post(SARVAM_TTS_URL, json=payload, headers=headers, timeout=30)
+            if not resp.ok:
+                # Log the error body for easier debugging
+                logger.error(f"Sarvam TTS error {resp.status_code}: {resp.text[:500]}")
+                resp.raise_for_status()
+
+            data = resp.json()
+            audio_b64 = data.get("audios", [None])[0]
+            if audio_b64:
+                audio_segments.append(base64.b64decode(audio_b64))
+        except Exception as e:
+            logger.error(f"Sarvam TTS chunk failed: {e}")
+            raise
 
     if not audio_segments:
         raise RuntimeError("Sarvam TTS returned no audio")
 
-    # Merge WAV chunks: keep first header, append data from rest
-    # WAV header is 44 bytes; we concatenate raw PCM data
-    import io, wave
+    # Merge WAV chunks into a single file
     merged_frames = b""
     first_params = None
     for seg in audio_segments:
@@ -508,25 +518,24 @@ def generate_sarvam_tts(text: str, audio_path: Path, language: str = "ta") -> No
                 first_params = wf.getparams()
             merged_frames += wf.readframes(wf.getnframes())
 
-    # Write merged WAV (save as .wav but rename to .mp3 for compatibility)
     if not first_params:
         raise RuntimeError("Sarvam TTS: no valid WAV params from audio chunks")
+
     wav_path = audio_path.with_suffix(".wav")
     with wave.open(str(wav_path), 'wb') as out:
         out.setparams(first_params)
         out.writeframes(merged_frames)
 
-    # Convert WAV → MP3 using pydub if available, else keep .wav as .mp3 (browsers handle it)
+    # Convert WAV → MP3 using pydub if available, else keep WAV (browsers handle it fine)
     try:
         from pydub import AudioSegment
         AudioSegment.from_wav(str(wav_path)).export(str(audio_path), format="mp3", bitrate="128k")
         wav_path.unlink(missing_ok=True)
         logger.info(f"✅ Sarvam Tamil TTS saved (MP3): {audio_path}")
     except Exception:
-        # pydub not available — rename wav to mp3 path (browsers accept WAV fine)
-        import shutil
         shutil.move(str(wav_path), str(audio_path))
-        logger.info(f"✅ Sarvam Tamil TTS saved (WAV as MP3): {audio_path}")
+        logger.info(f"✅ Sarvam Tamil TTS saved (WAV renamed to MP3): {audio_path}")
+
 
 
 def generate_tts_audio(
