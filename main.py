@@ -697,7 +697,6 @@ async def upload_file_endpoint(
 @app.post("/api/ingest-url")
 async def ingest_url(
     url: str = Form(...),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(get_current_user)
 ):
     """Extract text from a web page URL and process it through the embedding pipeline."""
@@ -757,11 +756,19 @@ async def ingest_url(
 
         # Queue background processing (chunking + embedding)
         job_id = str(uuid.uuid4())
-        _update_batch_status(job_id, "queued", progress=0)
-        background_tasks.add_task(
-            _process_document_background,
-            filename, current_user.id, job_id, current_user.access_token
-        )
+        try:
+            supabase.table("batch_jobs").insert({
+                "id": job_id,
+                "user_id": current_user.id,
+                "doc_name": filename,
+                "status": "queued",
+                "progress": 0,
+                "total_steps": 4,
+                "completed_steps": 0
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Batch job creation warning: {e}")
+        _enqueue_processing(current_user.id, filename, current_user.access_token, job_id)
 
         return {
             "success": True,
