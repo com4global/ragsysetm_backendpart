@@ -2139,9 +2139,10 @@ async def update_user_role(
     role: str = Form(...),
     current_user: User = Depends(get_current_user)
 ):
-    """Switch user role to 'teacher' or 'student'."""
-    if role not in ("teacher", "student"):
-        raise HTTPException(status_code=400, detail="Role must be 'teacher' or 'student'")
+    """Switch user role: teacher | student | individual | other."""
+    VALID_ROLES = {"teacher", "student", "individual", "other"}
+    if role not in VALID_ROLES:
+        raise HTTPException(status_code=400, detail=f"Role must be one of: {', '.join(sorted(VALID_ROLES))}")
     try:
         supabase.table("profiles").update({"role": role}).eq("id", current_user.id).execute()
         return {"success": True, "role": role}
