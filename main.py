@@ -1573,16 +1573,23 @@ async def edtech_speak_answer(
         if not audio_path.exists():
             # Truncate very long answers to keep TTS reasonable
             tts_text = text[:1500] if len(text) > 1500 else text
-            voice = "shimmer" if language == "ta" else "nova"
 
-            def _generate():
-                resp = client.audio.speech.create(
-                    model="tts-1",
-                    voice=voice,
-                    input=tts_text,
-                    response_format="mp3"
-                )
-                resp.stream_to_file(str(audio_path))
+            if language == "ta":
+                # ── Sarvam AI — natural Tamil voice for Q&A answers ──
+                from heygen_service import generate_sarvam_tts, TTS_AUDIO_DIR as _TTS_DIR
+                def _generate():
+                    generate_sarvam_tts(tts_text, audio_path, language="ta")
+            else:
+                # ── OpenAI TTS — English ──
+                voice = "nova"
+                def _generate():
+                    resp = client.audio.speech.create(
+                        model="tts-1",
+                        voice=voice,
+                        input=tts_text,
+                        response_format="mp3"
+                    )
+                    resp.stream_to_file(str(audio_path))
 
             await loop.run_in_executor(None, _generate)
 

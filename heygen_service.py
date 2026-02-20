@@ -28,6 +28,8 @@ load_dotenv()
 # ── Config ──────────────────────────────────────────────────────────
 HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY", "")
 HEYGEN_BASE_URL = "https://api.heygen.com"
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
+SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -444,12 +446,96 @@ def _split_into_sentences(text: str) -> list:
     return sentences
 
 
+def generate_sarvam_tts(text: str, audio_path: Path, language: str = "ta") -> None:
+    """
+    Generate Tamil TTS audio using Sarvam AI's saarika:v2 model.
+    Sarvam is built specifically for Indian languages — sounds like a real Tamil teacher.
+    Handles long texts by chunking (Sarvam limit: 500 chars per request).
+    """
+    if not SARVAM_API_KEY:
+        raise RuntimeError("SARVAM_API_KEY not set in environment")
+
+    # Sarvam supports up to ~500 chars per request — chunk if needed
+    CHUNK_SIZE = 450
+    words = text.split()
+    chunks, current = [], []
+    for word in words:
+        current.append(word)
+        if len(" ".join(current)) >= CHUNK_SIZE:
+            chunks.append(" ".join(current))
+            current = []
+    if current:
+        chunks.append(" ".join(current))
+
+    audio_segments = []
+    headers = {
+        "api-subscription-key": SARVAM_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    for chunk in chunks:
+        payload = {
+            "inputs": [chunk],
+            "target_language_code": "ta-IN",
+            "speaker": "anushka",        # Natural female Tamil teacher voice
+            "pitch": 0,
+            "pace": 1.0,               # Normal speed — students can follow easily
+            "loudness": 1.5,
+            "speech_sample_rate": 22050,
+            "enable_preprocessing": True,
+            "model": "bulbul:v1"
+        }
+        resp = requests.post(SARVAM_TTS_URL, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        # Sarvam returns base64-encoded WAV audio
+        import base64
+        audio_b64 = data.get("audios", [None])[0]
+        if audio_b64:
+            audio_segments.append(base64.b64decode(audio_b64))
+
+    if not audio_segments:
+        raise RuntimeError("Sarvam TTS returned no audio")
+
+    # Merge WAV chunks: keep first header, append data from rest
+    # WAV header is 44 bytes; we concatenate raw PCM data
+    import io, wave
+    merged_frames = b""
+    first_params = None
+    for seg in audio_segments:
+        with wave.open(io.BytesIO(seg), 'rb') as wf:
+            if first_params is None:
+                first_params = wf.getparams()
+            merged_frames += wf.readframes(wf.getnframes())
+
+    # Write merged WAV (save as .wav but rename to .mp3 for compatibility)
+    if not first_params:
+        raise RuntimeError("Sarvam TTS: no valid WAV params from audio chunks")
+    wav_path = audio_path.with_suffix(".wav")
+    with wave.open(str(wav_path), 'wb') as out:
+        out.setparams(first_params)
+        out.writeframes(merged_frames)
+
+    # Convert WAV → MP3 using pydub if available, else keep .wav as .mp3 (browsers handle it)
+    try:
+        from pydub import AudioSegment
+        AudioSegment.from_wav(str(wav_path)).export(str(audio_path), format="mp3", bitrate="128k")
+        wav_path.unlink(missing_ok=True)
+        logger.info(f"✅ Sarvam Tamil TTS saved (MP3): {audio_path}")
+    except Exception:
+        # pydub not available — rename wav to mp3 path (browsers accept WAV fine)
+        import shutil
+        shutil.move(str(wav_path), str(audio_path))
+        logger.info(f"✅ Sarvam Tamil TTS saved (WAV as MP3): {audio_path}")
+
+
 def generate_tts_audio(
     script: str,
     topic: str,
     user_id: str = "",
     doc_name: str = "",
-    voice: str = "nova"
+    voice: str = "nova",
+    language: str = "en"
 ) -> Dict:
     """
     Generate TTS audio from a teaching script using OpenAI's TTS API.
@@ -475,25 +561,28 @@ def generate_tts_audio(
             logger.info(f"🎯 TTS cache hit for '{topic}'")
             return cached
     
-    # ── Generate audio via OpenAI TTS ──
+    # ── Generate audio ──
     audio_filename = f"tts_{cache_key}.mp3"
     audio_path = TTS_AUDIO_DIR / audio_filename
-    
+
     try:
-        logger.info(f"🔊 Generating TTS audio for: '{topic}' (voice={voice})")
-        
-        response = client.audio.speech.create(
-            model="tts-1",
-            voice=voice,
-            input=script,
-            response_format="mp3"
-        )
-        
-        # Save the audio file
-        response.stream_to_file(str(audio_path))
-        
+        if language == "ta" and SARVAM_API_KEY:
+            # ── Sarvam AI — natural Tamil teacher voice ──
+            logger.info(f"🔊 Generating Tamil TTS via Sarvam AI for: '{topic}'")
+            generate_sarvam_tts(script, audio_path, language="ta")
+        else:
+            # ── OpenAI TTS — English and other languages ──
+            logger.info(f"🔊 Generating TTS audio for: '{topic}' (voice={voice})")
+            response = client.audio.speech.create(
+                model="tts-1",
+                voice=voice,
+                input=script,
+                response_format="mp3"
+            )
+            response.stream_to_file(str(audio_path))
+
         logger.info(f"✅ TTS audio saved: {audio_path} ({audio_path.stat().st_size} bytes)")
-        
+
     except Exception as e:
         logger.error(f"TTS generation failed: {e}")
         raise RuntimeError(f"Failed to generate TTS audio: {e}")
@@ -569,7 +658,8 @@ def generate_tts_video_for_topic(
             topic=topic,
             user_id=user_id,
             doc_name=doc_name,
-            voice=voice
+            voice=voice,
+            language=language
         )
         return {"status": "completed", **result}
     except Exception as e:
@@ -597,6 +687,9 @@ def generate_dialogue_audio(
     topic_slug = hashlib.md5(f"{user_id}:{doc_name}:{topic}".encode()).hexdigest()[:10]
     audio_files = [""] * len(dialogue_lines)  # Pre-size list to maintain order
 
+    # Detect language from dialogue_lines metadata (passed via voice_map extra key)
+    lang = voice_map.get("__language__", "en")
+
     def _generate_one(idx, line):
         speaker = line.get("speaker", "")
         text = line.get("text", "")
@@ -613,14 +706,20 @@ def generate_dialogue_audio(
             return idx, audio_filename
 
         try:
-            logger.info(f"🔊 Generating dialogue audio: line {idx} ({speaker}, voice={voice})")
-            response = client.audio.speech.create(
-                model="tts-1",
-                voice=voice,
-                input=text,
-                response_format="mp3"
-            )
-            response.stream_to_file(str(audio_path))
+            if lang == "ta" and SARVAM_API_KEY:
+                # ── Sarvam AI — natural Tamil voice ──
+                logger.info(f"🔊 Tamil dialogue TTS via Sarvam: line {idx} ({speaker})")
+                generate_sarvam_tts(text, audio_path, language="ta")
+            else:
+                # ── OpenAI TTS — English ──
+                logger.info(f"🔊 Generating dialogue audio: line {idx} ({speaker}, voice={voice})")
+                response = client.audio.speech.create(
+                    model="tts-1",
+                    voice=voice,
+                    input=text,
+                    response_format="mp3"
+                )
+                response.stream_to_file(str(audio_path))
             return idx, audio_filename
         except Exception as e:
             logger.error(f"Dialogue TTS line {idx} failed: {e}")
