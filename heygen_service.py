@@ -477,20 +477,26 @@ def generate_sarvam_tts(text: str, audio_path: Path, language: str = "ta") -> No
 
     audio_segments = []
 
+    # Pick a random Tamil female speaker for this call (varies per lesson/Q&A)
+    import random as _rnd
+    _TAMIL_SPEAKERS = ["anushka", "manisha", "vidya", "arya"]
+    chosen_speaker = _rnd.choice(_TAMIL_SPEAKERS)
+    logger.info(f"🎙️ Sarvam TTS speaker: {chosen_speaker}")
+
     for chunk in chunks:
         # ── Correct payload for bulbul:v2 ──
-        # bulbul:v2 uses "text" (string) + supports "anushka" speaker + "target_language_code"
+        # bulbul:v2 uses "text" (string) + target_language_code
         # bulbul:v1 would need "inputs": [text] — different format entirely
         payload = {
             "text": chunk,
             "target_language_code": "ta-IN",
-            "speaker": "anushka",              # anushka is a bulbul:v2 Tamil female speaker
+            "speaker": chosen_speaker,         # Random Tamil female voice, chosen once per call
             "pitch": 0,
             "pace": 1.0,
             "loudness": 1.5,
             "speech_sample_rate": 22050,
             "enable_preprocessing": True,
-            "model": "bulbul:v2"               # ← MUST be v2 to use text field + anushka
+            "model": "bulbul:v2"               # ← MUST be v2 for text field + these speakers
         }
 
         try:
@@ -507,6 +513,7 @@ def generate_sarvam_tts(text: str, audio_path: Path, language: str = "ta") -> No
         except Exception as e:
             logger.error(f"Sarvam TTS chunk failed: {e}")
             raise
+
 
     if not audio_segments:
         raise RuntimeError("Sarvam TTS returned no audio")
