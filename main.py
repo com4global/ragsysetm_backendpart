@@ -1182,15 +1182,39 @@ async def edtech_extract_topics(
         all_chunks = []
         loop = asyncio.get_event_loop()
 
-        # Build Pinecone filter — optionally filter by chapter
-        if chapter:
+        # Build Pinecone filter — optionally filter by chapter.
+        # IMPORTANT: "Untitled Section" is only a display label assigned in the
+        # chapter-listing endpoint for chunks that have chapter="" (empty) in Pinecone.
+        # When the frontend sends chapter="Untitled Section" we must query
+        # for chunks with chapter="" (or missing chapter), NOT the literal string.
+        UNTITLED_DISPLAY = "Untitled Section"
+        raw_chapter = chapter  # actual value stored in Pinecone
+
+        if chapter == UNTITLED_DISPLAY:
+            # Web pages / undivided docs → stored with empty or absent chapter field
+            raw_chapter = ""
+
+        if raw_chapter:
+            # Named chapter: exact match
             pinecone_filter = {
                 "$and": [
                     {"doc_name": {"$eq": doc_name}},
-                    {"chapter": {"$eq": chapter}}
+                    {"chapter": {"$eq": raw_chapter}}
+                ]
+            }
+        elif chapter:
+            # "Untitled Section" case: match chunks with chapter="" or chapter absent
+            pinecone_filter = {
+                "$and": [
+                    {"doc_name": {"$eq": doc_name}},
+                    {"$or": [
+                        {"chapter": {"$eq": ""}},
+                        {"chapter": {"$exists": False}}
+                    ]}
                 ]
             }
         else:
+            # No chapter filter — full document
             pinecone_filter = {"doc_name": {"$eq": doc_name}}
 
         for ns in namespaces:
