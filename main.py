@@ -365,6 +365,17 @@ async def _background_process_and_pregenerate(user_id: str, filename: str, acces
                 try:
                     topics = await loop.run_in_executor(None, lambda: extract_topics(combined, "en", [filename]))
                     all_topics.extend(topics)
+                    # ── FIX 1: Persist chapter topics to lesson_cache so the topics endpoint
+                    #           never needs to re-call the LLM (instant retrieval) ──
+                    if topics:
+                        topics_cache_key = _lesson_cache_key(user_id, filename, chapter or "__all__", "en", "topics")
+                        _save_lesson_cache(
+                            user_id=user_id, cache_key=topics_cache_key,
+                            topic=chapter or "__all__", doc_name=filename,
+                            language="en", lesson_type="topics",
+                            lesson_json={"topics": topics, "chapter": chapter},
+                            audio_storage_paths=[]
+                        )
                 except Exception as e:
                     logger.warning(f"[BG] Topic extraction failed for chapter '{chapter}': {e}")
 
@@ -926,6 +937,61 @@ async def batch_status_endpoint(
         logger.error(f"Batch status error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/prewarm-status")
+async def prewarm_status(
+    doc_name: str = "",
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Convenience endpoint for checking if a document's lessons are pre-warmed.
+    Returns status + lesson count so the frontend can show a readiness banner.
+    """
+    try:
+        # Get latest batch job for this doc
+        query = supabase.table("batch_jobs").select("*")
+        if doc_name:
+            query = query.eq("doc_name", doc_name)
+        # Look across all users for teacher-uploaded docs too
+        result = query.order("created_at", desc=True).limit(1).execute()
+
+        if not result.data:
+            return {"success": True, "status": "not_found", "progress": 0, "lessons_ready": 0}
+
+        job = result.data[0]
+        status = job.get("status", "unknown")
+
+        # Count pre-generated lessons in cache
+        lessons_ready = 0
+        try:
+            lc = supabase.table("lesson_cache").select("cache_key", count="exact") \
+                .eq("doc_name", doc_name).in_("lesson_type", ["conversation", "tts_video"]).execute()
+            lessons_ready = lc.count if hasattr(lc, "count") and lc.count else len(lc.data or [])
+        except Exception:
+            pass
+
+        status_labels = {
+            "queued": "⏳ Waiting to start...",
+            "processing": "📄 Chunking & embedding document...",
+            "extracting_topics": "🔍 Extracting topics...",
+            "generating_lessons": "📝 Pre-generating AI lessons...",
+            "generating_videos": "🎬 Pre-generating teaching videos...",
+            "completed": "✅ All lessons ready!",
+            "failed": "❌ Processing failed."
+        }
+
+        return {
+            "success": True,
+            "status": status,
+            "label": status_labels.get(status, status),
+            "progress": job.get("progress", 0),
+            "lessons_ready": lessons_ready,
+            "is_ready": status == "completed"
+        }
+    except Exception as e:
+        logger.error(f"Prewarm status error: {e}")
+        return {"success": True, "status": "unknown", "progress": 0, "lessons_ready": 0}
+
 @app.post("/chat", response_model=QueryResponse)
 async def chat_endpoint(request: QueryRequest, current_user: User = Depends(get_current_user)):
     """Process user query with authenticated session and data isolation"""
@@ -1190,8 +1256,28 @@ async def edtech_extract_topics(
     topic_cache_key = f"{current_user.id}:{doc_name}:{chapter}:{language}"
     cached = _topics_cache.get(topic_cache_key)
     if cached and (_time.time() - cached["ts"]) < _EDTECH_CACHE_TTL:
-        logger.info(f"🎯 Topics cache HIT: {doc_name} / {chapter or 'whole doc'}")
+        logger.info(f"🎯 Topics cache HIT (mem): {doc_name} / {chapter or 'whole doc'}")
         return cached["data"]
+
+    # FIX 3: Check lesson_cache table (populated by background pre-warm at upload time)
+    # This makes topics instant on pre-warmed documents — no Pinecone or LLM call needed.
+    try:
+        lc_key = _lesson_cache_key(current_user.id, doc_name, chapter or "__all__", language, "topics")
+        lc_row = _get_cached_lesson(lc_key)
+        if not lc_row:
+            # Also check any user's pre-warm (teacher uploaded, student accesses)
+            cross = supabase.table("lesson_cache").select("*") \
+                .eq("doc_name", doc_name).eq("lesson_type", "topics") \
+                .eq("topic", chapter or "__all__").limit(1).execute()
+            if cross.data:
+                lc_row = cross.data[0]
+        if lc_row and lc_row.get("lesson_json", {}).get("topics"):
+            result = {"success": True, "topics": lc_row["lesson_json"]["topics"], "cached": True}
+            _topics_cache[topic_cache_key] = {"data": result, "ts": _time.time()}
+            logger.info(f"🎯 Topics cache HIT (db): {doc_name} / {chapter or 'whole doc'}")
+            return result
+    except Exception as _e:
+        logger.warning(f"Topics lesson_cache lookup failed (non-fatal): {_e}")
     try:
         from edtech_service import extract_topics
         from vectorstore import index, get_user_namespaces
@@ -1443,6 +1529,19 @@ async def edtech_generate_lesson(
         # ── 1. Check cache first ──
         cache_key = _lesson_cache_key(current_user.id, "", topic, language, "conversation")
         cached = _get_cached_lesson(cache_key)
+        # FIX 2: Cross-user fallback — if teacher pre-warmed under their user_id,
+        # student requests with doc_name can reuse that pre-generated lesson.
+        if not cached and doc_name:
+            try:
+                cross = supabase.table("lesson_cache").select("*") \
+                    .eq("topic", topic).eq("lesson_type", "conversation").limit(1).execute()
+                if cross.data:
+                    cached = cross.data[0]
+                    # Populate local memory cache for next time
+                    import time as _t
+                    _lesson_mem_cache[cache_key] = {"data": cached, "ts": _t.time()}
+            except Exception:
+                pass
         if cached:
             logger.info(f"🎯 Lesson cache HIT: {topic}")
             return {"success": True, "lesson": cached["lesson_json"], "cached": True}
@@ -1878,6 +1977,18 @@ async def edtech_generate_tts_video(
         # ── 1. Check cache first ──
         cache_key = _lesson_cache_key(current_user.id, doc_name, topic, language, "tts_video")
         cached = _get_cached_lesson(cache_key)
+        # FIX 2: Cross-user fallback — student hits teacher pre-generated TTS video
+        if not cached and doc_name:
+            try:
+                cross = supabase.table("lesson_cache").select("*") \
+                    .eq("doc_name", doc_name).eq("topic", topic) \
+                    .eq("lesson_type", "tts_video").limit(1).execute()
+                if cross.data:
+                    cached = cross.data[0]
+                    import time as _t
+                    _lesson_mem_cache[cache_key] = {"data": cached, "ts": _t.time()}
+            except Exception:
+                pass
         if cached:
             logger.info(f"🎯 TTS video cache HIT: {topic}")
             return {"success": True, **cached["lesson_json"], "cached": True}
