@@ -2256,6 +2256,7 @@ async def create_classroom(
     name: str = Form(...),
     description: str = Form(""),
     doc_name: str = Form(""),
+    chapter_name: str = Form(""),
     current_user: User = Depends(get_current_user)
 ):
     """Create a new classroom (teacher only)."""
@@ -2275,13 +2276,24 @@ async def create_classroom(
                 break
             join_code = _generate_join_code()
 
-        result = supabase.table("classrooms").insert({
+        row = {
             "teacher_id": current_user.id,
             "name": name,
             "description": description,
             "doc_name": doc_name,
             "join_code": join_code
-        }).execute()
+        }
+        # Store chapter_name if provided (column may not exist in older DBs — try/except)
+        if chapter_name:
+            try:
+                row["chapter_name"] = chapter_name
+                result = supabase.table("classrooms").insert(row).execute()
+            except Exception:
+                # Fallback: insert without chapter_name if column missing
+                row.pop("chapter_name", None)
+                result = supabase.table("classrooms").insert(row).execute()
+        else:
+            result = supabase.table("classrooms").insert(row).execute()
 
         return {"success": True, "classroom": result.data[0] if result.data else None}
     except Exception as e:
