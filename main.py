@@ -2257,6 +2257,7 @@ async def create_classroom(
     description: str = Form(""),
     doc_name: str = Form(""),
     chapter_name: str = Form(""),
+    topics: str = Form(""),   # JSON-encoded list sent by the frontend
     current_user: User = Depends(get_current_user)
 ):
     """Create a new classroom (teacher only)."""
@@ -2276,6 +2277,7 @@ async def create_classroom(
                 break
             join_code = _generate_join_code()
 
+        import json as _json
         row = {
             "teacher_id": current_user.id,
             "name": name,
@@ -2283,22 +2285,27 @@ async def create_classroom(
             "doc_name": doc_name,
             "join_code": join_code
         }
-        # Store chapter_name if provided (column may not exist in older DBs — try/except)
         if chapter_name:
+            row["chapter_name"] = chapter_name
+        if topics:
             try:
-                row["chapter_name"] = chapter_name
-                result = supabase.table("classrooms").insert(row).execute()
+                row["topics"] = _json.dumps(_json.loads(topics))
             except Exception:
-                # Fallback: insert without chapter_name if column missing
-                row.pop("chapter_name", None)
-                result = supabase.table("classrooms").insert(row).execute()
-        else:
+                pass
+
+        # Try inserting with all extra columns; fall back stripping them if DB doesn't have them
+        try:
+            result = supabase.table("classrooms").insert(row).execute()
+        except Exception:
+            row.pop("chapter_name", None)
+            row.pop("topics", None)
             result = supabase.table("classrooms").insert(row).execute()
 
         return {"success": True, "classroom": result.data[0] if result.data else None}
     except Exception as e:
         logger.error(f"Classroom creation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.delete("/api/classrooms/{classroom_id}")
