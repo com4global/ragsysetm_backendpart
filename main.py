@@ -393,8 +393,21 @@ async def _background_process_and_pregenerate(user_id: str, filename: str, acces
         from embedder import embed_User_query
         from vectorstore import search_user_documents
 
+        # all_topics is a list of dicts: [{"title": ..., "description": ..., ...}]
+        # Extract plain string titles for embed / generate calls
+        all_topic_titles = []
+        for t in all_topics:
+            if isinstance(t, dict):
+                title = t.get("title") or t.get("name") or ""
+            else:
+                title = str(t)
+            if title.strip():
+                all_topic_titles.append(title.strip())
+
+        logger.info(f"📋 [BG] {len(all_topic_titles)} unique topic titles to pre-generate: {all_topic_titles[:5]}...")
+
         generated = 0
-        for topic_name in all_topics[:20]:  # Cap at 20 topics to avoid overloading
+        for topic_name in all_topic_titles[:20]:  # Cap at 20 topics to avoid overloading
             try:
                 cache_key = _lesson_cache_key(user_id, "", topic_name, "en", "conversation")
                 if _get_cached_lesson(cache_key):
@@ -457,9 +470,9 @@ async def _background_process_and_pregenerate(user_id: str, filename: str, acces
                     lesson_json=lesson, audio_storage_paths=audio_storage_paths
                 )
                 generated += 1
-                pct = 50 + int((generated / min(len(all_topics), 20)) * 25)
+                pct = 50 + int((generated / min(len(all_topic_titles), 20)) * 25)
                 _update_batch_status(job_id, "generating_lessons", progress=pct, completed_steps=2)
-                logger.info(f"📝 [BG] Lesson {generated}/{len(all_topics)}: {topic_name}")
+                logger.info(f"📝 [BG] Lesson {generated}/{len(all_topic_titles)}: {topic_name}")
 
                 # Tiny sleep to avoid rate-limiting OpenAI
                 await asyncio.sleep(0.5)
@@ -470,10 +483,10 @@ async def _background_process_and_pregenerate(user_id: str, filename: str, acces
         _update_batch_status(job_id, "generating_videos", progress=80, completed_steps=3)
         logger.info(f"✅ [BG] Step 3 done: {generated} lessons pre-generated")
 
-        # ── Step 4: Pre-generate TTS videos for first N topics ──
+        # ── Step 4: Pre-generate TTS videos for ALL topics (up to 20) ──
         from heygen_service import generate_tts_video_for_topic
         video_count = 0
-        for topic_name in all_topics[:10]:  # Cap at 10 videos
+        for topic_name in all_topic_titles[:20]:  # Match lesson cap
             try:
                 cache_key = _lesson_cache_key(user_id, filename, topic_name, "en", "tts_video")
                 if _get_cached_lesson(cache_key):
@@ -515,9 +528,9 @@ async def _background_process_and_pregenerate(user_id: str, filename: str, acces
                         lesson_json=response_data, audio_storage_paths=[storage_path]
                     )
                     video_count += 1
-                    pct = 80 + int((video_count / min(len(all_topics), 10)) * 20)
+                    pct = 80 + int((video_count / min(len(all_topic_titles), 20)) * 20)
                     _update_batch_status(job_id, "generating_videos", progress=pct, completed_steps=3)
-                    logger.info(f"🎬 [BG] Video {video_count}: {topic_name}")
+                    logger.info(f"🎬 [BG] Video {video_count}/{len(all_topic_titles)}: {topic_name}")
 
                 await asyncio.sleep(0.5)
 
