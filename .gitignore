@@ -1,6 +1,7 @@
-# Environment files
+# ─── Environment files ───────────────────────────────────────────
 .env
 frontend/.env
+frontend/.env.local
 .myenvironment/
 .menv/
 *.venv/
@@ -8,56 +9,94 @@ venv/
 ENV/
 env/
 
-# Python cache and bytecode
+# ─── Python cache / bytecode ─────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.python-version
 
-# Virtual environment
+# ─── Virtual environment ─────────────────────────────────────────
 .myenv/
 .menv/
 venv/
-*.venv/
 
-# Generated / cached audio files (re-created at runtime)
+# ─── Generated / cached audio & video files ──────────────────────
 static/tts_audio/
 *.mp3
-
-# Uploaded & processed user files (runtime data, not source code)
-uploads/
-processed/
-resources/*/
-!resources/
-resources/.file_metadata.json
-
-# User database (local dev only)
-users.db
-*.db
-
-# Resources, data, or temp files
-*.log
-*.tmp
-
-# OS specific
-.DS_Store
-Thumbs.db
-
-# IDE/editor configs
-.vscode/
-.idea/
-.vs/
-*.swp
-
-# Node modules
-node_modules/
-frontend/node_modules/
-
-# Ignore all video formats
 *.mp4
 *.mov
 *.wmv
 *.avi
 *.mkv
 *.flv
+
+# ─── Uploaded & processed user files (runtime data) ─────────────
+uploads/
+processed/
+resources/*/
+!resources/
+resources/.file_metadata.json
+
+# ─── Local databases ─────────────────────────────────────────────
+users.db
+*.db
+*.sqlite
+
+# ─── Debug / temp scripts & output files ─────────────────────────
+debug_*.py
+debug_*.txt
+check_*.py
+check_*.txt
+fix_*.py
+fix_rls_policies.py
+fix_cors.py
+diagnose_*.py
+reproduce_*.py
+verify_*.py
+inspect_*.py
+test_upload*.py
+test_upload*.txt
+test_rls_auth.py
+test_meta.py
+test_chat*.py
+test_fix_mocked.py
+sync_existing_files.py
+setup_storage.py
+create_bucket.py
+request_monitor.py
+gen_landing_p1.py
+gen_landing_p2.py
+fix_landing.py
+check_rls.py
+check_storage.py
+check_db.py
+pinecone_docs_output*.txt
+progress_debug*.txt
+classroom_check*.txt
+debug_output.txt
+debug_results.txt
+test_legal.txt
+debug_rag_pipeline.ipynb
+
+# ─── SQL fix files (one-time migration scripts, not needed in repo) ─
+fix_profiles_rls.sql
+fix_supa_storage.sql
+
+# ─── Logs & temp ─────────────────────────────────────────────────
+*.log
+*.tmp
+
+# ─── OS specific ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── IDE/editor configs ──────────────────────────────────────────
+.vscode/
+.idea/
+.vs/
+*.swp
+
+# ─── Node modules ────────────────────────────────────────────────
+node_modules/
+frontend/node_modules/

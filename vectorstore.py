@@ -234,6 +234,67 @@ def search_user_documents(
 
 
 # --------------------------------------------------
+# DOC-NAME SEARCH (for classroom / assigned documents)
+# --------------------------------------------------
+
+def search_by_doc_name(
+    query_vector: List[float],
+    doc_name: str,
+    top_k: int = 10
+) -> List[Dict]:
+    """
+    Search across ALL namespaces but filter by doc_name metadata.
+    Used when a student wants to study a teacher-assigned document that
+    lives in a different user's namespace.
+
+    Args:
+        query_vector: Embedded query vector
+        doc_name: Exact document name to filter on (e.g. "chapter1.pdf")
+        top_k: Number of results
+
+    Returns:
+        List of matching chunks with text, score, page, doc_name, path
+    """
+    results = []
+
+    try:
+        stats = index.describe_index_stats()
+        namespaces_to_search = list(stats.namespaces.keys())
+        print(f"🔍 Searching ALL namespaces for doc_name='{doc_name}'")
+    except Exception:
+        print("⚠️ Could not list namespaces, falling back to empty namespace")
+        namespaces_to_search = [""]
+
+    for ns in namespaces_to_search:
+        try:
+            res = index.query(
+                vector=query_vector,
+                top_k=top_k,
+                include_metadata=True,
+                filter={"doc_name": {"$eq": doc_name}},
+                namespace=ns
+            )
+            for match in res.matches:
+                metadata = match.metadata
+                results.append({
+                    "text": metadata.get("text", ""),
+                    "score": match.score,
+                    "page": metadata.get("page", "N/A"),
+                    "doc_name": metadata.get("doc_name", doc_name),
+                    "path": metadata.get("path", "Unknown"),
+                    "namespace": ns
+                })
+        except Exception as e:
+            print(f"⚠️ Could not search namespace '{ns}' for doc_name: {e}")
+            continue
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    final_results = results[:top_k]
+    print(f"✅ search_by_doc_name returned {len(final_results)} results for '{doc_name}'")
+    return final_results
+
+
+# --------------------------------------------------
 # NAMESPACE MANAGEMENT
 # --------------------------------------------------
 

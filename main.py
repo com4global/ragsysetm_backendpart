@@ -1414,9 +1414,27 @@ async def edtech_generate_lesson(
         logger.info(f"🔄 Lesson cache MISS: {topic}")
         loop = asyncio.get_event_loop()
 
-        # Search for relevant chunks about this topic
+        # Search for relevant chunks:
+        # - If doc_name is provided (classroom assignment), search across ALL namespaces
+        #   filtered by that document name (teacher's namespace).
+        # - Otherwise fall back to the student's own uploaded documents.
         query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic))
-        results = await loop.run_in_executor(None, lambda: search_user_documents(query_vec, current_user.id, top_k=10))
+
+        if doc_name:
+            from vectorstore import search_by_doc_name
+            results = await loop.run_in_executor(
+                None, lambda: search_by_doc_name(query_vec, doc_name, top_k=10)
+            )
+            # Fallback: try student's own docs if doc-specific search found nothing
+            if not results:
+                logger.warning(f"search_by_doc_name found no results for '{doc_name}', falling back to user docs")
+                results = await loop.run_in_executor(
+                    None, lambda: search_user_documents(query_vec, current_user.id, top_k=10)
+                )
+        else:
+            results = await loop.run_in_executor(
+                None, lambda: search_user_documents(query_vec, current_user.id, top_k=10)
+            )
 
         if not results:
             return {"success": False, "detail": "No relevant content found for this topic. Please process more documents."}
@@ -1676,9 +1694,20 @@ async def edtech_generate_video(
                 "message": "Video already generated!"
             }
 
-        # 2. Search for relevant chunks about this topic (same as lesson generation)
+        # 2. Search for relevant chunks:
+        # - If doc_name is provided (classroom assignment), search across ALL namespaces
+        #   filtered by that document name (teacher may own it).
+        # - Otherwise fall back to the student's own uploaded documents.
         query_vec = embed_User_query(topic)
-        results = search_user_documents(query_vec, current_user.id, top_k=10)
+
+        if doc_name:
+            from vectorstore import search_by_doc_name
+            results = search_by_doc_name(query_vec, doc_name, top_k=10)
+            if not results:
+                logger.warning(f"search_by_doc_name found no results for '{doc_name}', falling back to user docs")
+                results = search_user_documents(query_vec, current_user.id, top_k=10)
+        else:
+            results = search_user_documents(query_vec, current_user.id, top_k=10)
 
         if not results:
             return {
@@ -1820,9 +1849,26 @@ async def edtech_generate_tts_video(
         logger.info(f"🔄 TTS video cache MISS: {topic}")
         loop = asyncio.get_event_loop()
 
-        # Search for relevant chunks
+        # Search for relevant chunks:
+        # - If doc_name is provided (classroom assignment), search across ALL namespaces
+        #   filtered by that document name (teacher may own it).
+        # - Otherwise fall back to the student's own uploaded documents.
         query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic))
-        results = await loop.run_in_executor(None, lambda: search_user_documents(query_vec, current_user.id, top_k=10))
+
+        if doc_name:
+            from vectorstore import search_by_doc_name
+            results = await loop.run_in_executor(
+                None, lambda: search_by_doc_name(query_vec, doc_name, top_k=10)
+            )
+            if not results:
+                logger.warning(f"search_by_doc_name found no results for '{doc_name}', falling back to user docs")
+                results = await loop.run_in_executor(
+                    None, lambda: search_user_documents(query_vec, current_user.id, top_k=10)
+                )
+        else:
+            results = await loop.run_in_executor(
+                None, lambda: search_user_documents(query_vec, current_user.id, top_k=10)
+            )
 
         if not results:
             return {
@@ -1830,6 +1876,7 @@ async def edtech_generate_tts_video(
                 "status": "failed",
                 "error": "No relevant content found for this topic."
             }
+
 
         chunks_with_refs = []
         for r in results:
@@ -2175,8 +2222,13 @@ async def create_classroom(
     current_user: User = Depends(get_current_user)
 ):
     """Create a new classroom (teacher only)."""
-    if current_user.role != "teacher":
-        raise HTTPException(status_code=403, detail="Only teachers can create classrooms")
+    allowed_roles = {"teacher", "admin"}
+    if current_user.role not in allowed_roles:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Only teachers can create classrooms. Your current role is '{current_user.role}'. "
+                   f"Please update your role from the profile settings."
+        )
     try:
         join_code = _generate_join_code()
         # Ensure unique join code
@@ -2200,21 +2252,51 @@ async def create_classroom(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/api/classrooms/{classroom_id}")
+async def delete_classroom(classroom_id: str, current_user: User = Depends(get_current_user)):
+    """Delete a classroom (owner teacher only)."""
+    try:
+        # Verify ownership
+        existing = supabase.table("classrooms").select("teacher_id").eq("id", classroom_id).single().execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Classroom not found")
+        if existing.data["teacher_id"] != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the classroom owner can delete it")
+        # Delete child rows first (ignore if table doesn't exist)
+        try:
+            supabase.table("classroom_students").delete().eq("classroom_id", classroom_id).execute()
+        except Exception:
+            pass
+        supabase.table("classrooms").delete().eq("id", classroom_id).execute()
+        return {"success": True, "message": "Classroom deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete classroom failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/classrooms")
 async def list_classrooms(current_user: User = Depends(get_current_user)):
     """List classrooms — teacher sees owned, student sees joined."""
     try:
-        if current_user.role == "teacher":
+        if current_user.role in ("teacher", "admin"):
             result = supabase.table("classrooms").select("*").eq("teacher_id", current_user.id).order("created_at", desc=True).execute()
             classrooms = result.data or []
-            # Attach student count
+            # Attach student count — gracefully skip if table doesn't exist yet
             for cls in classrooms:
-                count = supabase.table("classroom_students").select("id", count="exact").eq("classroom_id", cls["id"]).execute()
-                cls["student_count"] = count.count if count.count is not None else 0
+                try:
+                    count = supabase.table("classroom_students").select("id", count="exact").eq("classroom_id", cls["id"]).execute()
+                    cls["student_count"] = count.count if count.count is not None else 0
+                except Exception:
+                    cls["student_count"] = 0
         else:
             # Student: get classrooms they've joined
-            memberships = supabase.table("classroom_students").select("classroom_id").eq("student_id", current_user.id).execute()
-            classroom_ids = [m["classroom_id"] for m in (memberships.data or [])]
+            try:
+                memberships = supabase.table("classroom_students").select("classroom_id").eq("student_id", current_user.id).execute()
+                classroom_ids = [m["classroom_id"] for m in (memberships.data or [])]
+            except Exception:
+                classroom_ids = []
             if classroom_ids:
                 result = supabase.table("classrooms").select("*").in_("id", classroom_ids).execute()
                 classrooms = result.data or []
@@ -2222,8 +2304,11 @@ async def list_classrooms(current_user: User = Depends(get_current_user)):
                 classrooms = []
             # Attach teacher name
             for cls in classrooms:
-                teacher = supabase.table("profiles").select("full_name").eq("id", cls["teacher_id"]).limit(1).execute()
-                cls["teacher_name"] = teacher.data[0]["full_name"] if teacher.data else "Teacher"
+                try:
+                    teacher = supabase.table("profiles").select("full_name").eq("id", cls["teacher_id"]).limit(1).execute()
+                    cls["teacher_name"] = teacher.data[0]["full_name"] if teacher.data else "Teacher"
+                except Exception:
+                    cls["teacher_name"] = "Teacher"
 
         return {"success": True, "classrooms": classrooms}
     except Exception as e:
@@ -2299,15 +2384,160 @@ async def get_classroom_detail(classroom_id: str, current_user: User = Depends(g
 
 # ── Assignments ──
 
+@app.get("/api/documents")
+async def list_processed_documents(current_user: User = Depends(get_current_user)):
+    """Return all processed documents for the current user (for assignment book-picker)."""
+    try:
+        # Try Supabase user_files table first
+        result = supabase.table("user_files").select("id, filename, file_type, chunks_created, processed, uploaded_at") \
+            .eq("user_id", current_user.id).eq("processed", True).order("uploaded_at", desc=True).execute()
+        if result.data:
+            return {"success": True, "documents": result.data}
+
+        # Fallback: read from local .file_metadata.json
+        import json as _json, os as _os
+        meta_path = _os.path.join(_os.path.dirname(__file__), "resources", ".file_metadata.json")
+        if _os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = _json.load(f)
+            docs = [d for d in (meta.get("files") or []) if d.get("processed")]
+            return {"success": True, "documents": docs}
+
+        return {"success": True, "documents": []}
+    except Exception as e:
+        logger.error(f"List documents failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/documents/{filename}/structure")
+async def get_document_structure(filename: str, current_user: User = Depends(get_current_user)):
+    """
+    Extract chapters and topics from a processed document by scanning its Pinecone chunks.
+    Uses heuristic heading detection — lines that look like chapters/section titles.
+    """
+    try:
+        import hashlib as _hashlib, re as _re
+        from vectorstore import index
+
+        user_hash = _hashlib.md5(current_user.id.encode()).hexdigest()[:8]
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "pdf"
+        namespace = f"{ext}-user-{user_hash}"
+
+        # We don't have a text-level heading API from Pinecone, so we'll
+        # do a broad zero-vector query to collect all chunks for this file.
+        try:
+            stats = index.describe_index_stats()
+            dim = stats.dimension
+        except Exception:
+            dim = 1536
+        dummy = [0.0] * dim
+
+        try:
+            res = index.query(
+                vector=dummy,
+                top_k=1000,
+                include_metadata=True,
+                filter={"doc_name": {"$eq": filename}},
+                namespace=namespace,
+            )
+            chunks = [m.metadata.get("text", "") for m in (res.matches or []) if m.metadata.get("text")]
+        except Exception:
+            chunks = []
+
+        # If no chunks found, try all user namespaces
+        if not chunks:
+            file_types = ["pdf", "xlsx", "xls", "csv", "txt", "docx", "doc", "xml"]
+            for ft in file_types:
+                ns = f"{ft}-user-{user_hash}"
+                try:
+                    res = index.query(
+                        vector=dummy,
+                        top_k=1000,
+                        include_metadata=True,
+                        filter={"doc_name": {"$eq": filename}},
+                        namespace=ns,
+                    )
+                    chunks = [m.metadata.get("text", "") for m in (res.matches or []) if m.metadata.get("text")]
+                    if chunks:
+                        break
+                except Exception:
+                    continue
+
+        # ── Heuristic heading extraction ──────────────────────────────────
+        chapter_pattern = _re.compile(
+            r'^(chapter\s+[\divxlc]+[:\.\s]|unit\s+[\divxlc]+[:\.\s]|section\s+[\d\.]+|lesson\s+\d+|module\s+\d+|part\s+[\divxlc]+)',
+            _re.IGNORECASE
+        )
+        topic_patterns = [
+            _re.compile(r'^\d+[\.\)]\s+[A-Z].{5,80}$'),   # numbered items
+            _re.compile(r'^[A-Z][A-Z\s]{4,50}$'),           # ALL CAPS headings
+            _re.compile(r'^[A-Z][a-zA-Z\s\-]{5,60}:?\s*$'), # Title Case lines
+        ]
+
+        chapters_found = {}
+        current_chapter = None
+
+        for chunk in chunks:
+            for line in chunk.split("\n"):
+                line = line.strip()
+                if not line or len(line) < 4:
+                    continue
+
+                # Is it a chapter/unit heading?
+                if chapter_pattern.match(line):
+                    title = line[:120]
+                    if title not in chapters_found:
+                        chapters_found[title] = []
+                    current_chapter = title
+                    continue
+
+                # Is it a topic/subtopic heading?
+                if current_chapter:
+                    for pat in topic_patterns:
+                        if pat.match(line) and len(chapters_found[current_chapter]) < 20:
+                            topic = line.rstrip(":").strip()[:80]
+                            if topic not in chapters_found[current_chapter]:
+                                chapters_found[current_chapter].append(topic)
+                            break
+
+        # If no chapters detected, create a generic structure from distinct text segments
+        if not chapters_found:
+            # Offer page-level grouping as fallback
+            chapters_found["Full Document"] = []
+            all_lines = []
+            for chunk in chunks[:30]:
+                for line in chunk.split("\n"):
+                    line = line.strip()
+                    if 10 < len(line) < 80 and line[0].isupper():
+                        all_lines.append(line.rstrip(":"))
+            # Deduplicate
+            seen = set()
+            for l in all_lines:
+                if l not in seen:
+                    seen.add(l)
+                    chapters_found["Full Document"].append(l)
+                    if len(chapters_found["Full Document"]) >= 15:
+                        break
+
+        chapters = [{"title": k, "topics": v} for k, v in chapters_found.items()]
+        return {"success": True, "filename": filename, "chapters": chapters}
+
+    except Exception as e:
+        logger.error(f"Document structure extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/classrooms/{classroom_id}/assignments")
 async def create_assignment(
     classroom_id: str,
     chapter_title: str = Form(...),
-    topics: str = Form("[]"),  # JSON array string
+    topics: str = Form("[]"),       # JSON array string
     due_date: str = Form(""),
+    doc_name: str = Form(""),       # which book this assignment is from
+    student_id: str = Form(""),     # empty = whole class, UUID = individual student
     current_user: User = Depends(get_current_user)
 ):
-    """Teacher creates an assignment (chapter + topics + optional due date)."""
+    """Teacher creates an assignment (chapter + topics + optional due date + optional per-student)."""
     if current_user.role != "teacher":
         raise HTTPException(status_code=403, detail="Only teachers can create assignments")
     try:
@@ -2320,6 +2550,10 @@ async def create_assignment(
         }
         if due_date:
             assignment_data["due_date"] = due_date
+        if doc_name:
+            assignment_data["doc_name"] = doc_name
+        if student_id:
+            assignment_data["student_id"] = student_id
 
         result = supabase.table("assignments").insert(assignment_data).execute()
         return {"success": True, "assignment": result.data[0] if result.data else None}
@@ -2354,15 +2588,17 @@ async def update_student_progress(
             update_data["video_completed"] = True
         elif activity_type == "quiz":
             update_data["quiz_score"] = quiz_score
-            update_data["quiz_answers"] = _json.loads(quiz_answers) if quiz_answers else {}
+            parsed_answers = _json.loads(quiz_answers) if quiz_answers else {}
+            update_data["quiz_answers"] = parsed_answers
 
         if existing.data:
             # Update existing
             progress = existing.data[0]
             supabase.table("student_progress").update(update_data).eq("id", progress["id"]).execute()
-            # Check if fully completed
+            # Check if fully completed — quiz done = score was explicitly set (not None)
             merged = {**progress, **update_data}
-            if merged.get("conversation_completed") and merged.get("video_completed") and merged.get("quiz_score", 0) > 0:
+            quiz_done = merged.get("quiz_score") is not None
+            if merged.get("conversation_completed") and merged.get("video_completed") and quiz_done:
                 supabase.table("student_progress").update({"completed_at": datetime.utcnow().isoformat()}).eq("id", progress["id"]).execute()
         else:
             # Insert new
