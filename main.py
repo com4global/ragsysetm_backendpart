@@ -1084,7 +1084,9 @@ async def edtech_get_chapters(
         all_chunks = []
         loop = asyncio.get_event_loop()
 
-        for ns in namespaces:
+        async def _query_ns(ns):
+            """Query a single namespace and return matching chunks."""
+            chunks = []
             try:
                 dummy_vec = [0.0] * 1536
                 res = await loop.run_in_executor(None, lambda _ns=ns: index.query(
@@ -1100,14 +1102,31 @@ async def edtech_get_chapters(
                     page = meta.get("page", "")
                     chapter = meta.get("chapter", "")
                     if text:
-                        all_chunks.append({
+                        chunks.append({
                             "text": text,
                             "page": page,
                             "chapter": chapter
                         })
             except Exception as e:
                 logger.warning(f"Namespace {ns} query failed: {e}")
-                continue
+            return chunks
+
+        # 1. Try student's own namespaces first
+        for ns in namespaces:
+            all_chunks.extend(await _query_ns(ns))
+
+        # 2. If nothing found (assigned doc likely uploaded by teacher), search ALL namespaces
+        if not all_chunks:
+            logger.info(f"📚 No chunks in student namespaces for '{doc_name}', searching all namespaces (teacher-uploaded doc)")
+            try:
+                stats = await loop.run_in_executor(None, index.describe_index_stats)
+                all_namespaces = list(stats.namespaces.keys())
+                # Skip the ones we already checked
+                extra_ns = [ns for ns in all_namespaces if ns not in namespaces]
+                for ns in extra_ns:
+                    all_chunks.extend(await _query_ns(ns))
+            except Exception as e:
+                logger.warning(f"Cross-namespace fallback failed: {e}")
 
         if not all_chunks:
             return {"success": True, "chapters": [], "message": f"No chunks found for document '{doc_name}'."}
@@ -1217,7 +1236,9 @@ async def edtech_extract_topics(
             # No chapter filter — full document
             pinecone_filter = {"doc_name": {"$eq": doc_name}}
 
-        for ns in namespaces:
+        async def _query_ns_topics(ns):
+            """Query a single namespace for topics and return matching chunks."""
+            chunks = []
             try:
                 dummy_vec = [0.0] * 1536
                 res = await loop.run_in_executor(None, lambda _ns=ns: index.query(
@@ -1233,14 +1254,30 @@ async def edtech_extract_topics(
                     page = meta.get("page", "")
                     ch = meta.get("chapter", "")
                     if text:
-                        all_chunks.append({
+                        chunks.append({
                             "text": text,
                             "page": page,
                             "chapter": ch
                         })
             except Exception as e:
                 logger.warning(f"Namespace {ns} query failed: {e}")
-                continue
+            return chunks
+
+        # 1. Try student's own namespaces first
+        for ns in namespaces:
+            all_chunks.extend(await _query_ns_topics(ns))
+
+        # 2. If nothing found (teacher-uploaded doc), search ALL namespaces
+        if not all_chunks:
+            logger.info(f"📚 No chunks in student namespaces for '{doc_name}' topics, searching all namespaces")
+            try:
+                stats = await loop.run_in_executor(None, index.describe_index_stats)
+                all_namespaces = list(stats.namespaces.keys())
+                extra_ns = [ns for ns in all_namespaces if ns not in namespaces]
+                for ns in extra_ns:
+                    all_chunks.extend(await _query_ns_topics(ns))
+            except Exception as e:
+                logger.warning(f"Cross-namespace fallback failed for topics: {e}")
 
         if not all_chunks:
             msg = f"No chunks found for chapter '{chapter}'" if chapter else f"No chunks found for '{doc_name}'"
