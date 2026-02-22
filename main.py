@@ -1274,20 +1274,24 @@ async def edtech_extract_topics(
 
     # FIX 3: Check lesson_cache table (populated by background pre-warm at upload time)
     # This makes topics instant on pre-warmed documents — no Pinecone or LLM call needed.
+    # IMPORTANT: Normalize "Untitled Section" (UI label for empty-chapter docs) → "__all__"
+    # because the background task saves with chapter="" → "__all__", not the display label.
+    UNTITLED_DISPLAY = "Untitled Section"
+    cache_chapter_key = "__all__" if (not chapter or chapter == UNTITLED_DISPLAY) else chapter
     try:
-        lc_key = _lesson_cache_key(current_user.id, doc_name, chapter or "__all__", language, "topics")
+        lc_key = _lesson_cache_key(current_user.id, doc_name, cache_chapter_key, language, "topics")
         lc_row = _get_cached_lesson(lc_key)
         if not lc_row:
             # Also check any user's pre-warm (teacher uploaded, student accesses)
             cross = supabase.table("lesson_cache").select("*") \
                 .eq("doc_name", doc_name).eq("lesson_type", "topics") \
-                .eq("topic", chapter or "__all__").limit(1).execute()
+                .eq("topic", cache_chapter_key).limit(1).execute()
             if cross.data:
                 lc_row = cross.data[0]
         if lc_row and lc_row.get("lesson_json", {}).get("topics"):
             result = {"success": True, "topics": lc_row["lesson_json"]["topics"], "cached": True}
             _topics_cache[topic_cache_key] = {"data": result, "ts": _time.time()}
-            logger.info(f"🎯 Topics cache HIT (db): {doc_name} / {chapter or 'whole doc'}")
+            logger.info(f"🎯 Topics cache HIT (db): {doc_name} / {cache_chapter_key}")
             return result
     except Exception as _e:
         logger.warning(f"Topics lesson_cache lookup failed (non-fatal): {_e}")
