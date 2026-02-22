@@ -880,11 +880,14 @@ async def register_file_endpoint(request: RegisterFileRequest, current_user: Use
 
 @app.post("/api/process-file")
 async def process_file_endpoint(filename: str, current_user: User = Depends(get_current_user)):
-    """Queue a file for processing (non-blocking). Returns batch_job_id for polling."""
+    """Process a file for vectorization.
+    - On Vercel: runs chunking+embedding SYNCHRONOUSLY (background tasks get killed by serverless timeout).
+    - On regular servers: queues background task for async processing + lesson/video pre-gen.
+    """
     try:
-        logger.info(f"⚙️ Queuing file for processing: {filename} for user {current_user.id}")
-        
-        # Create batch job
+        logger.info(f"⚙️ Processing file: {filename} for user {current_user.id} (IS_VERCEL={IS_VERCEL})")
+
+        # Create batch job record
         batch_job_id = str(uuid.uuid4())
         try:
             supabase.table("batch_jobs").insert({
@@ -898,19 +901,90 @@ async def process_file_endpoint(filename: str, current_user: User = Depends(get_
             }).execute()
         except Exception as e:
             logger.warning(f"Batch job creation failed: {e}")
-        
-        # Enqueue for background processing (returns immediately)
-        _enqueue_processing(current_user.id, filename, current_user.access_token, batch_job_id)
-        
-        return {
-            "success": True, 
-            "queued": True,
-            "batch_job_id": batch_job_id,
-            "message": f"File {filename} queued for processing"
-        }
+
+        if IS_VERCEL:
+            # ── Vercel: run Step 1 (chunking+embedding) synchronously ──
+            # Background tasks are killed by Vercel's serverless timeout.
+            # We only do vectorization here; lesson/video pre-gen is deferred to
+            # the frontend's silent pre-fetch when the user opens AI Teacher.
+            try:
+                _update_batch_status(batch_job_id, "processing", progress=5, total_steps=4, completed_steps=0)
+
+                # Resolve file — check local paths first, then download from Supabase Storage
+                local_path = WRITE_RESOURCES_DIR / filename
+                if not local_path.exists():
+                    local_path = STATIC_RESOURCES_DIR / filename
+                user_temp_dir = WRITE_RESOURCES_DIR / current_user.id
+                if not local_path.exists():
+                    local_path = user_temp_dir / filename
+
+                if not local_path.exists():
+                    # Try fetching blob URL from Supabase metadata
+                    s_files = user_db.get_user_files(current_user.id, current_user.access_token)
+                    file_meta = next((f for f in s_files if f.get('filename') == filename or f.get('file_name') == filename), None)
+                    blob_url = file_meta.get('blob_url') if file_meta else None
+                    if blob_url:
+                        logger.info(f"⬇️ Downloading from blob: {blob_url}")
+                        r = requests.get(blob_url, timeout=60)
+                        r.raise_for_status()
+                        user_temp_dir.mkdir(exist_ok=True)
+                        local_path = user_temp_dir / filename
+                        with open(local_path, 'wb') as f:
+                            f.write(r.content)
+
+                if not local_path.exists():
+                    _update_batch_status(batch_job_id, "failed", error="File not found")
+                    raise HTTPException(status_code=404, detail="File not found for processing")
+
+                # Run chunking + embedding synchronously in thread pool
+                from dataprocessor import process_file
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(None, lambda: process_file(str(local_path), user_id=current_user.id))
+                chunks_created = result.get("chunks_created", 0)
+
+                # Update file metadata in Supabase
+                try:
+                    user_db.update_file_processed(
+                        user_id=current_user.id, filename=filename,
+                        chunks_created=chunks_created, user_token=current_user.access_token
+                    )
+                except Exception as e:
+                    logger.warning(f"Metadata update failed: {e}")
+
+                _update_batch_status(batch_job_id, "completed", progress=100, completed_steps=4, total_steps=4)
+                logger.info(f"✅ Vercel sync vectorization done: {filename} ({chunks_created} chunks)")
+
+                return {
+                    "success": True,
+                    "queued": False,
+                    "batch_job_id": batch_job_id,
+                    "chunks_created": chunks_created,
+                    "message": f"File {filename} vectorized ({chunks_created} chunks)"
+                }
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Vercel sync processing failed for {filename}: {e}")
+                _update_batch_status(batch_job_id, "failed", error=str(e))
+                raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+        else:
+            # ── Standard server: enqueue background task ──
+            _enqueue_processing(current_user.id, filename, current_user.access_token, batch_job_id)
+            return {
+                "success": True,
+                "queued": True,
+                "batch_job_id": batch_job_id,
+                "message": f"File {filename} queued for processing"
+            }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error queuing file {filename}: {e}")
+        logger.error(f"Error processing file {filename}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/api/batch-status")
