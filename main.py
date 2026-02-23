@@ -2306,8 +2306,13 @@ async def edtech_generate_tts_video(
             except Exception:
                 pass
         if cached:
-            logger.info(f"🎯 TTS video cache HIT: {topic}")
-            return {"success": True, **cached["lesson_json"], "cached": True}
+            cached_lesson = cached.get("lesson_json", {})
+            cached_audio = cached_lesson.get("audio_url", "")
+            if cached_audio:
+                logger.info(f"🎯 TTS video cache HIT (with audio): {topic}")
+                return {"success": True, **cached_lesson, "cached": True}
+            else:
+                logger.info(f"🔄 TTS video cache HIT but NO audio — regenerating: {topic}")
 
         # ── 2. Cache miss — generate from scratch ──
         logger.info(f"🔄 TTS video cache MISS: {topic}")
@@ -2380,6 +2385,9 @@ async def edtech_generate_tts_video(
             else:
                 result["audio_url"] = f"/static/tts_audio/{result['audio_filename']}"
 
+        # Always ensure audio_url exists in the response (prevent frontend crash)
+        if "audio_url" not in result:
+            result["audio_url"] = ""
         response = {"success": result.get("status") != "failed", **result}
 
         # ── 3b. Enrich TTS sentences with Wikipedia images ──
