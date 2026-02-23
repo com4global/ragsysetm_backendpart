@@ -70,7 +70,7 @@ def get_random_teacher_pair(topic: str) -> dict:
     return TEACHER_PAIRS[idx]
 
 
-def extract_topics(chunks_text: str, language: str = "en", doc_names: Optional[List[str]] = None) -> List[Dict]:
+def extract_topics(chunks_text: str, language: str = "en", doc_names: Optional[List[str]] = None, min_topics: int = 1, max_topics: int = 8) -> List[Dict]:
     """
     Extract key topics STRICTLY from the provided document chunks.
     No hallucination — only topics explicitly present in the content.
@@ -109,7 +109,8 @@ Return as JSON:
   ]
 }}
 
-Extract 3-8 topics. For large textbooks or multi-chapter books, try to cover different chapters/sections.
+Extract {min_topics}-{max_topics} topics. For large textbooks or multi-chapter books, try to cover different chapters/sections.
+If the content is short (a single page or paragraph), it is perfectly fine to return just 1 topic.
 Every topic MUST be traceable to specific content in the chunks below.
 
 DOCUMENT CONTENT:

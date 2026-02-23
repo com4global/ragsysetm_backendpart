@@ -100,3 +100,9 @@ Thumbs.db
 # ─── Node modules ────────────────────────────────────────────────
 node_modules/
 frontend/node_modules/
+
+# ─── Stripe CLI binary ───────────────────────────────────────────
+stripe.exe
+
+# ─── Test output files ───────────────────────────────────────────
+did_test_output.txt

@@ -2,14 +2,14 @@
 HeyGen Video Generation Service
 Generates AI teaching videos from document content.
 
-Pipeline:
-  1. PDF chunks (from Pinecone) → LLM generates a teaching script
-  2. Script → HeyGen Video Agent API → video_id
-  3. Poll HeyGen for video status → completed → video_url
-  4. Cache video_url so the same topic is never re-generated
+Pipeline (Individual Learner — synchronous, w/ Supabase persistence):
+  1. Check Supabase `ai_videos` table — return instantly if cached
+  2. PDF chunks (from Pinecone) → LLM generates a teaching script
+  3. Script → HeyGen Video Agent API → video_id
+  4. Poll HeyGen until done → video_url (mp4)
+  5. Persist to Supabase so the same topic is NEVER regenerated across restarts
 
-Uses the simple Video Agent endpoint (v1/video_agent/generate)
-which is the fastest path from text to video.
+Uses v1/video_agent/generate for fastest text-to-video path.
 """
 
 import os
@@ -37,9 +37,236 @@ MODEL = "gpt-4o-mini"
 
 logger = logging.getLogger(__name__)
 
-# ── Video Cache (JSON file) ─────────────────────────────────────────
+# ── Video Cache (JSON file — fallback when Supabase unavailable) ────
 CACHE_DIR = Path("/tmp") if os.name != "nt" else Path(os.environ.get("TEMP", "."))
 CACHE_FILE = CACHE_DIR / "heygen_video_cache.json"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ▸ Supabase Persistent Video Cache — ai_videos table
+# ═══════════════════════════════════════════════════════════════════
+
+def _heygen_cache_key(topic: str, doc_name: str, language: str) -> str:
+    """Cache key shared across ALL users — same topic/doc/language = same video."""
+    raw = f"{topic.strip().lower()}|{doc_name.strip().lower()}|{language.strip().lower()}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def get_supabase_cached_video(topic: str, doc_name: str, language: str) -> Optional[Dict]:
+    """
+    Check Supabase ai_videos table for an already-generated video.
+    Returns the row dict (with video_url) or None.
+    """
+    try:
+        from database import get_supabase_client
+        sb = get_supabase_client()
+        key = _heygen_cache_key(topic, doc_name, language)
+        result = sb.table("ai_videos").select("*").eq("cache_key", key).eq("status", "completed").limit(1).execute()
+        if result.data:
+            logger.info(f"🎯 Supabase ai_videos cache HIT: {topic}")
+            return result.data[0]
+    except Exception as e:
+        logger.warning(f"Supabase video cache lookup failed (non-fatal): {e}")
+    return None
+
+
+def save_supabase_video(topic: str, doc_name: str, language: str, video_id: str,
+                        video_url: str, thumbnail_url: str = "", script: str = "",
+                        presenter: str = "") -> None:
+    """Upsert a completed video into Supabase ai_videos for permanent caching."""
+    try:
+        from database import get_supabase_client
+        sb = get_supabase_client()
+        key = _heygen_cache_key(topic, doc_name, language)
+        sb.table("ai_videos").upsert({
+            "cache_key": key,
+            "topic": topic,
+            "doc_name": doc_name,
+            "language": language,
+            "video_id": video_id,
+            "video_url": video_url,
+            "thumbnail_url": thumbnail_url,
+            "script": script[:500],
+            "presenter": presenter,
+            "status": "completed",
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }, on_conflict="cache_key").execute()
+        logger.info(f"✅ Supabase ai_videos saved: {topic} → {video_url[:60]}...")
+    except Exception as e:
+        logger.warning(f"Supabase video cache save failed (non-fatal): {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ▸ HeyGen Synchronous Pipeline (for Individual Learner role)
+# ═══════════════════════════════════════════════════════════════════
+
+def poll_heygen_video(video_id: str, max_wait: int = 300, interval: int = 5) -> Dict:
+    """
+    Poll HeyGen v1/video_status.get until status is 'completed' or 'failed'.
+    Returns the full status dict including video_url when ready.
+    Raises TimeoutError if max_wait (seconds) is exceeded.
+    """
+    if not HEYGEN_API_KEY:
+        raise ValueError("HEYGEN_API_KEY not configured")
+
+    headers = {"X-Api-Key": HEYGEN_API_KEY, "Accept": "application/json"}
+    deadline = time.time() + max_wait
+
+    while time.time() < deadline:
+        resp = requests.get(
+            f"{HEYGEN_BASE_URL}/v1/video_status.get",
+            headers=headers,
+            params={"video_id": video_id},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"HeyGen status check failed ({resp.status_code}): {resp.text[:200]}")
+
+        data = resp.json().get("data", {})
+        status = data.get("status", "")
+        logger.info(f"🔄 HeyGen poll {video_id}: status={status}")
+
+        if status == "completed":
+            return data
+        elif status in ("failed", "error"):
+            raise RuntimeError(f"HeyGen video failed: {data.get('error', 'unknown error')}")
+
+        time.sleep(interval)
+
+    raise TimeoutError(f"HeyGen video {video_id} did not finish within {max_wait}s")
+
+
+def generate_heygen_video_sync(script: str, topic: str, doc_name: str = "",
+                               language: str = "en") -> Dict:
+    """
+    Full synchronous pipeline for Individual Learner role:
+      1. Check Supabase cache → return immediately if already generated
+      2. Submit to HeyGen video agent
+      3. Poll until completed (up to 5 minutes)
+      4. Save to Supabase for permanent caching
+      5. Return {video_url, video_id, presenter, cached}
+
+    This runs in a thread pool (asyncio.run_in_executor) from main.py.
+    """
+    if not HEYGEN_API_KEY:
+        raise ValueError("HEYGEN_API_KEY environment variable is not set.")
+
+    # ── 1. Check Supabase cache ──
+    cached = get_supabase_cached_video(topic, doc_name, language)
+    if cached and cached.get("video_url"):
+        return {
+            "video_url": cached["video_url"],
+            "video_id": cached.get("video_id", ""),
+            "thumbnail_url": cached.get("thumbnail_url", ""),
+            "presenter": cached.get("presenter", "HeyGen Avatar"),
+            "cached": True,
+        }
+
+    # ── 2. Check file-based fallback cache ──
+    file_cache = _load_cache()
+    file_key = _heygen_cache_key(topic, doc_name, language)
+    if file_key in file_cache and file_cache[file_key].get("video_url"):
+        entry = file_cache[file_key]
+        # Promote to Supabase
+        save_supabase_video(
+            topic, doc_name, language,
+            entry.get("video_id", ""), entry["video_url"],
+            entry.get("thumbnail_url", ""), script
+        )
+        return {
+            "video_url": entry["video_url"],
+            "video_id": entry.get("video_id", ""),
+            "presenter": "HeyGen Avatar",
+            "cached": True,
+        }
+
+    # ── 3. Submit to HeyGen v2/video/generate (uses subscription minutes, not API credits) ──
+    # v1/video_agent costs API credits → 402. v2/video/generate uses plan video minutes.
+    script_truncated = script[:1500].strip()  # ~90-120 seconds of speech
+
+    headers = {
+        "X-Api-Key": HEYGEN_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    # Pick avatar + voice — IDs verified against /v2/voices on this account
+    # Female: M2WosQ2Ju3f2b7jdddsj  |  Male fallback: a50b2b18a4bf49109caf46a3a6c6a08a
+    avatar_id = "Anna_public_3_20240108"   # Professional female educator preset
+    voice_id = "M2WosQ2Ju3f2b7jdddsj"     # en female (verified from /v2/voices)
+    _ = language  # reserved for future multilingual support
+
+    payload = {
+        "video_inputs": [
+            {
+                "character": {
+                    "type": "avatar",
+                    "avatar_id": avatar_id,
+                    "avatar_style": "normal",
+                },
+                "voice": {
+                    "type": "text",
+                    "input_text": script_truncated,
+                    "voice_id": voice_id,
+                    "speed": 1.0,
+                },
+                "background": {
+                    "type": "color",
+                    "value": "#f0f4f8",
+                },
+            }
+        ],
+        "aspect_ratio": "16:9",
+        "test": False,
+    }
+
+    logger.info(f"🎬 HeyGen v2: submitting video for '{topic}' ({len(script_truncated)} chars)")
+    resp = requests.post(
+        f"{HEYGEN_BASE_URL}/v2/video/generate",
+        json=payload, headers=headers, timeout=60,
+    )
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"HeyGen API error ({resp.status_code}): {resp.text[:400]}")
+
+    resp_data = resp.json()
+    video_id = (
+        resp_data.get("data", {}).get("video_id")
+        or resp_data.get("video_id")
+    )
+    if not video_id:
+        raise RuntimeError(f"HeyGen v2 returned no video_id: {resp_data}")
+
+    logger.info(f"✅ HeyGen v2 video submitted: {video_id}")
+
+
+    # ── 4. Poll until done ──
+    result = poll_heygen_video(video_id, max_wait=300, interval=5)
+    video_url = result.get("video_url", "")
+    thumbnail_url = result.get("thumbnail_url", "")
+
+    if not video_url:
+        raise RuntimeError("HeyGen returned no video_url after completion")
+
+    # ── 5. Persist to Supabase + file cache ──
+    save_supabase_video(topic, doc_name, language, video_id, video_url, thumbnail_url, script)
+
+    file_cache[file_key] = {
+        "video_id": video_id, "video_url": video_url,
+        "thumbnail_url": thumbnail_url, "topic": topic,
+        "doc_name": doc_name, "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _save_cache(file_cache)
+
+    logger.info(f"✅ HeyGen video ready: {video_url}")
+    return {
+        "video_url": video_url,
+        "video_id": video_id,
+        "thumbnail_url": thumbnail_url,
+        "presenter": "HeyGen Avatar",
+        "cached": False,
+    }
+
+
 
 
 def _load_cache() -> Dict:

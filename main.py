@@ -26,12 +26,20 @@ Production-ready API with user isolation and security
 # from fastapi.staticfiles import StaticFiles
 # from datetime import datetime, timedelta
 # import uuid
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, status, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, status, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
+
+# Load .env file FIRST so all os.getenv() calls across modules get the values
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+except ImportError:
+    pass  # python-dotenv not installed; rely on system env vars
+
 import shutil
 import uuid
 from datetime import datetime
@@ -156,6 +164,14 @@ else:
     _tts_audio_dir = _pathlib.Path("/tmp") / "tts_audio"
 _tts_audio_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/static/tts_audio", StaticFiles(directory=str(_tts_audio_dir)), name="tts_audio")
+
+# Mount static files for local video fallback
+if os.name == "nt":
+    _videos_dir = _pathlib.Path(__file__).parent / "static" / "videos"
+else:
+    _videos_dir = _pathlib.Path("/tmp") / "videos"
+_videos_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/static/videos", StaticFiles(directory=str(_videos_dir)), name="videos")
 
 # RESOURCES_DIR is split into WRITE and STATIC. 
 # Helpers will resolve paths dynamically.
@@ -1504,7 +1520,13 @@ async def edtech_extract_topics(
         logger.info(f"📚 Sending {len(content_parts)} chunks ({total_chars} chars) to LLM" +
                      (f" [chapter: {chapter}]" if chapter else " [whole doc]"))
 
-        topics = await loop.run_in_executor(None, lambda: extract_topics(combined, language, [doc_name]))
+        topics = await loop.run_in_executor(None, lambda: extract_topics(
+            combined,
+            language,
+            [doc_name],
+            min_topics=1 if len(all_chunks) <= 3 else 3,
+            max_topics=3 if len(all_chunks) <= 3 else 8
+        ))
 
         response = {
             "success": True,
@@ -1761,6 +1783,180 @@ async def edtech_generate_lesson(
         logger.error(f"EdTech lesson generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+
+@app.post("/api/edtech/generate-did-video")
+async def edtech_generate_video(
+    request: Request,
+    topic: str = Form(...),
+    language: str = Form("en"),
+    doc_name: str = Form(""),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Generate an AI Teacher video for the Individual Learner role.
+    Uses LOCAL TTS+Video engine (OpenAI TTS + moviepy — no paid video API).
+    Endpoint URL unchanged so the frontend requires no changes.
+
+    Steps:
+      1. Check Supabase ai_videos cache → return instantly if already done
+      2. Retrieve RAG context (Pinecone) for the requested topic
+      3. Generate a professional narration script via GPT
+      4. Local pipeline: TTS audio → Pillow frames → moviepy MP4
+      5. Upload to Supabase Storage → cache URL in ai_videos table
+    """
+    try:
+        from local_video_service import (
+            generate_local_video_sync,
+            get_supabase_cached_video,
+        )
+        from embedder import embed_User_query
+        from vectorstore import search_user_documents
+
+        # ── 1. Check Supabase cache first ──
+        cached = get_supabase_cached_video(topic, doc_name, language)
+        if cached and cached.get("video_url"):
+            logger.info(f"🎯 Local video cache HIT: {topic}")
+            return {
+                "success": True,
+                "video_url": cached["video_url"],
+                "video_id": cached.get("video_id", ""),
+                "presenter": cached.get("presenter", "AI Teacher"),
+                "script": cached.get("script", ""),
+                "cached": True,
+            }
+
+        # ── 2. Retrieve relevant RAG context ──
+        loop = asyncio.get_event_loop()
+        query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic))
+
+        if doc_name:
+            from vectorstore import search_by_doc_name
+            results = await loop.run_in_executor(
+                None, lambda: search_by_doc_name(query_vec, doc_name, top_k=8)
+            )
+            if not results:
+                results = await loop.run_in_executor(
+                    None, lambda: search_user_documents(query_vec, current_user.id, top_k=8)
+                )
+        else:
+            results = await loop.run_in_executor(
+                None, lambda: search_user_documents(query_vec, current_user.id, top_k=8)
+            )
+
+        if not results:
+            raise HTTPException(status_code=404, detail="No relevant content found for this topic.")
+
+        context_chunks = [r.get("text", "") for r in results if r.get("text")]
+        combined = "\n\n".join(context_chunks[:6])
+
+        # ── 3. Generate professional narration script via GPT ──
+        from openai import OpenAI
+        openai_client = OpenAI()
+
+        lang_instruction = ""
+        if language == "ta":
+            lang_instruction = "\nIMPORTANT: Write the entire script in Tamil (தமிழ்)."
+        elif language == "hi":
+            lang_instruction = "\nIMPORTANT: Write the entire script in Hindi."
+
+        system_prompt = (
+            "You are an expert course instructor creating a professional educational video script. "
+            "The script will be read aloud by an AI voice presenter to an adult learner. "
+            "Style: clear, authoritative, engaging, no filler words. "
+            "Length: 3-5 paragraphs (about 90-150 seconds of speech). "
+            "Do NOT add stage directions, [pause], or speaker names — pure spoken text only."
+            + lang_instruction
+        )
+        user_prompt = (
+            f"Create a professional educational video script about: '{topic}'\n\n"
+            f"Use this content as your source material:\n{combined}\n\n"
+            f"Write a flowing, well-structured narration that an expert would deliver to peers."
+        )
+
+        gpt_resp = await loop.run_in_executor(None, lambda: openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=800,
+            temperature=0.7,
+        ))
+        script = gpt_resp.choices[0].message.content.strip()
+        logger.info(f"📝 Script generated ({len(script)} chars) for '{topic}'")
+
+        # ── 4. Local TTS+Video pipeline (runs in thread pool) ──
+        result = await loop.run_in_executor(
+            None,
+            lambda: generate_local_video_sync(script, topic, doc_name, language)
+        )
+
+        # Make video_url absolute so the browser can load it directly.
+        # Supabase URLs are already absolute (https://...);
+        # local fallback paths like /static/videos/x.mp4 need the base URL.
+        video_url = result["video_url"]
+        if video_url and video_url.startswith("/"):
+            base = str(request.base_url).rstrip("/")
+            video_url = f"{base}{video_url}"
+
+        return {
+            "success": True,
+            "video_url": video_url,
+            "video_id": result.get("video_id", ""),
+            "presenter": result.get("presenter", "AI Teacher"),
+            "script": script,
+            "cached": result.get("cached", False),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Local video generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Video generation failed: {str(e)}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DEAD CODE — HeyGen backup (kept for reference; not active)
+# Restore by replacing the endpoint above with this block.
+# Note: requires HEYGEN_API_KEY with an active HeyGen *API* plan ($99/mo).
+# ════════════════════════════════════════════════════════════════════════════
+# @app.post("/api/edtech/generate-did-video")
+# async def edtech_generate_heygen_video(
+#     topic: str = Form(...),
+#     language: str = Form("en"),
+#     doc_name: str = Form(""),
+#     current_user: User = Depends(get_current_user)
+# ):
+#     try:
+#         from heygen_service import generate_heygen_video_sync, get_supabase_cached_video
+#         from embedder import embed_User_query
+#         from vectorstore import search_user_documents
+#         cached = get_supabase_cached_video(topic, doc_name, language)
+#         if cached and cached.get("video_url"):
+#             return {"success": True, **cached, "cached": True}
+#         loop = asyncio.get_event_loop()
+#         query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic))
+#         results = await loop.run_in_executor(
+#             None, lambda: search_user_documents(query_vec, current_user.id, top_k=8))
+#         if not results:
+#             raise HTTPException(status_code=404, detail="No content found.")
+#         combined = "\n\n".join([r.get("text","") for r in results[:6]])
+#         from openai import OpenAI
+#         script_resp = OpenAI().chat.completions.create(
+#             model="gpt-4o-mini",
+#             messages=[{"role":"user","content":f"Educational script about {topic}:\n{combined}"}],
+#             max_tokens=800)
+#         script = script_resp.choices[0].message.content.strip()
+#         result = await loop.run_in_executor(
+#             None, lambda: generate_heygen_video_sync(script, topic, doc_name, language))
+#         return {"success": True, "video_url": result["video_url"],
+#                 "video_id": result.get("video_id",""), "presenter":"HeyGen Avatar",
+#                 "script": script, "cached": result.get("cached", False)}
+#     except HTTPException: raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"HeyGen failed: {str(e)}")
 
 
 @app.post("/api/edtech/ask")
@@ -2955,5 +3151,170 @@ async def get_classroom_progress(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BILLING / SUBSCRIPTION ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+from billing_service import (
+    PLANS,
+    get_user_subscription,
+    create_checkout_session,
+    create_portal_session,
+    handle_webhook_event,
+)
+
+
+class CheckoutRequest(BaseModel):
+    plan: str           # pro | plus | corporate
+    currency: str = "usd"   # usd | inr
+    success_url: str
+    cancel_url: str
+
+
+class PortalRequest(BaseModel):
+    return_url: str
+
+
+@app.get("/api/billing/plans")
+async def billing_plans():
+    """Return all subscription plans with pricing."""
+    plans_out = {}
+    for key, p in PLANS.items():
+        plans_out[key] = {
+            "name": p["name"],
+            "price_usd": p["price_usd"],
+            "price_inr": p["price_inr"],
+            "upload_limit_mb": p["upload_limit_mb"],
+            "chunk_limit": p["chunk_limit"],
+            "description": p["description"],
+            "features": p["features"],
+        }
+    return {"success": True, "plans": plans_out}
+
+
+@app.get("/api/billing/status")
+async def billing_status(current_user: User = Depends(get_current_user)):
+    """Return the calling user's current plan and limits."""
+    info = get_user_subscription(current_user.id)
+    return {"success": True, **info}
+
+
+@app.post("/api/billing/create-checkout")
+async def billing_create_checkout(
+    body: CheckoutRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Create a Stripe Checkout session for a paid plan."""
+    if body.plan == "free":
+        # Just mark user as free in DB — no Stripe needed
+        try:
+            supabase.table("subscriptions").upsert(
+                {"user_id": current_user.id, "plan": "free", "status": "active"},
+                on_conflict="user_id"
+            ).execute()
+            supabase.table("profiles").update({"plan": "free"}).eq("id", current_user.id).execute()
+        except Exception as e:
+            logger.warning(f"Free plan save failed: {e}")
+        return {"success": True, "url": body.success_url, "plan": "free"}
+
+    if body.currency.lower() not in ("usd", "inr"):
+        raise HTTPException(status_code=400, detail="Currency must be 'usd' or 'inr'")
+
+    try:
+        url = create_checkout_session(
+            user_id=current_user.id,
+            email=current_user.email,
+            plan=body.plan,
+            currency=body.currency.lower(),
+            success_url=body.success_url,
+            cancel_url=body.cancel_url,
+        )
+        return {"success": True, "url": url}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Checkout session creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+
+
+@app.post("/api/billing/webhook")
+async def billing_webhook(request: Request):
+    """
+    Stripe webhook endpoint.
+    Stripe sends events here when subscriptions change.
+    Register this URL in your Stripe Dashboard → Webhooks.
+    """
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    try:
+        result = handle_webhook_event(payload, sig_header)
+        return {"success": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Webhook processing failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/billing/portal")
+async def billing_portal(
+    body: PortalRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Return a Stripe Customer Portal URL so users can manage their subscription."""
+    try:
+        url = create_portal_session(current_user.id, body.return_url)
+        return {"success": True, "url": url}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Portal session failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/billing/verify-session")
+async def billing_verify_session(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    After Stripe Checkout redirects back to the app, call this with the
+    session_id to verify payment and update the user's plan immediately.
+    This bypasses the need for a running webhook listener in local dev.
+    """
+    from billing_service import verify_checkout_session
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    try:
+        result = verify_checkout_session(session_id, current_user.id)
+        return {"success": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"verify-session failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/billing/sync-subscription")
+async def billing_sync_subscription(current_user: User = Depends(get_current_user)):
+    """
+    Sync the user's plan from their active Stripe subscription.
+    Call this if payment went through on Stripe but the app still shows FREE.
+    """
+    from billing_service import sync_active_subscription
+    try:
+        result = sync_active_subscription(current_user.id)
+        return {"success": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"sync-subscription failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
