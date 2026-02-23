@@ -1695,9 +1695,39 @@ async def edtech_generate_lesson(
         combined = "\n\n---\n\n".join(chunks_with_refs)
         lesson = await loop.run_in_executor(None, lambda: generate_teacher_dialogue(topic, combined, language))
 
-        # ── 3. Save lesson text to cache immediately (no audio yet) ──
-        # This lets the user see the lesson right away while audio generates in background.
-        lesson["audio_urls"] = []  # empty for now — filled by background task
+        # ── 3. Generate TTS audio SYNCHRONOUSLY so the user hears voice on first play ──
+        from heygen_service import generate_dialogue_audio, TTS_AUDIO_DIR, enrich_sentences_with_images
+        dialogue = lesson.get("dialogue", [])
+        voice_map = lesson.get("voice_map", {})
+
+        audio_urls = []
+        audio_storage_paths = []
+        if dialogue and voice_map:
+            voice_map_with_lang = {**voice_map, "__language__": language}
+            audio_files = await loop.run_in_executor(None, lambda: generate_dialogue_audio(
+                dialogue_lines=dialogue,
+                voice_map=voice_map_with_lang,
+                topic=topic,
+                user_id=current_user.id,
+                doc_name=doc_name
+            ))
+            async def _upload_one(f_name):
+                if not f_name:
+                    return "", ""
+                local_file = TTS_AUDIO_DIR / f_name
+                storage_path = f"dialogue/{current_user.id}/{f_name}"
+                public_url = await loop.run_in_executor(
+                    None, lambda lf=str(local_file), sp=storage_path: _upload_audio_to_storage(lf, sp)
+                )
+                return (public_url, storage_path) if public_url else (f"/static/tts_audio/{f_name}", "")
+
+            upload_results = await asyncio.gather(*[_upload_one(f) for f in audio_files])
+            audio_urls = [r[0] for r in upload_results]
+            audio_storage_paths = [r[1] for r in upload_results]
+
+        lesson["audio_urls"] = audio_urls
+
+        # ── 4. Save lesson WITH audio to cache ──
         _save_lesson_cache(
             user_id=current_user.id,
             cache_key=cache_key,
@@ -1706,61 +1736,23 @@ async def edtech_generate_lesson(
             language=language,
             lesson_type="conversation",
             lesson_json=lesson,
-            audio_storage_paths=[]
+            audio_storage_paths=audio_storage_paths
         )
 
-        # ── 4. Fire-and-forget: generate TTS audio + images in background ──
-        # This runs AFTER we return to the user so it doesn't add to wait time.
-        # On next load the cached lesson will have audio_urls populated.
-        async def _enrich_lesson_audio_and_images():
+        # ── 5. Fire-and-forget: enrich dialogue with Wikipedia images (non-critical) ──
+        async def _enrich_lesson_images():
             try:
-                from heygen_service import generate_dialogue_audio, TTS_AUDIO_DIR, enrich_sentences_with_images
-                dialogue = lesson.get("dialogue", [])
-                voice_map = lesson.get("voice_map", {})
+                dialogue_texts = [line.get("text", "") for line in dialogue]
+                enriched = await loop.run_in_executor(
+                    None, lambda: enrich_sentences_with_images(dialogue_texts, topic, language)
+                )
+                for i, line in enumerate(dialogue):
+                    if i < len(enriched):
+                        line["image_url"] = enriched[i].get("image_url", "")
+                        line["image_caption"] = enriched[i].get("image_caption", "")
+                lesson["dialogue"] = dialogue
 
-                # Generate TTS audio for each dialogue line
-                audio_urls = []
-                audio_storage_paths = []
-                if dialogue and voice_map:
-                    voice_map_with_lang = {**voice_map, "__language__": language}
-                    audio_files = await loop.run_in_executor(None, lambda: generate_dialogue_audio(
-                        dialogue_lines=dialogue,
-                        voice_map=voice_map_with_lang,
-                        topic=topic,
-                        user_id=current_user.id,
-                        doc_name=doc_name
-                    ))
-                    async def _upload_one(f_name):
-                        if not f_name:
-                            return "", ""
-                        local_file = TTS_AUDIO_DIR / f_name
-                        storage_path = f"dialogue/{current_user.id}/{f_name}"
-                        public_url = await loop.run_in_executor(
-                            None, lambda lf=str(local_file), sp=storage_path: _upload_audio_to_storage(lf, sp)
-                        )
-                        return (public_url, storage_path) if public_url else (f"/static/tts_audio/{f_name}", "")
-
-                    upload_results = await asyncio.gather(*[_upload_one(f) for f in audio_files])
-                    audio_urls = [r[0] for r in upload_results]
-                    audio_storage_paths = [r[1] for r in upload_results]
-
-                # Enrich dialogue with Wikipedia images
-                try:
-                    dialogue_texts = [line.get("text", "") for line in dialogue]
-                    enriched = await loop.run_in_executor(
-                        None, lambda: enrich_sentences_with_images(dialogue_texts, topic, language)
-                    )
-                    for i, line in enumerate(dialogue):
-                        if i < len(enriched):
-                            line["image_url"] = enriched[i].get("image_url", "")
-                            line["image_caption"] = enriched[i].get("image_caption", "")
-                    lesson["dialogue"] = dialogue
-                except Exception as img_err:
-                    logger.warning(f"Background image enrichment failed: {img_err}")
-
-                lesson["audio_urls"] = audio_urls
-
-                # Update the cache with audio + images now that they're ready
+                # Update cache with images
                 _save_lesson_cache(
                     user_id=current_user.id,
                     cache_key=cache_key,
@@ -1771,11 +1763,11 @@ async def edtech_generate_lesson(
                     lesson_json=lesson,
                     audio_storage_paths=audio_storage_paths
                 )
-                logger.info(f"✅ Background audio+images ready for lesson: {topic}")
-            except Exception as bg_err:
-                logger.warning(f"Background lesson enrichment failed (non-fatal): {bg_err}")
+                logger.info(f"✅ Background images enriched for lesson: {topic}")
+            except Exception as img_err:
+                logger.warning(f"Background image enrichment failed (non-fatal): {img_err}")
 
-        asyncio.create_task(_enrich_lesson_audio_and_images())
+        asyncio.create_task(_enrich_lesson_images())
 
         return {"success": True, "lesson": lesson}
 
