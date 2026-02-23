@@ -1654,8 +1654,14 @@ async def edtech_generate_lesson(
             except Exception:
                 pass
         if cached:
-            logger.info(f"🎯 Lesson cache HIT: {topic}")
-            return {"success": True, "lesson": cached["lesson_json"], "cached": True}
+            cached_lesson = cached.get("lesson_json", {})
+            cached_audio = cached_lesson.get("audio_urls", [])
+            # If cached lesson has audio, return it; otherwise regenerate with audio
+            if cached_audio and any(u for u in cached_audio):
+                logger.info(f"🎯 Lesson cache HIT (with audio): {topic}")
+                return {"success": True, "lesson": cached_lesson, "cached": True}
+            else:
+                logger.info(f"🔄 Lesson cache HIT but NO audio — regenerating: {topic}")
 
         # ── 2. Cache miss — generate dialogue text only (fast GPT call) ──
         logger.info(f"🔄 Lesson cache MISS: {topic}")
@@ -1695,7 +1701,7 @@ async def edtech_generate_lesson(
         combined = "\n\n---\n\n".join(chunks_with_refs)
         lesson = await loop.run_in_executor(None, lambda: generate_teacher_dialogue(topic, combined, language))
 
-        # ── 3. Generate TTS audio SYNCHRONOUSLY so the user hears voice on first play ──
+        # ── 3. Generate TTS audio BEFORE returning ──
         from heygen_service import generate_dialogue_audio, TTS_AUDIO_DIR, enrich_sentences_with_images
         dialogue = lesson.get("dialogue", [])
         voice_map = lesson.get("voice_map", {})
@@ -1711,19 +1717,20 @@ async def edtech_generate_lesson(
                 user_id=current_user.id,
                 doc_name=doc_name
             ))
-            async def _upload_one(f_name):
-                if not f_name:
-                    return "", ""
-                local_file = TTS_AUDIO_DIR / f_name
-                storage_path = f"dialogue/{current_user.id}/{f_name}"
-                public_url = await loop.run_in_executor(
-                    None, lambda lf=str(local_file), sp=storage_path: _upload_audio_to_storage(lf, sp)
-                )
-                return (public_url, storage_path) if public_url else (f"/static/tts_audio/{f_name}", "")
-
-            upload_results = await asyncio.gather(*[_upload_one(f) for f in audio_files])
-            audio_urls = [r[0] for r in upload_results]
-            audio_storage_paths = [r[1] for r in upload_results]
+            for f_name in audio_files:
+                if f_name:
+                    local_file = TTS_AUDIO_DIR / f_name
+                    storage_path = f"dialogue/{current_user.id}/{f_name}"
+                    public_url = _upload_audio_to_storage(str(local_file), storage_path)
+                    if public_url:
+                        audio_urls.append(public_url)
+                        audio_storage_paths.append(storage_path)
+                    else:
+                        audio_urls.append(f"/static/tts_audio/{f_name}")
+                        audio_storage_paths.append("")
+                else:
+                    audio_urls.append("")
+                    audio_storage_paths.append("")
 
         lesson["audio_urls"] = audio_urls
 
@@ -1739,7 +1746,7 @@ async def edtech_generate_lesson(
             audio_storage_paths=audio_storage_paths
         )
 
-        # ── 5. Fire-and-forget: enrich dialogue with Wikipedia images (non-critical) ──
+        # ── 5. Fire-and-forget: enrich with images (non-critical) ──
         async def _enrich_lesson_images():
             try:
                 dialogue_texts = [line.get("text", "") for line in dialogue]
@@ -1751,8 +1758,6 @@ async def edtech_generate_lesson(
                         line["image_url"] = enriched[i].get("image_url", "")
                         line["image_caption"] = enriched[i].get("image_caption", "")
                 lesson["dialogue"] = dialogue
-
-                # Update cache with images
                 _save_lesson_cache(
                     user_id=current_user.id,
                     cache_key=cache_key,
@@ -1775,6 +1780,33 @@ async def edtech_generate_lesson(
         logger.error(f"EdTech lesson generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/edtech/lesson-audio-status")
+async def edtech_lesson_audio_status(
+    topic: str,
+    doc_name: str = "",
+    language: str = "en",
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Poll endpoint: check if background TTS audio generation is done for a lesson.
+    Returns { audio_urls: [...], audio_generating: bool }.
+    Frontend polls this every 3 seconds until audio_generating is False.
+    """
+    try:
+        cache_key = _lesson_cache_key(current_user.id, doc_name, topic, language, "conversation")
+        cached = _get_cached_lesson(cache_key)
+        if not cached:
+            return {"audio_urls": [], "audio_generating": False}
+
+        lesson_json = cached.get("lesson_json", {})
+        return {
+            "audio_urls": lesson_json.get("audio_urls", []),
+            "audio_generating": lesson_json.get("audio_generating", False),
+        }
+    except Exception as e:
+        logger.warning(f"Lesson audio status check failed: {e}")
+        return {"audio_urls": [], "audio_generating": False}
 
 
 
