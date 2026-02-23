@@ -16,3 +16,4 @@ openpyxl
 python-docx
 pdfplumber
 Pillow
+stripe
