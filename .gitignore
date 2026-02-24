@@ -106,3 +106,21 @@ stripe.exe
 
 # ─── Test output files ───────────────────────────────────────────
 did_test_output.txt
+test_moviepy_results.txt
+
+# ─── Test / experiment scripts (not part of the app) ─────────────
+test_*.py
+extract_frames.py
+
+# ─── Generated avatar / video temp files ─────────────────────────
+static/avatar_video_temp/
+static/avatars/
+static/fonts/
+
+# ─── Capacitor / mobile build artifacts ──────────────────────────
+frontend/android/
+frontend/ios/
+frontend/dist/
+
+# ─── Build output ────────────────────────────────────────────────
+frontend/build/

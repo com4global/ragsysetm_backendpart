@@ -5,10 +5,10 @@ Handles plan management, Stripe Checkout sessions,
 webhook processing, and customer portal for the app.
 
 Plans:
-  free      → $0/mo  — 10 MB, 200 chunks
-  pro       → $25/mo — 100 MB, 2,000 chunks
-  plus      → $60/mo — 500 MB, 10,000 chunks
-  corporate → $100/mo — Unlimited
+  free      → $0/mo  — PDF only, 3 MB/file, 20 MB total, 200 chunks
+  pro       → $25/mo — All types, 25 MB/file, 200 MB total, 2,000 chunks
+  plus      → $60/mo — All types, 100 MB/file, 1 GB total, 10,000 chunks
+  corporate → $100/mo — All types, 500 MB/file, unlimited total, unlimited chunks
 """
 
 import os
@@ -25,10 +25,14 @@ PLANS: Dict[str, Dict[str, Any]] = {
         "price_usd": 0,
         "price_inr": 0,
         "upload_limit_mb": 10,
+        "max_file_size_mb": 3,
+        "max_total_storage_mb": 20,
+        "allowed_file_types": [".pdf"],
         "chunk_limit": 200,
         "description": "Get started — no credit card required",
         "features": [
-            "Up to 10 MB document uploads",
+            "PDF uploads up to 3 MB each",
+            "20 MB total storage",
             "200 RAG chunks",
             "Basic AI chat",
             "1 document at a time",
@@ -39,10 +43,14 @@ PLANS: Dict[str, Dict[str, Any]] = {
         "price_usd": 25,
         "price_inr": 2100,
         "upload_limit_mb": 100,
+        "max_file_size_mb": 25,
+        "max_total_storage_mb": 200,
+        "allowed_file_types": "all",
         "chunk_limit": 2000,
         "description": "For professionals who need more power",
         "features": [
-            "Up to 100 MB document uploads",
+            "All file formats, up to 25 MB each",
+            "200 MB total storage",
             "2,000 RAG chunks",
             "AI Teacher videos",
             "Legal Analysis",
@@ -56,10 +64,14 @@ PLANS: Dict[str, Dict[str, Any]] = {
         "price_usd": 60,
         "price_inr": 5000,
         "upload_limit_mb": 500,
+        "max_file_size_mb": 100,
+        "max_total_storage_mb": 1024,
+        "allowed_file_types": "all",
         "chunk_limit": 10000,
         "description": "For power users and small teams",
         "features": [
-            "Up to 500 MB document uploads",
+            "All file formats, up to 100 MB each",
+            "1 GB total storage",
             "10,000 RAG chunks",
             "All Pro features",
             "Multiple document sessions",
@@ -73,10 +85,14 @@ PLANS: Dict[str, Dict[str, Any]] = {
         "price_usd": 100,
         "price_inr": 8300,
         "upload_limit_mb": -1,   # -1 = unlimited
+        "max_file_size_mb": 500,  # 500 MB per file
+        "max_total_storage_mb": -1,  # -1 = unlimited
+        "allowed_file_types": "all",
         "chunk_limit": -1,       # -1 = unlimited
         "description": "Unlimited access for enterprises",
         "features": [
-            "Unlimited document uploads",
+            "All file formats, up to 500 MB each",
+            "Unlimited total storage",
             "Unlimited RAG chunks",
             "All Plus features",
             "Custom integrations",
@@ -125,6 +141,63 @@ def check_chunks_allowed(plan_name: str, current_chunks: int) -> tuple[bool, str
         return False, (
             f"You've reached your {plan['name']} plan chunk limit of {limit:,}. "
             f"Upgrade to store more documents."
+        )
+    return True, ""
+
+
+def check_file_type_allowed(plan_name: str, filename: str) -> tuple[bool, str]:
+    """
+    Returns (allowed: bool, reason: str).
+    Checks whether the file extension is permitted for the user's plan.
+    """
+    plan = get_plan(plan_name)
+    allowed = plan.get("allowed_file_types", "all")
+    if allowed == "all":
+        return True, ""
+    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in allowed:
+        allowed_str = ", ".join(t.upper().replace(".", "") for t in allowed)
+        return False, (
+            f"Your {plan['name']} plan only supports {allowed_str} files. "
+            f"Upgrade to upload {ext.upper().replace('.', '')} and other formats."
+        )
+    return True, ""
+
+
+def check_total_storage(plan_name: str, current_used_bytes: int, new_file_bytes: int) -> tuple[bool, str]:
+    """
+    Returns (allowed: bool, reason: str).
+    Checks whether the user has enough total storage remaining.
+    """
+    plan = get_plan(plan_name)
+    limit_mb = plan.get("max_total_storage_mb", -1)
+    if limit_mb == -1:
+        return True, ""
+    limit_bytes = limit_mb * 1024 * 1024
+    new_total = current_used_bytes + new_file_bytes
+    if new_total > limit_bytes:
+        used_mb = current_used_bytes / (1024 * 1024)
+        return False, (
+            f"Adding this file would exceed your {plan['name']} plan storage limit of {limit_mb} MB "
+            f"(currently using {used_mb:.1f} MB). Upgrade for more storage."
+        )
+    return True, ""
+
+
+def check_file_size(plan_name: str, file_size_bytes: int) -> tuple[bool, str]:
+    """
+    Returns (allowed: bool, reason: str).
+    Checks per-file size limit (max_file_size_mb).
+    """
+    plan = get_plan(plan_name)
+    limit_mb = plan.get("max_file_size_mb", -1)
+    if limit_mb == -1:
+        return True, ""
+    file_mb = file_size_bytes / (1024 * 1024)
+    if file_mb > limit_mb:
+        return False, (
+            f"File size {file_mb:.1f} MB exceeds your {plan['name']} plan limit of {limit_mb} MB per file. "
+            f"Upgrade to upload larger files."
         )
     return True, ""
 

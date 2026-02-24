@@ -173,6 +173,14 @@ else:
 _videos_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/static/videos", StaticFiles(directory=str(_videos_dir)), name="videos")
 
+# Mount static files for avatar video generation temp files
+if os.name == "nt":
+    _avatar_video_dir = _pathlib.Path(__file__).parent / "static" / "avatar_video_temp"
+else:
+    _avatar_video_dir = _pathlib.Path("/tmp") / "avatar_video_temp"
+_avatar_video_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/static/avatar_video_temp", StaticFiles(directory=str(_avatar_video_dir)), name="avatar_video_temp")
+
 # RESOURCES_DIR is split into WRITE and STATIC. 
 # Helpers will resolve paths dynamically.
 
@@ -598,17 +606,65 @@ async def upload_file_endpoint(
     """Upload a file via multipart/form-data, save locally, and record metadata"""
     try:
         from datetime import datetime
+        from billing_service import (
+            get_user_subscription as _get_sub,
+            check_file_type_allowed,
+            check_file_size,
+            check_total_storage,
+        )
         logger.info(f"📤 Upload started: {file.filename} by user {current_user.id}")
+
+        # ── Plan-based upload enforcement ─────────────────────────────────
+        sub_info = _get_sub(current_user.id)
+        plan_name = sub_info.get("plan", "free")
+
+        # 0a. File-type check
+        type_ok, type_reason = check_file_type_allowed(plan_name, file.filename)
+        if not type_ok:
+            raise HTTPException(
+                status_code=403,
+                detail={"upgrade_required": True, "reason": type_reason, "current_plan": plan_name},
+            )
+
+        # 0b. Read the file content to get size
+        content = await file.read()
+        file_size = len(content)
+
+        # 0c. Per-file size check
+        size_ok, size_reason = check_file_size(plan_name, file_size)
+        if not size_ok:
+            raise HTTPException(
+                status_code=403,
+                detail={"upgrade_required": True, "reason": size_reason, "current_plan": plan_name},
+            )
+
+        # 0d. Total storage check — sum existing file sizes for this user
+        try:
+            user_files_result = supabase.table("user_files") \
+                .select("file_size") \
+                .eq("user_id", current_user.id) \
+                .execute()
+            current_used = sum(r.get("file_size", 0) for r in (user_files_result.data or []))
+        except Exception:
+            current_used = 0  # If query fails, don't block upload
+
+        storage_ok, storage_reason = check_total_storage(plan_name, current_used, file_size)
+        if not storage_ok:
+            raise HTTPException(
+                status_code=403,
+                detail={"upgrade_required": True, "reason": storage_reason, "current_plan": plan_name},
+            )
+
+        logger.info(f"✅ Plan checks passed ({plan_name}): {file.filename} ({file_size} bytes)")
+        # ── End enforcement ───────────────────────────────────────────────
         
         # 1. Save file to local storage (resources directory root)
         # Always write to writable directory
         local_path = WRITE_RESOURCES_DIR / file.filename
         
         with open(local_path, "wb") as buffer:
-            content = await file.read()
             buffer.write(content)
         
-        file_size = len(content)
         logger.info(f"📤 File saved: {local_path} ({file_size} bytes)")
         
         # 2. Record metadata in local .file_metadata.json
@@ -732,6 +788,90 @@ async def upload_file_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── PDF Page Extraction ──
+
+class ExtractPagesRequest(BaseModel):
+    start_page: int = 1       # 1-indexed
+    end_page: int = -1        # -1 = last page
+    info_only: bool = False   # True = just return page count
+
+@app.post("/api/extract-pages")
+async def extract_pages(
+    file: UploadFile = File(...),
+    start_page: int = Form(1),
+    end_page: int = Form(-1),
+    info_only: str = Form("false"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Extract a page range from a PDF and return the result.
+    If info_only=true, returns only total page count.
+    Pages are 1-indexed.
+    """
+    import io
+    from pypdf import PdfReader, PdfWriter
+
+    is_info_only = info_only.lower() in ("true", "1", "yes")
+
+    try:
+        content = await file.read()
+        pdf_stream = io.BytesIO(content)
+        reader = PdfReader(pdf_stream)
+        total_pages = len(reader.pages)
+
+        # Info-only mode: just return metadata
+        if is_info_only:
+            return {
+                "success": True,
+                "total_pages": total_pages,
+                "filename": file.filename,
+                "file_size": len(content),
+            }
+
+        # Validate range
+        start = max(1, start_page)
+        end = total_pages if end_page == -1 else min(end_page, total_pages)
+        if start > end or start > total_pages:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid page range {start}-{end}. File has {total_pages} pages.",
+            )
+
+        # Extract pages
+        writer = PdfWriter()
+        for i in range(start - 1, end):  # convert to 0-indexed
+            writer.add_page(reader.pages[i])
+
+        out_buf = io.BytesIO()
+        writer.write(out_buf)
+        out_buf.seek(0)
+
+        # Build output filename
+        base = file.filename.rsplit(".", 1)[0] if "." in file.filename else file.filename
+        out_name = f"{base}_pages_{start}-{end}.pdf"
+
+        logger.info(
+            f"✂️ Extracted pages {start}-{end} ({end - start + 1} pages) "
+            f"from {file.filename} ({total_pages} total) for user {current_user.id}"
+        )
+
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(
+            out_buf,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{out_name}"',
+                "X-Total-Pages": str(total_pages),
+                "X-Extracted-Pages": f"{start}-{end}",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Page extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Page extraction failed: {e}")
+
+
 # ── Web URL Ingestion ──
 
 @app.post("/api/ingest-url")
@@ -826,6 +966,183 @@ async def ingest_url(
         raise HTTPException(status_code=400, detail=f"Could not fetch URL: {str(e)}")
     except Exception as e:
         logger.error(f"URL ingestion failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── YouTube Video Processing ──
+
+def _extract_video_id(url: str) -> str:
+    """Extract the video ID from various YouTube URL formats."""
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    if "youtube.com" in hostname:
+        qs = parse_qs(parsed.query)
+        if "v" in qs:
+            return qs["v"][0]
+        # Handle /embed/VIDEO_ID and /v/VIDEO_ID
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) >= 2 and parts[0] in ("embed", "v"):
+            return parts[1]
+    elif "youtu.be" in hostname:
+        return parsed.path.lstrip("/").split("/")[0]
+    raise ValueError(f"Could not extract video ID from URL: {url}")
+
+
+class YouTubeRequest(BaseModel):
+    url: str
+
+
+@app.post("/api/process-youtube")
+async def process_youtube(
+    request: YouTubeRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """Fetch YouTube video transcript via captions API, save as text, and process through RAG pipeline."""
+    try:
+        url = request.url.strip()
+        logger.info(f"🎬 Processing YouTube URL: {url} for user {current_user.id}")
+
+        # 1. Extract the video ID
+        try:
+            video_id = _extract_video_id(url)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # 2. Fetch transcript using youtube-transcript-api (new instance-based API)
+        ytt_api = YouTubeTranscriptApi()
+        transcript_segments = None
+        try:
+            transcript_segments = ytt_api.fetch(
+                video_id,
+                languages=["en", "en-US", "en-GB", "en-IN"]
+            )
+        except Exception as e:
+            logger.warning(f"English transcript not found, trying any language: {e}")
+            try:
+                # Fallback: try to get any available transcript
+                transcript_list = ytt_api.list(video_id)
+                # Try auto-generated first, then manual
+                for transcript in transcript_list:
+                    try:
+                        transcript_segments = transcript.fetch()
+                        logger.info(f"Found transcript in language: {transcript.language}")
+                        break
+                    except Exception:
+                        continue
+            except Exception as e2:
+                logger.error(f"No transcripts available for video {video_id}: {e2}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No captions/transcript available for this video. "
+                           f"The video may not have captions enabled."
+                )
+
+        if not transcript_segments:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not retrieve transcript for this video. "
+                       "The video may not have captions enabled."
+            )
+
+        # 3. Build full transcript text with timestamps
+        #    New API returns FetchedTranscriptSnippet objects with .text, .start, .duration
+        text_parts = []
+        for seg in transcript_segments:
+            start_sec = int(getattr(seg, 'start', 0))
+            minutes = start_sec // 60
+            seconds = start_sec % 60
+            timestamp = f"[{minutes}:{seconds:02d}]"
+            text = getattr(seg, 'text', '').strip()
+            if text:
+                link = f"https://www.youtube.com/watch?v={video_id}&t={start_sec}s"
+                text_parts.append(f"{timestamp} ({link}) {text}")
+
+        if not text_parts:
+            raise HTTPException(status_code=400, detail="Transcript was empty")
+
+        # Try to get video title via a lightweight page fetch
+        video_title = f"YouTube Video {video_id}"
+        try:
+            resp = requests.get(
+                f"https://www.youtube.com/watch?v={video_id}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10
+            )
+            if resp.ok:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                if soup.title and soup.title.string:
+                    raw_title = soup.title.string.strip()
+                    # Remove " - YouTube" suffix
+                    if raw_title.endswith(" - YouTube"):
+                        raw_title = raw_title[:-10].strip()
+                    if raw_title:
+                        video_title = raw_title
+        except Exception:
+            pass  # Keep default title
+
+        full_text = (
+            f"# {video_title}\n\n"
+            f"Source: {url}\n"
+            f"Video ID: {video_id}\n\n"
+            f"## Transcript\n\n" +
+            "\n".join(text_parts)
+        )
+
+        # 4. Save as .txt file (same approach as ingest_url)
+        safe_name = re.sub(r"[^a-zA-Z0-9]", "_", video_title)[:50]
+        filename = f"youtube_{safe_name}_{video_id}.txt"
+        user_dir = WRITE_RESOURCES_DIR / current_user.id
+        user_dir.mkdir(parents=True, exist_ok=True)
+        file_path = user_dir / filename
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(full_text)
+
+        file_size = len(full_text.encode("utf-8"))
+        logger.info(f"📝 YouTube transcript saved: {filename} ({file_size} bytes, {len(text_parts)} segments)")
+
+        # 5. Register the file in the database
+        try:
+            user_db.add_user_file(
+                user_id=current_user.id,
+                filename=filename,
+                file_type="txt",
+                file_size=file_size,
+                user_token=current_user.access_token
+            )
+        except Exception as e:
+            logger.warning(f"File registration warning: {e}")
+
+        # 6. Queue background processing (chunking + embedding)
+        job_id = str(uuid.uuid4())
+        try:
+            supabase.table("batch_jobs").insert({
+                "id": job_id,
+                "user_id": current_user.id,
+                "doc_name": filename,
+                "status": "queued",
+                "progress": 0,
+                "total_steps": 4,
+                "completed_steps": 0
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Batch job creation warning: {e}")
+        _enqueue_processing(current_user.id, filename, current_user.access_token, job_id)
+
+        return {
+            "success": True,
+            "title": video_title,
+            "video_id": video_id,
+            "filename": filename,
+            "transcript_length": len(full_text),
+            "segments": len(text_parts),
+            "batch_job_id": job_id,
+            "message": f"YouTube video '{video_title}' transcript extracted! Processing in background."
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"YouTube processing failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1821,14 +2138,6 @@ async def edtech_generate_video(
     """
     Generate an AI Teacher video for the Individual Learner role.
     Uses LOCAL TTS+Video engine (OpenAI TTS + moviepy — no paid video API).
-    Endpoint URL unchanged so the frontend requires no changes.
-
-    Steps:
-      1. Check Supabase ai_videos cache → return instantly if already done
-      2. Retrieve RAG context (Pinecone) for the requested topic
-      3. Generate a professional narration script via GPT
-      4. Local pipeline: TTS audio → Pillow frames → moviepy MP4
-      5. Upload to Supabase Storage → cache URL in ai_videos table
     """
     try:
         from local_video_service import (
@@ -1918,8 +2227,6 @@ async def edtech_generate_video(
         )
 
         # Make video_url absolute so the browser can load it directly.
-        # Supabase URLs are already absolute (https://...);
-        # local fallback paths like /static/videos/x.mp4 need the base URL.
         video_url = result["video_url"]
         if video_url and video_url.startswith("/"):
             base = str(request.base_url).rstrip("/")
@@ -1939,6 +2246,157 @@ async def edtech_generate_video(
     except Exception as e:
         logger.error(f"Local video generation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Video generation failed: {str(e)}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Professional HeyGen Avatar Video — premium AI presenter with subtitles
+# ════════════════════════════════════════════════════════════════════════════
+@app.post("/api/edtech/generate-heygen-video")
+async def edtech_generate_heygen_video(
+    request: Request,
+    topic: str = Form(...),
+    language: str = Form("en"),
+    doc_name: str = Form(""),
+    avatar_type: str = Form("public"),
+    avatar_id: str = Form(""),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Generate a PROFESSIONAL HeyGen avatar video.
+    Uses HeyGen API with language selection (English / Tamil Thanglish)
+    and always-on English subtitles.
+
+    Steps:
+      1. Check Supabase ai_videos cache → return instantly if already done
+      2. Retrieve RAG context (Pinecone) for the requested topic
+      3. Generate a narration script (Thanglish or English) via GPT
+      4. Submit to HeyGen v2 → poll until completed
+      5. Cache in Supabase → return video URL
+    """
+    try:
+        from heygen_service import (
+            generate_heygen_video_sync,
+            generate_heygen_script,
+            get_supabase_cached_video,
+            list_available_avatars,
+        )
+        from embedder import embed_User_query
+        from vectorstore import search_user_documents
+
+        # ── 1. Check Supabase cache (keyed by language + "heygen" prefix) ──
+        cache_topic = f"heygen_{topic}"
+        cached = get_supabase_cached_video(cache_topic, doc_name, language)
+        if cached and cached.get("video_url"):
+            logger.info(f"🎯 HeyGen video cache HIT: {topic} ({language})")
+            return {
+                "success": True,
+                "video_url": cached["video_url"],
+                "video_id": cached.get("video_id", ""),
+                "presenter": cached.get("presenter", "HeyGen Avatar"),
+                "script": cached.get("script", ""),
+                "cached": True,
+            }
+
+        # ── 2. Retrieve relevant RAG context ──
+        loop = asyncio.get_event_loop()
+        query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic))
+
+        if doc_name:
+            from vectorstore import search_by_doc_name
+            results = await loop.run_in_executor(
+                None, lambda: search_by_doc_name(query_vec, doc_name, top_k=8)
+            )
+            if not results:
+                results = await loop.run_in_executor(
+                    None, lambda: search_user_documents(query_vec, current_user.id, top_k=8)
+                )
+        else:
+            results = await loop.run_in_executor(
+                None, lambda: search_user_documents(query_vec, current_user.id, top_k=8)
+            )
+
+        if not results:
+            raise HTTPException(status_code=404, detail="No relevant content found for this topic.")
+
+        context_chunks = [r.get("text", "") for r in results if r.get("text")]
+        combined = "\n\n".join(context_chunks[:6])
+
+        # ── 3. Generate concise HeyGen script (under 1 minute, complete summary) ──
+        script = await loop.run_in_executor(
+            None, lambda: generate_heygen_script(topic, combined, language)
+        )
+        logger.info(f"📝 HeyGen script generated ({len(script)} chars, ~{len(script.split())} words) for '{topic}' [{language}]")
+
+        # ── 4. HeyGen video pipeline (runs in thread pool) ──
+        result = await loop.run_in_executor(
+            None,
+            lambda: generate_heygen_video_sync(
+                script, cache_topic, doc_name, language, avatar_type, avatar_id
+            )
+        )
+
+        return {
+            "success": True,
+            "video_url": result["video_url"],
+            "video_id": result.get("video_id", ""),
+            "presenter": result.get("presenter", "HeyGen Avatar"),
+            "script": script,
+            "cached": result.get("cached", False),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"HeyGen video generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Professional video generation failed: {str(e)}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# List HeyGen Avatars & Talking Photos for the frontend selector
+# ════════════════════════════════════════════════════════════════════════════
+@app.get("/api/edtech/heygen-avatars")
+async def edtech_list_heygen_avatars(
+    current_user: User = Depends(get_current_user)
+):
+    """Return available public avatars and talking photos from HeyGen."""
+    try:
+        from heygen_service import list_available_avatars
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, list_available_avatars)
+        return {"success": True, **result}
+    except Exception as e:
+        logger.error(f"Failed to list HeyGen avatars: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Upload a Talking Photo to HeyGen
+# ════════════════════════════════════════════════════════════════════════════
+@app.post("/api/edtech/heygen-upload-photo")
+async def edtech_upload_talking_photo(
+    photo: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload a user photo to HeyGen as a talking photo avatar."""
+    try:
+        from heygen_service import upload_talking_photo
+        image_bytes = await photo.read()
+        if len(image_bytes) > 10 * 1024 * 1024:  # 10 MB limit
+            raise HTTPException(status_code=400, detail="Image must be under 10 MB")
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: upload_talking_photo(image_bytes, photo.filename or "photo.jpg")
+        )
+        if result.get("success"):
+            return {"success": True, "id": result["id"], "image_url": result["image_url"]}
+        else:
+            raise HTTPException(status_code=500, detail=result.get("error", "Upload failed"))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to upload talking photo: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3234,6 +3692,23 @@ async def billing_plans():
 async def billing_status(current_user: User = Depends(get_current_user)):
     """Return the calling user's current plan and limits."""
     info = get_user_subscription(current_user.id)
+    plan_name = info.get("plan", "free")
+    plan_config = PLANS.get(plan_name, PLANS["free"])
+    # Include the new fields for frontend enforcement
+    info["max_file_size_mb"] = plan_config.get("max_file_size_mb", -1)
+    info["max_total_storage_mb"] = plan_config.get("max_total_storage_mb", -1)
+    info["allowed_file_types"] = plan_config.get("allowed_file_types", "all")
+    # Calculate current storage usage
+    try:
+        user_files_result = supabase.table("user_files") \
+            .select("file_size") \
+            .eq("user_id", current_user.id) \
+            .execute()
+        info["storage_used_mb"] = round(
+            sum(r.get("file_size", 0) for r in (user_files_result.data or [])) / (1024 * 1024), 2
+        )
+    except Exception:
+        info["storage_used_mb"] = 0
     return {"success": True, **info}
 
 
@@ -3350,3 +3825,211 @@ async def billing_sync_subscription(current_user: User = Depends(get_current_use
     except Exception as e:
         logger.error(f"sync-subscription failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ▸  AVATAR VIDEO ENGINE  — Standalone AI video generation endpoints
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/api/avatar-video/generate")
+async def avatar_video_generate(
+    topic: str = Form(...),
+    doc_name: str = Form(""),
+    language: str = Form("en"),
+    voice: str = Form("nova"),
+    avatar_id: str = Form("teacher_female_1"),
+    style: str = Form("educational"),
+    aspect_ratio: str = Form("16:9"),
+    include_captions: bool = Form(True),
+    include_broll: bool = Form(True),
+    video_style: str = Form("educational_diagram"),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Start avatar video generation (runs as a background task).
+    Returns a job_id to poll for status.
+    """
+    from avatar_video_service import generate_avatar_video, update_job_status
+    import threading
+    import hashlib
+    import time
+
+    # Gather content from uploaded doc (if any)
+    content = ""
+    if doc_name:
+        try:
+            import vectorstore as vs
+            chunks = vs.vector_search(topic, doc_name=doc_name, top_k=8)
+            content = "\n\n".join([c.get("text", "") for c in chunks])
+        except Exception:
+            pass
+
+    # Create a unique job ID
+    job_id = hashlib.md5(
+        f"{current_user.id}:{topic}:{language}:{time.time()}".encode()
+    ).hexdigest()[:12]
+
+    update_job_status(job_id, status="queued", progress=0, stage="Queued for processing...")
+
+    def _run_pipeline():
+        try:
+            logger.info(f"🚀 [{job_id}] Background pipeline thread started for topic='{topic}'")
+            result = generate_avatar_video(
+                topic=topic,
+                content=content,
+                user_id=current_user.id,
+                avatar_id=avatar_id,
+                language=language,
+                voice=voice,
+                style=style,
+                aspect_ratio=aspect_ratio,
+                include_captions=include_captions,
+                include_broll=include_broll,
+                job_id=job_id,
+                video_style=video_style,
+            )
+
+            logger.info(f"📋 [{job_id}] Pipeline returned: status={result.get('status')}, error={result.get('error', 'none')}")
+
+            # Update final status from result
+            if result.get("status") == "completed":
+                update_job_status(
+                    job_id,
+                    status="completed",
+                    progress=100,
+                    stage="Complete!",
+                    video_url=result.get("video_url", ""),
+                    video_path=result.get("video_path", ""),
+                )
+
+            # Upload to Supabase Storage if video was generated
+            if result.get("status") == "completed" and result.get("video_path"):
+                try:
+                    video_path = result["video_path"]
+                    storage_key = f"avatar-videos/{current_user.id}/{job_id}.mp4"
+                    with open(video_path, "rb") as f:
+                        video_bytes = f.read()
+                    supabase.storage.from_("tts-cache").upload(
+                        path=storage_key,
+                        file=video_bytes,
+                        file_options={"content-type": "video/mp4", "upsert": "true"},
+                    )
+                    sb_url = os.getenv("SUPABASE_URL", "")
+                    video_url = f"{sb_url}/storage/v1/object/public/tts-cache/{storage_key}"
+                    result["video_url"] = video_url
+                    update_job_status(job_id, video_url=video_url)
+                    logger.info(f"✅ [{job_id}] Avatar video uploaded: {video_url}")
+                except Exception as e:
+                    logger.warning(f"⚠️ [{job_id}] Avatar video upload failed: {e}")
+                    # Still mark as completed — video was generated, just upload failed
+                    # Serve it locally instead
+                    video_path = result.get("video_path", "")
+                    if video_path:
+                        local_url = f"/static/avatar_video_temp/{os.path.basename(video_path)}"
+                        update_job_status(job_id, video_url=local_url)
+                        logger.info(f"📁 [{job_id}] Serving video locally: {local_url}")
+
+        except Exception as e:
+            import traceback
+            logger.error(f"❌ [{job_id}] Avatar video pipeline CRASHED: {e}")
+            logger.error(traceback.format_exc())
+            update_job_status(job_id, status="failed", error=str(e))
+
+    # Run in a background thread
+    thread = threading.Thread(target=_run_pipeline, daemon=True)
+    thread.start()
+
+    return {"success": True, "job_id": job_id, "status": "queued"}
+
+
+@app.get("/api/avatar-video/status/{job_id}")
+async def avatar_video_status(job_id: str, current_user: User = Depends(get_current_user)):
+    """Poll the status of an avatar video generation job."""
+    from avatar_video_service import get_job_status
+    status = get_job_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"success": True, **status}
+
+
+@app.get("/api/avatar-video/avatars")
+async def avatar_video_list_avatars(current_user: User = Depends(get_current_user)):
+    """List all available avatar images."""
+    from avatar_video_service import list_available_avatars
+    avatars = list_available_avatars()
+    return {"success": True, "avatars": avatars}
+
+
+@app.post("/api/avatar-video/avatar/upload")
+async def avatar_video_upload_avatar(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload a custom avatar photo."""
+    from avatar_video_service import AVATAR_DIR
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    import hashlib
+    import time
+    avatar_id = hashlib.md5(f"{current_user.id}:{file.filename}:{time.time()}".encode()).hexdigest()[:8]
+    save_path = AVATAR_DIR / f"custom_{avatar_id}.png"
+
+    content = await file.read()
+    with open(save_path, "wb") as f:
+        f.write(content)
+
+    return {
+        "success": True,
+        "avatar_id": f"custom_{avatar_id}",
+        "message": "Avatar uploaded successfully",
+    }
+
+
+@app.get("/api/avatar-video/list")
+async def avatar_video_list(current_user: User = Depends(get_current_user)):
+    """List all avatar videos generated by the current user."""
+    videos = []
+
+    # Try Supabase Storage first
+    try:
+        sb_url = os.getenv("SUPABASE_URL", "")
+        prefix = f"avatar-videos/{current_user.id}/"
+        files = supabase.storage.from_("tts-cache").list(prefix)
+        for f in (files or []):
+            name = f.get("name", "")
+            if name.endswith(".mp4"):
+                videos.append({
+                    "name": name.replace(".mp4", "").replace("_", " ").title(),
+                    "url": f"{sb_url}/storage/v1/object/public/tts-cache/{prefix}{name}",
+                    "created_at": f.get("created_at", ""),
+                    "source": "cloud",
+                })
+    except Exception as e:
+        logger.warning(f"Supabase list failed: {e}")
+
+    # Always also scan local files (fallback / primary for local dev)
+    try:
+        import pathlib
+        local_dir = pathlib.Path(__file__).parent / "static" / "avatar_video_temp"
+        if local_dir.exists():
+            for mp4 in sorted(local_dir.glob("*_final.mp4"), key=lambda p: p.stat().st_mtime, reverse=True):
+                local_url = f"/static/avatar_video_temp/{mp4.name}"
+                # Avoid duplicates if already listed from Supabase
+                if not any(v.get("url", "").endswith(mp4.name) for v in videos):
+                    import datetime
+                    mtime = datetime.datetime.fromtimestamp(mp4.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                    size_mb = mp4.stat().st_size / (1024 * 1024)
+                    job_id = mp4.stem.replace("_final", "")
+                    videos.append({
+                        "name": f"Video {job_id[:8]}",
+                        "url": local_url,
+                        "created_at": mtime,
+                        "size": f"{size_mb:.1f} MB",
+                        "source": "local",
+                    })
+    except Exception as e:
+        logger.warning(f"Local video scan failed: {e}")
+
+    return {"success": True, "videos": videos}
+

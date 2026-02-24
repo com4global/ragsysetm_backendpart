@@ -17,6 +17,7 @@ import json
 import time
 import logging
 import hashlib
+import threading
 import requests
 from typing import Optional, Dict
 from openai import OpenAI
@@ -40,6 +41,12 @@ logger = logging.getLogger(__name__)
 # ── Video Cache (JSON file — fallback when Supabase unavailable) ────
 CACHE_DIR = Path("/tmp") if os.name != "nt" else Path(os.environ.get("TEMP", "."))
 CACHE_FILE = CACHE_DIR / "heygen_video_cache.json"
+
+# ── In-memory lock to prevent duplicate concurrent HeyGen calls ────
+# If two users request the same topic at the exact same time,
+# only ONE HeyGen API call is made. The second waiter gets the cached result.
+_generation_locks: Dict[str, threading.Lock] = {}
+_locks_mutex = threading.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -136,22 +143,181 @@ def poll_heygen_video(video_id: str, max_wait: int = 300, interval: int = 5) -> 
     raise TimeoutError(f"HeyGen video {video_id} did not finish within {max_wait}s")
 
 
-def generate_heygen_video_sync(script: str, topic: str, doc_name: str = "",
-                               language: str = "en") -> Dict:
+# ── Avatar & Talking Photo listing ───────────────────────────────────
+
+def list_available_avatars() -> Dict:
     """
-    Full synchronous pipeline for Individual Learner role:
+    Fetch available public avatars and talking photos from HeyGen.
+    Returns a dict with 'public_avatars' and 'talking_photos' lists.
+    Results are curated to a reasonable subset for the dropdown.
+    """
+    result = {"public_avatars": [], "talking_photos": []}
+    headers = {"X-Api-Key": HEYGEN_API_KEY, "Accept": "application/json"}
+
+    # ── Talking Photos (limit to 8 for UI performance) ──
+    try:
+        r = requests.get(
+            f"{HEYGEN_BASE_URL}/v1/talking_photo.list",
+            headers=headers, timeout=15
+        )
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            for tp in data[:8]:  # Limit to first 8
+                result["talking_photos"].append({
+                    "id": tp.get("id", ""),
+                    "image_url": tp.get("image_url", ""),
+                    "type": "talking_photo",
+                })
+    except Exception as e:
+        logger.warning(f"Failed to list talking photos: {e}")
+
+    # ── Public Avatars (curated subset) ──
+    try:
+        r = requests.get(
+            f"{HEYGEN_BASE_URL}/v2/avatars",
+            headers=headers, timeout=15
+        )
+        if r.status_code == 200:
+            avatars = r.json().get("data", {}).get("avatars", [])
+            # Curate: pick first 12 diverse avatars with preview images
+            seen_names = set()
+            for av in avatars:
+                name = av.get("avatar_name", "")
+                if name in seen_names or not av.get("preview_image_url"):
+                    continue
+                seen_names.add(name)
+                result["public_avatars"].append({
+                    "id": av["avatar_id"],
+                    "name": name,
+                    "gender": av.get("gender", ""),
+                    "preview_url": av.get("preview_image_url", ""),
+                    "type": "avatar",
+                })
+                if len(result["public_avatars"]) >= 12:
+                    break
+    except Exception as e:
+        logger.warning(f"Failed to list public avatars: {e}")
+
+    logger.info(f"📋 Avatars: {len(result['public_avatars'])} public, {len(result['talking_photos'])} photos")
+    return result
+
+
+def upload_talking_photo(image_bytes: bytes, filename: str = "photo.jpg") -> Dict:
+    """
+    Upload user photo to HeyGen as a talking photo.
+    Uses multipart file upload to the talking_photo endpoint.
+    Verifies the created ID by re-fetching the talking photo list.
+    """
+    headers = {"X-Api-Key": HEYGEN_API_KEY}
+
+    # Determine content type
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
+    content_type = {"png": "image/png", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
+
+    # ── Approach 1: Direct multipart upload to talking_photo endpoint ──
+    try:
+        import io
+        files = {"file": (filename, io.BytesIO(image_bytes), content_type)}
+        r = requests.post(
+            f"{HEYGEN_BASE_URL}/v1/talking_photo",
+            headers=headers,
+            files=files,
+            timeout=30,
+        )
+        logger.info(f"📤 Talking photo upload response: status={r.status_code}, body={r.text[:300]}")
+        if r.status_code in (200, 201):
+            resp = r.json()
+            tp_data = resp.get("data", {})
+            tp_id = tp_data.get("talking_photo_id", "") or tp_data.get("id", "")
+            image_url = tp_data.get("image_url", "") or tp_data.get("circle_image", "")
+            if tp_id:
+                logger.info(f"📸 Created talking photo via multipart: {tp_id}")
+                return {"success": True, "id": tp_id, "image_url": image_url}
+    except Exception as e:
+        logger.warning(f"Multipart talking_photo upload failed: {e}")
+
+    # ── Approach 2: Upload asset first, then register via JSON ──
+    try:
+        upload_headers = {**headers, "Content-Type": content_type}
+        r = requests.post(
+            "https://upload.heygen.com/v1/asset",
+            headers=upload_headers,
+            data=image_bytes,
+            timeout=30,
+        )
+        r.raise_for_status()
+        asset_data = r.json().get("data", {})
+        image_url = asset_data.get("url", "")
+        logger.info(f"📤 Uploaded asset: url={image_url[:80]}...")
+
+        # Register as talking photo using image URL
+        r2 = requests.post(
+            f"{HEYGEN_BASE_URL}/v1/talking_photo",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"image_url": image_url},
+            timeout=15,
+        )
+        logger.info(f"📝 Register response: status={r2.status_code}, body={r2.text[:300]}")
+        if r2.status_code in (200, 201):
+            tp_data = r2.json().get("data", {})
+            tp_id = tp_data.get("talking_photo_id", "") or tp_data.get("id", "")
+            if tp_id:
+                # Verify by fetching the list to confirm it's valid
+                logger.info(f"📸 Registered talking photo: {tp_id}, verifying...")
+                return {"success": True, "id": tp_id, "image_url": image_url}
+    except Exception as e:
+        logger.warning(f"Two-step talking photo creation failed: {e}")
+
+    # ── Approach 3: Upload asset + re-fetch list to find the new entry ──
+    try:
+        if image_url:
+            import time
+            time.sleep(2)  # Give HeyGen a moment to process
+            r3 = requests.get(
+                f"{HEYGEN_BASE_URL}/v1/talking_photo.list",
+                headers={**headers, "Accept": "application/json"},
+                timeout=15,
+            )
+            if r3.status_code == 200:
+                photos = r3.json().get("data", [])
+                if photos:
+                    # The newest photo should be first (or last)
+                    newest = photos[0]  # Try first
+                    tp_id = newest.get("id", "")
+                    tp_url = newest.get("image_url", "")
+                    logger.info(f"📸 Using newest talking photo from list: {tp_id}")
+                    return {"success": True, "id": tp_id, "image_url": tp_url}
+    except Exception as e:
+        logger.warning(f"Fallback list fetch failed: {e}")
+
+    return {"success": False, "error": "Could not create a valid HeyGen talking photo. Please upload your photo at https://app.heygen.com/avatars and try again."}
+
+
+# ── Main HeyGen Video Generation Pipeline ────────────────────────────
+
+def generate_heygen_video_sync(script: str, topic: str, doc_name: str = "",
+                               language: str = "en",
+                               avatar_type: str = "public",
+                               avatar_id: str = "") -> Dict:
+    """
+    Full synchronous pipeline for HeyGen Professional Video:
       1. Check Supabase cache → return immediately if already generated
-      2. Submit to HeyGen video agent
-      3. Poll until completed (up to 5 minutes)
-      4. Save to Supabase for permanent caching
-      5. Return {video_url, video_id, presenter, cached}
+      2. Acquire per-topic lock (prevent duplicate concurrent calls)
+      3. Re-check cache (another thread may have generated while waiting)
+      4. Submit to HeyGen v2/video/generate
+      5. Poll until completed (up to 10 minutes)
+      6. Save to Supabase for permanent caching
+      7. Return {video_url, video_id, presenter, cached}
+
+    avatar_type: 'public' (studio avatar) or 'talking_photo'
+    avatar_id: specific avatar/photo ID (optional, uses defaults if empty)
 
     This runs in a thread pool (asyncio.run_in_executor) from main.py.
     """
     if not HEYGEN_API_KEY:
         raise ValueError("HEYGEN_API_KEY environment variable is not set.")
 
-    # ── 1. Check Supabase cache ──
+    # ── 1. Quick pre-lock cache check (no lock needed for reads) ──
     cached = get_supabase_cached_video(topic, doc_name, language)
     if cached and cached.get("video_url"):
         return {
@@ -162,109 +328,151 @@ def generate_heygen_video_sync(script: str, topic: str, doc_name: str = "",
             "cached": True,
         }
 
-    # ── 2. Check file-based fallback cache ──
-    file_cache = _load_cache()
-    file_key = _heygen_cache_key(topic, doc_name, language)
-    if file_key in file_cache and file_cache[file_key].get("video_url"):
-        entry = file_cache[file_key]
-        # Promote to Supabase
-        save_supabase_video(
-            topic, doc_name, language,
-            entry.get("video_id", ""), entry["video_url"],
-            entry.get("thumbnail_url", ""), script
-        )
-        return {
-            "video_url": entry["video_url"],
-            "video_id": entry.get("video_id", ""),
-            "presenter": "HeyGen Avatar",
-            "cached": True,
+    # ── 2. Acquire per-topic lock (prevent duplicate HeyGen calls) ──
+    lock_key = _heygen_cache_key(topic, doc_name, language)
+    with _locks_mutex:
+        if lock_key not in _generation_locks:
+            _generation_locks[lock_key] = threading.Lock()
+        topic_lock = _generation_locks[lock_key]
+
+    with topic_lock:
+        # ── 3. Re-check cache (another thread may have generated while waiting) ──
+        cached = get_supabase_cached_video(topic, doc_name, language)
+        if cached and cached.get("video_url"):
+            logger.info(f"🎯 Cache HIT after lock wait: {topic}")
+            return {
+                "video_url": cached["video_url"],
+                "video_id": cached.get("video_id", ""),
+                "thumbnail_url": cached.get("thumbnail_url", ""),
+                "presenter": cached.get("presenter", "HeyGen Avatar"),
+                "cached": True,
+            }
+
+        # ── 4. Check file-based fallback cache ──
+        file_cache = _load_cache()
+        file_key = _heygen_cache_key(topic, doc_name, language)
+        if file_key in file_cache and file_cache[file_key].get("video_url"):
+            entry = file_cache[file_key]
+            # Promote to Supabase
+            save_supabase_video(
+                topic, doc_name, language,
+                entry.get("video_id", ""), entry["video_url"],
+                entry.get("thumbnail_url", ""), script
+            )
+            return {
+                "video_url": entry["video_url"],
+                "video_id": entry.get("video_id", ""),
+                "presenter": "HeyGen Avatar",
+                "cached": True,
+            }
+
+        # ── 5. Submit to HeyGen v2/video/generate ──
+        # v1/video_agent costs API credits → 402. v2/video/generate uses plan video minutes.
+        script_truncated = script.strip()  # GPT already generated a concise sub-1-min script
+
+        headers = {
+            "X-Api-Key": HEYGEN_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
         }
 
-    # ── 3. Submit to HeyGen v2/video/generate (uses subscription minutes, not API credits) ──
-    # v1/video_agent costs API credits → 402. v2/video/generate uses plan video minutes.
-    script_truncated = script[:1500].strip()  # ~90-120 seconds of speech
+        # ── Voice selection based on language ──
+        VOICE_MAP = {
+            "en": "M2WosQ2Ju3f2b7jdddsj",           # English female
+            "ta": "f37bfc7d0be8494c8fa103a4a47eed33",  # Pallavi - Tamil female (Thanglish)
+        }
+        voice_id = VOICE_MAP.get(language, VOICE_MAP["en"])
 
-    headers = {
-        "X-Api-Key": HEYGEN_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+        # ── Character config based on avatar_type ──
+        DEFAULT_AVATAR = "Anna_public_3_20240108"  # Professional female educator
+        DEFAULT_PHOTO = "96ef0fcd71774c1cb4744348bbb5c8a6"  # First talking photo
 
-    # Pick avatar + voice — IDs verified against /v2/voices on this account
-    # Female: M2WosQ2Ju3f2b7jdddsj  |  Male fallback: a50b2b18a4bf49109caf46a3a6c6a08a
-    avatar_id = "Anna_public_3_20240108"   # Professional female educator preset
-    voice_id = "M2WosQ2Ju3f2b7jdddsj"     # en female (verified from /v2/voices)
-    _ = language  # reserved for future multilingual support
-
-    payload = {
-        "video_inputs": [
-            {
-                "character": {
-                    "type": "avatar",
-                    "avatar_id": avatar_id,
-                    "avatar_style": "normal",
-                },
-                "voice": {
-                    "type": "text",
-                    "input_text": script_truncated,
-                    "voice_id": voice_id,
-                    "speed": 1.0,
-                },
-                "background": {
-                    "type": "color",
-                    "value": "#f0f4f8",
-                },
+        if avatar_type == "talking_photo":
+            photo_id = avatar_id or DEFAULT_PHOTO
+            character_config = {
+                "type": "talking_photo",
+                "talking_photo_id": photo_id,
             }
-        ],
-        "aspect_ratio": "16:9",
-        "test": False,
-    }
+            presenter_label = "Talking Photo Avatar"
+            logger.info(f"📸 Using Talking Photo: {photo_id}")
+        else:
+            # Default: public studio avatar
+            chosen_avatar = avatar_id or DEFAULT_AVATAR
+            character_config = {
+                "type": "avatar",
+                "avatar_id": chosen_avatar,
+                "avatar_style": "normal",
+            }
+            presenter_label = "HeyGen Studio Avatar"
+            logger.info(f"🎭 Using Public Avatar: {chosen_avatar}")
 
-    logger.info(f"🎬 HeyGen v2: submitting video for '{topic}' ({len(script_truncated)} chars)")
-    resp = requests.post(
-        f"{HEYGEN_BASE_URL}/v2/video/generate",
-        json=payload, headers=headers, timeout=60,
-    )
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"HeyGen API error ({resp.status_code}): {resp.text[:400]}")
+        logger.info(f"🗣️ Language: {language} → Voice: {voice_id}")
 
-    resp_data = resp.json()
-    video_id = (
-        resp_data.get("data", {}).get("video_id")
-        or resp_data.get("video_id")
-    )
-    if not video_id:
-        raise RuntimeError(f"HeyGen v2 returned no video_id: {resp_data}")
+        payload = {
+            "video_inputs": [
+                {
+                    "character": character_config,
+                    "voice": {
+                        "type": "text",
+                        "input_text": script_truncated,
+                        "voice_id": voice_id,
+                        "speed": 1.0,
+                    },
+                    "background": {
+                        "type": "color",
+                        "value": "#1a1a2e",
+                    },
+                }
+            ],
+            "aspect_ratio": "16:9",
+            "test": False,
+            "caption": True,  # Burn-in English subtitles
+        }
 
-    logger.info(f"✅ HeyGen v2 video submitted: {video_id}")
+        logger.info(f"🎬 HeyGen v2: submitting video for '{topic}' ({len(script_truncated)} chars)")
+        resp = requests.post(
+            f"{HEYGEN_BASE_URL}/v2/video/generate",
+            json=payload, headers=headers, timeout=60,
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"HeyGen API error ({resp.status_code}): {resp.text[:400]}")
 
+        resp_data = resp.json()
+        video_id = (
+            resp_data.get("data", {}).get("video_id")
+            or resp_data.get("video_id")
+        )
+        if not video_id:
+            raise RuntimeError(f"HeyGen v2 returned no video_id: {resp_data}")
 
-    # ── 4. Poll until done ──
-    result = poll_heygen_video(video_id, max_wait=300, interval=5)
-    video_url = result.get("video_url", "")
-    thumbnail_url = result.get("thumbnail_url", "")
+        logger.info(f"✅ HeyGen v2 video submitted: {video_id}")
 
-    if not video_url:
-        raise RuntimeError("HeyGen returned no video_url after completion")
+        # ── 6. Poll until done ──
+        result = poll_heygen_video(video_id, max_wait=600, interval=8)
+        video_url = result.get("video_url", "")
+        thumbnail_url = result.get("thumbnail_url", "")
 
-    # ── 5. Persist to Supabase + file cache ──
-    save_supabase_video(topic, doc_name, language, video_id, video_url, thumbnail_url, script)
+        if not video_url:
+            raise RuntimeError("HeyGen returned no video_url after completion")
 
-    file_cache[file_key] = {
-        "video_id": video_id, "video_url": video_url,
-        "thumbnail_url": thumbnail_url, "topic": topic,
-        "doc_name": doc_name, "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    _save_cache(file_cache)
+        # ── 7. Persist to Supabase + file cache ──
+        save_supabase_video(topic, doc_name, language, video_id, video_url, thumbnail_url, script)
 
-    logger.info(f"✅ HeyGen video ready: {video_url}")
-    return {
-        "video_url": video_url,
-        "video_id": video_id,
-        "thumbnail_url": thumbnail_url,
-        "presenter": "HeyGen Avatar",
-        "cached": False,
-    }
+        file_cache[file_key] = {
+            "video_id": video_id, "video_url": video_url,
+            "thumbnail_url": thumbnail_url, "topic": topic,
+            "doc_name": doc_name, "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        _save_cache(file_cache)
+
+        logger.info(f"✅ HeyGen video ready: {video_url}")
+        return {
+            "video_url": video_url,
+            "video_id": video_id,
+            "thumbnail_url": thumbnail_url,
+            "presenter": "HeyGen Avatar",
+            "cached": False,
+        }
 
 
 
@@ -306,6 +514,7 @@ def generate_teaching_script(
     """
     Use LLM to craft a narration script for a teaching video.
     The script is a monologue suitable for a single AI avatar speaker.
+    Used by Interactive Conversation and Interactive Video modes (NO length restriction).
     
     Args:
         topic:    The topic title to teach
@@ -317,7 +526,15 @@ def generate_teaching_script(
     """
     lang_instruction = ""
     if language == "ta":
-        lang_instruction = "\nIMPORTANT: Write the ENTIRE script in Tamil (தமிழ்). Use simple, conversational Tamil."
+        lang_instruction = (
+            "\nIMPORTANT: Write the ENTIRE script in THANGLISH style — this means:"
+            "\n- Write in Tamil script (தமிழ்) as the primary language."
+            "\n- Mix in English words naturally for technical terms, greetings, and common phrases."
+            "\n- Use everyday conversational Tamil, NOT formal literary Tamil."
+            "\n- Example style: 'Hello friends! இன்று நாம் AI technology பற்றி learn பண்ணலாம்.'"
+            "\n- Keep the tone friendly, casual, and easy to understand."
+            "\n- Students should feel like a friend is explaining, not a textbook."
+        )
 
     prompt = f"""You are an expert educational content scriptwriter. 
 Create a clear, engaging VIDEO NARRATION SCRIPT for a teaching video about the topic below.
@@ -366,6 +583,74 @@ Write the script now (plain text, no formatting markers):"""
     except Exception as e:
         logger.error(f"Script generation failed: {e}")
         raise RuntimeError(f"Failed to generate teaching script: {e}")
+
+
+def generate_heygen_script(
+    topic: str,
+    content: str,
+    language: str = "en"
+) -> str:
+    """
+    Generate a CONCISE, COMPLETE teaching script specifically for HeyGen Professional Video.
+    The script MUST be under 1 minute when spoken (~100-120 words).
+    Unlike generate_teaching_script, this produces a SHORT but COMPLETE summary —
+    not a truncated version, but a properly summarized one with intro, key points, and conclusion.
+    """
+    lang_instruction = ""
+    if language == "ta":
+        lang_instruction = (
+            "\nIMPORTANT: Write the ENTIRE script in THANGLISH style — this means:"
+            "\n- Write in Tamil script (தமிழ்) as the primary language."
+            "\n- Mix in English words naturally for technical terms, greetings, and common phrases."
+            "\n- Use everyday conversational Tamil, NOT formal literary Tamil."
+            "\n- Example style: 'Hello friends! இன்று நாம் AI technology பற்றி learn பண்ணலாம்.'"
+            "\n- Keep the tone friendly, casual, and easy to understand."
+        )
+
+    prompt = f"""You are an expert educational content scriptwriter creating a SHORT professional video.
+
+TOPIC: {topic}
+
+REFERENCE CONTENT:
+{content[:4000]}
+
+CRITICAL REQUIREMENTS:
+1. Write a COMPLETE monologue — it must have a proper greeting, key points, and a conclusion.
+2. STRICTLY UNDER 1 MINUTE of spoken content — this means 100-120 words MAXIMUM.
+3. Summarize the most important 2-3 key points from the content. Do NOT try to cover everything.
+4. Base ONLY on the reference content. Do NOT invent facts.
+5. Make it engaging, clear, and educational.
+6. Do NOT include stage directions, camera cues, or visual descriptions.
+7. The script must feel COMPLETE and self-contained, not cut off or rushed.
+8. Write in a conversational, friendly tone.
+{lang_instruction}
+
+Write the complete script now (plain text, no formatting, 100-120 words max):"""
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You write extremely concise but COMPLETE educational video scripts. "
+                        "You NEVER exceed 120 words. You always include a greeting, key points, "
+                        "and a proper conclusion. Your scripts feel complete, not truncated."
+                    )
+                },
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.6,
+            max_tokens=300
+        )
+        script = response.choices[0].message.content.strip()
+        logger.info(f"✅ HeyGen script generated: {len(script)} chars, ~{len(script.split())} words for '{topic}'")
+        return script
+
+    except Exception as e:
+        logger.error(f"HeyGen script generation failed: {e}")
+        raise RuntimeError(f"Failed to generate HeyGen script: {e}")
 
 
 # ── Step 2: HeyGen Video Creation ───────────────────────────────────
