@@ -3872,6 +3872,8 @@ async def avatar_video_generate(
                     stage="Complete!",
                     video_url=result.get("video_url", ""),
                     video_path=result.get("video_path", ""),
+                    scenes=result.get("scenes", []),
+                    scene_timings=result.get("scene_timings", []),
                 )
 
             # Upload to Supabase Storage if video was generated

@@ -62,81 +62,52 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 # ── Pre-made Avatars ────────────────────────────────────────────────
 DEFAULT_AVATARS = [
     {
-        "id": "teacher_female_1",
-        "name": "Professor Maya",
-        "description": "Professional female teacher",
-        "image": "teacher_female_1.png",
+        "id": "avatar_priya",
+        "name": "Priya",
+        "description": "Corporate professional, warm and confident",
+        "image": "avatar_priya.png",
         "style": "professional",
+        "gender": "female",
     },
     {
-        "id": "teacher_male_1",
+        "id": "avatar_james",
         "name": "Dr. James",
-        "description": "Academic male professor",
-        "image": "teacher_male_1.png",
+        "description": "Senior academic, clear and authoritative",
+        "image": "avatar_james.png",
         "style": "academic",
+        "gender": "male",
     },
     {
-        "id": "presenter_female_1",
-        "name": "Sarah",
-        "description": "Casual female presenter",
-        "image": "presenter_female_1.png",
+        "id": "avatar_mei",
+        "name": "Mei",
+        "description": "Approachable educator, warm and friendly",
+        "image": "avatar_mei.png",
         "style": "casual",
+        "gender": "female",
     },
     {
-        "id": "presenter_male_1",
-        "name": "Alex",
-        "description": "Modern male presenter",
-        "image": "presenter_male_1.png",
+        "id": "avatar_marcus",
+        "name": "Marcus",
+        "description": "Dynamic presenter, confident and engaging",
+        "image": "avatar_marcus.png",
         "style": "modern",
+        "gender": "male",
     },
     {
-        "id": "corporate_female_1",
-        "name": "Diana",
-        "description": "Corporate female executive",
-        "image": "corporate_female_1.png",
-        "style": "corporate",
+        "id": "avatar_sofia",
+        "name": "Sofia",
+        "description": "Friendly instructor, natural and expressive",
+        "image": "avatar_sofia.png",
+        "style": "casual",
+        "gender": "female",
     },
     {
-        "id": "corporate_male_1",
-        "name": "Michael",
-        "description": "Corporate male executive",
-        "image": "corporate_male_1.png",
-        "style": "corporate",
-    },
-    {
-        "id": "banana_character",
-        "name": "Banana Buddy",
-        "description": "Fun banana character",
-        "image": "banana_character.png",
-        "style": "fun",
-    },
-    {
-        "id": "robot_buddy",
-        "name": "Robo Teacher",
-        "description": "Friendly robot assistant",
-        "image": "robot_buddy.png",
-        "style": "fun",
-    },
-    {
-        "id": "cat_presenter",
-        "name": "Professor Whiskers",
-        "description": "Adorable cat presenter",
-        "image": "cat_presenter.png",
-        "style": "fun",
-    },
-    {
-        "id": "red_car",
-        "name": "Red Racer",
-        "description": "Sporty red car character",
-        "image": "red_car.png",
-        "style": "fun",
-    },
-    {
-        "id": "dog_buddy",
-        "name": "Doggo",
-        "description": "Friendly dog presenter",
-        "image": "dog_buddy.png",
-        "style": "fun",
+        "id": "avatar_omar",
+        "name": "Omar",
+        "description": "Knowledgeable educator, genuine and warm",
+        "image": "avatar_omar.png",
+        "style": "academic",
+        "gender": "male",
     },
 ]
 
@@ -678,8 +649,8 @@ def generate_talking_head(
                 "driven_audio": audio_url,
                 "pose_style": 0,
                 "facerender": "facevid2vid",
-                "expression_scale": 0.5,  # Low value to minimize ghost mouth during silence
-                "still": True,           # Keep head still, only animate mouth
+                "expression_scale": 1.5,  # Higher value for more pronounced lip/mouth movement
+                "still": False,           # Allow natural head movement for realism
                 "preprocess": "full",     # Keep full image (crop outputs only 256x256 face)
             },
             timeout=300,
@@ -713,14 +684,29 @@ def generate_all_talking_heads(
     audio_paths: List[Optional[str]],
     job_id: str,
 ) -> List[Optional[str]]:
-    """Generate talking head clips for all scenes (sequentially — Replicate rate limits)."""
-    clips = []
-    for idx, ap in enumerate(audio_paths):
-        if ap:
-            clip = generate_talking_head(avatar_image_path, ap, idx, job_id)
-            clips.append(clip)
-        else:
-            clips.append(None)
+    """Generate talking head clips for all scenes in PARALLEL for speed."""
+    n = len(audio_paths)
+    clips: List[Optional[str]] = [None] * n
+
+    # Build list of (index, audio_path) for scenes that have audio
+    tasks = [(idx, ap) for idx, ap in enumerate(audio_paths) if ap]
+
+    if not tasks:
+        return clips
+
+    logger.info(f"🚀 [{job_id}] Generating {len(tasks)} lip-sync clips in parallel...")
+
+    def _gen(idx_ap):
+        idx, ap = idx_ap
+        return idx, generate_talking_head(avatar_image_path, ap, idx, job_id)
+
+    # Max 2 parallel to respect Replicate rate limits
+    with ThreadPoolExecutor(max_workers=min(2, len(tasks))) as pool:
+        for idx, clip in pool.map(_gen, tasks):
+            clips[idx] = clip
+
+    done = sum(1 for c in clips if c)
+    logger.info(f"✅ [{job_id}] Parallel lip-sync complete: {done}/{n} clips generated")
     return clips
 
 
@@ -1433,108 +1419,109 @@ def compose_final_video(
         update_job_status(job_id, status="failed", error=err)
         return None
 
-    # ── Concatenate with crossfade transitions ──
+    # ── Concatenate scenes (sync-safe: no xfade overlap) ──
+    # IMPORTANT: We use concat-demuxer instead of xfade because:
+    #  - xfade shortens video by TRANSITION_DURATION per join but audio stays
+    #    full-length → cumulative A/V drift that breaks lip-sync
+    #  - xfade blends two avatar faces together → ugly visual glitch
+    # Instead, each scene gets a short fade-out/fade-in for smooth transitions
+    # while preserving exact per-clip A/V synchronization.
     try:
-        update_job_status(job_id, progress=93, stage="Adding transitions & music...")
-        logger.info(f"🔗 [{job_id}] Joining {len(scene_files)} scenes with transitions...")
+        update_job_status(job_id, progress=93, stage="Joining scenes...")
+        logger.info(f"🔗 [{job_id}] Joining {len(scene_files)} scenes (sync-safe concat)...")
+
+        FADE_DUR = 0.3  # seconds of fade-in/out per scene edge
 
         if len(scene_files) == 1:
-            # Single scene — just copy it
-            import shutil
             pre_music_path = scene_files[0]
         else:
-            # Use xfade for transitions between scenes
             pre_music_path = WORK_DIR / f"{job_id}_pre_music.mp4"
 
-            # Get durations of each scene
-            scene_durations = []
-            for sf in scene_files:
+            # Step 1: Add fade-in/out to each scene for smooth visual transitions
+            faded_files = []
+            for idx_f, sf in enumerate(scene_files):
+                faded_out = WORK_DIR / f"{job_id}_faded_{idx_f}.mp4"
                 try:
-                    probe = subprocess.run(
+                    # Get scene duration for fade-out offset
+                    dur_probe = subprocess.run(
                         ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
                          "-of", "default=noprint_wrappers=1:nokey=1", str(sf)],
                         capture_output=True, text=True, timeout=10
                     )
-                    scene_durations.append(float(probe.stdout.strip()))
+                    sdur = float(dur_probe.stdout.strip())
                 except Exception:
-                    scene_durations.append(10.0)
+                    sdur = 10.0
 
-            # Build xfade chain: [0][1]xfade -> [result][2]xfade -> ...
-            xfade_cmd = ["ffmpeg", "-y"]
-            for sf in scene_files:
-                xfade_cmd += ["-i", str(sf)]
+                fade_out_start = max(0, sdur - FADE_DUR)
+                # Build fade filter: fade-in at start, fade-out at end
+                # First scene: no fade-in; Last scene: no fade-out
+                vf_parts = []
+                af_parts = []
+                if idx_f > 0:
+                    vf_parts.append(f"fade=t=in:st=0:d={FADE_DUR}")
+                    af_parts.append(f"afade=t=in:st=0:d={FADE_DUR}")
+                if idx_f < len(scene_files) - 1:
+                    vf_parts.append(f"fade=t=out:st={fade_out_start}:d={FADE_DUR}")
+                    af_parts.append(f"afade=t=out:st={fade_out_start}:d={FADE_DUR}")
 
-            # Build filter for xfade chain
-            xfade_filters = []
-            audio_filters = []
-            n = len(scene_files)
-            transition_types = ["fade", "fadeblack", "dissolve", "slideleft", "slideup"]
+                if vf_parts:
+                    fade_cmd = [
+                        "ffmpeg", "-y", "-i", str(sf),
+                        "-vf", ",".join(vf_parts),
+                        "-af", ",".join(af_parts),
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-pix_fmt", "yuv420p",
+                        str(faded_out)
+                    ]
+                    r = subprocess.run(fade_cmd, capture_output=True, text=True, timeout=120)
+                    if r.returncode == 0 and faded_out.exists():
+                        faded_files.append(faded_out)
+                    else:
+                        logger.warning(f"   [{job_id}] Fade for scene {idx_f} failed, using raw clip")
+                        faded_files.append(sf)
+                else:
+                    faded_files.append(sf)
 
-            if n == 2:
-                offset = max(0, scene_durations[0] - TRANSITION_DURATION)
-                t = transition_types[0]
-                xfade_filters.append(
-                    f"[0:v][1:v]xfade=transition={t}:duration={TRANSITION_DURATION}:offset={offset}[outv]"
-                )
-                audio_filters.append(
-                    f"[0:a][1:a]acrossfade=d={TRANSITION_DURATION}[outa]"
-                )
-            else:
-                # Multi-scene xfade chain
-                cumulative_offset = 0
-                for j in range(n - 1):
-                    t = transition_types[j % len(transition_types)]
-                    offset = cumulative_offset + scene_durations[j] - TRANSITION_DURATION
-                    in_label = f"[v{j}]" if j > 0 else "[0:v]"
-                    out_label = "[outv]" if j == n - 2 else f"[v{j+1}]"
-                    xfade_filters.append(
-                        f"{in_label}[{j+1}:v]xfade=transition={t}:duration={TRANSITION_DURATION}:offset={offset}{out_label}"
-                    )
-                    cumulative_offset = offset
+            # Step 2: Concat-demuxer join (no frame overlap, preserves A/V sync)
+            concat_file = WORK_DIR / f"{job_id}_concat.txt"
+            with open(concat_file, "w") as f:
+                for sf in faded_files:
+                    f.write(f"file '{str(sf).replace(chr(92), '/')}'\n")
 
-                # Audio: simple concat for now (acrossfade only works with 2 inputs)
-                audio_inputs = "".join(f"[{j}:a]" for j in range(n))
-                audio_filters.append(
-                    f"{audio_inputs}concat=n={n}:v=0:a=1[outa]"
-                )
-
-            full_filter = ";".join(xfade_filters + audio_filters)
-
-            xfade_cmd += [
-                "-filter_complex", full_filter,
-                "-map", "[outv]",
-                "-map", "[outa]",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-                "-c:a", "aac", "-b:a", "192k",
-                "-pix_fmt", "yuv420p",
+            concat_cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_file),
+                "-c", "copy",
                 "-movflags", "+faststart",
                 str(pre_music_path)
             ]
-
-            logger.info(f"   [{job_id}] Running xfade transition join...")
-            result = subprocess.run(
-                xfade_cmd, capture_output=True, text=True, timeout=300
-            )
+            logger.info(f"   [{job_id}] Running concat-demuxer join...")
+            result = subprocess.run(concat_cmd, capture_output=True, text=True, timeout=300)
 
             if result.returncode != 0:
-                logger.warning(f"   [{job_id}] xfade failed, using simple concat: {result.stderr[-300:]}")
-                # Fallback: simple concat
-                pre_music_path = WORK_DIR / f"{job_id}_pre_music.mp4"
-                concat_file = WORK_DIR / f"{job_id}_concat.txt"
-                with open(concat_file, "w") as f:
-                    for sf in scene_files:
-                        f.write(f"file '{str(sf).replace(chr(92), '/')}'\n")
-
-                concat_cmd = [
+                logger.warning(f"   [{job_id}] Concat copy failed, trying re-encode: {result.stderr[-300:]}")
+                # Fallback: re-encode concat
+                concat_cmd_reencode = [
                     "ffmpeg", "-y",
                     "-f", "concat", "-safe", "0",
                     "-i", str(concat_file),
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-pix_fmt", "yuv420p",
                     "-movflags", "+faststart",
                     str(pre_music_path)
                 ]
-                subprocess.run(concat_cmd, capture_output=True, timeout=300)
+                subprocess.run(concat_cmd_reencode, capture_output=True, timeout=300)
+
+            # Clean up faded intermediates
+            for ff in faded_files:
+                if ff not in scene_files:
+                    try:
+                        ff.unlink()
+                    except Exception:
+                        pass
 
         # ── Mix background music ──
         if pre_music_path and Path(str(pre_music_path)).exists():
@@ -1748,7 +1735,7 @@ def generate_avatar_video(
         avatar_image = get_avatar_image_path(avatar_id)
         avatar_clips = [None] * len(scenes)
         is_face = _is_face_avatar(avatar_id)
-        use_did = is_face and DID_API_KEY
+        use_did = False  # Always use SadTalker/Replicate for lip-sync (D-ID disabled)
 
         if video_style == "animated_explainer":
             logger.info(f"🎨 [{job_id}] Stage 4: Skipping avatar (animated_explainer style — voiceover only)")
@@ -1778,6 +1765,11 @@ def generate_avatar_video(
                 )
                 did_count = sum(1 for c in avatar_clips if c)
                 logger.info(f"✅ [{job_id}] D-ID: {did_count}/{len(scenes)} clips generated")
+                # If D-ID failed on ALL scenes, fall back to SadTalker
+                if did_count == 0 and avatar_image and REPLICATE_API_TOKEN:
+                    logger.warning(f"⚠️ [{job_id}] D-ID produced 0 clips — falling back to SadTalker")
+                    update_job_status(job_id, progress=50, stage="D-ID failed, using SadTalker fallback...")
+                    avatar_clips = generate_all_talking_heads(avatar_image, audio_paths, job_id)
             else:
                 logger.warning(f"⚠️ [{job_id}] D-ID avatar upload failed, falling back to SadTalker")
                 if avatar_image and REPLICATE_API_TOKEN:
@@ -1823,18 +1815,38 @@ def generate_avatar_video(
         update_job_status(job_id, progress=95, stage="Uploading video...")
 
         # Build scene timing data for frontend side text panel
+        # Use ACTUAL clip durations (not estimates) for accurate seek
+        # Priority: avatar clip duration > audio duration > estimate
         scene_timings = []
         cumulative = 0.0
         for idx_s, sc in enumerate(scenes):
-            dur = sc.get("duration_estimate", 10)
+            real_dur = sc.get("duration_estimate", 10)
+            # Prefer avatar clip duration (what's actually in the final video)
+            clip_file = avatar_clips[idx_s] if idx_s < len(avatar_clips) else None
+            audio_file = audio_paths[idx_s] if idx_s < len(audio_paths) else None
+            probe_file = None
+            if clip_file and Path(clip_file).exists():
+                probe_file = clip_file
+            elif audio_file and Path(audio_file).exists():
+                probe_file = audio_file
+            if probe_file:
+                try:
+                    _p = subprocess.run(
+                        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", str(probe_file)],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    real_dur = float(_p.stdout.strip())
+                except Exception:
+                    pass
             scene_timings.append({
                 "index": idx_s,
                 "start_time": round(cumulative, 2),
-                "end_time": round(cumulative + dur, 2),
+                "end_time": round(cumulative + real_dur, 2),
                 "narration": sc.get("narration", ""),
                 "text_overlay": sc.get("text_overlay", ""),
             })
-            cumulative += dur
+            cumulative += real_dur
 
         result = {
             "status": "completed",
