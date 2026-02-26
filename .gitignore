@@ -124,3 +124,33 @@ frontend/dist/
 
 # ─── Build output ────────────────────────────────────────────────
 frontend/build/
+
+# ─── JSON dump / debug exports ───────────────────────────────────
+*_dump.json
+did_presenters_dump.json
+
+# ─── One-off / marker text files ─────────────────────────────────
+DEBUG_START_HERE.txt
+SETUP_READY.txt
+*_DEBUGGING_READY.txt
+test_upload_results.txt
+test_legal.txt
+
+# ─── One-off SQL scripts (root-level) ───────────────────────────
+supabase_classroom_tables.sql
+fix_*.sql
+
+# ─── Backup / extra requirements ────────────────────────────────
+requirements_backup.txt
+requirements_core.txt
+
+# ─── AI agent / tool configs ────────────────────────────────────
+.gemini/
+.agents/
+.agent/
+_agents/
+_agent/
+
+# ─── Capacitor config ───────────────────────────────────────────
+capacitor.config.ts
+capacitor.config.js

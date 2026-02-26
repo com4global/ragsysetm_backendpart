@@ -53,43 +53,99 @@ def _get_auth_header() -> str:
 
 # ── Stock D-ID presenter avatars — professional, diverse ──
 # source_url must be a publicly accessible face image accepted by D-ID /talks.
-# Using D-ID's own public bucket images (verified working) and clips-presenters CDN.
+# Using D-ID's own public bucket images (verified working).
 PROFESSIONAL_PRESENTERS = [
     {
         "id": "amy",
         "name": "Amy",
-        "source_url": "https://d-id-public-bucket.s3.us-east-1.amazonaws.com/alice.jpg",  # female
+        "gender": "female",
+        "source_url": "https://d-id-public-bucket.s3.us-east-1.amazonaws.com/alice.jpg",
+        "thumbnail_url": "https://d-id-public-bucket.s3.us-east-1.amazonaws.com/alice.jpg",
         "voice": {"type": "microsoft", "voice_id": "en-US-JennyNeural"},
+        "description": "Friendly and approachable",
     },
     {
-        "id": "daniel",
-        "name": "Daniel",
-        "source_url": "https://d-id-public-bucket.s3.us-east-1.amazonaws.com/or-roman.jpg",  # male
+        "id": "david",
+        "name": "David",
+        "gender": "male",
+        "source_url": "https://d-id-public-bucket.s3.us-east-1.amazonaws.com/or-roman.jpg",
+        "thumbnail_url": "https://d-id-public-bucket.s3.us-east-1.amazonaws.com/or-roman.jpg",
         "voice": {"type": "microsoft", "voice_id": "en-US-GuyNeural"},
+        "description": "Professional and confident",
     },
     {
         "id": "noelle",
         "name": "Noelle",
-        "source_url": "https://d-id-public-bucket.s3.us-east-1.amazonaws.com/alice.jpg",  # female
+        "gender": "female",
+        "source_url": "https://create-images-results.d-id.com/DefaultPresenters/Noelle_f/image.png",
+        "thumbnail_url": "https://create-images-results.d-id.com/DefaultPresenters/Noelle_f/image.png",
         "voice": {"type": "microsoft", "voice_id": "en-US-AriaNeural"},
+        "description": "Warm and engaging",
     },
     {
-        "id": "william",
-        "name": "William",
-        "source_url": "https://d-id-public-bucket.s3.us-east-1.amazonaws.com/or-roman.jpg",  # male
+        "id": "matt",
+        "name": "Matt",
+        "gender": "male",
+        "source_url": "https://create-images-results.d-id.com/DefaultPresenters/William_f/image.png",
+        "thumbnail_url": "https://create-images-results.d-id.com/DefaultPresenters/William_f/image.png",
         "voice": {"type": "microsoft", "voice_id": "en-US-ChristopherNeural"},
+        "description": "Authoritative and clear",
+    },
+    {
+        "id": "emma",
+        "name": "Emma",
+        "gender": "female",
+        "source_url": "https://create-images-results.d-id.com/DefaultPresenters/Emma_f/image.png",
+        "thumbnail_url": "https://create-images-results.d-id.com/DefaultPresenters/Emma_f/image.png",
+        "voice": {"type": "microsoft", "voice_id": "en-US-SaraNeural"},
+        "description": "Calm and articulate",
+    },
+    {
+        "id": "alex",
+        "name": "Alex",
+        "gender": "male",
+        "source_url": "https://create-images-results.d-id.com/DefaultPresenters/Alex_f/image.png",
+        "thumbnail_url": "https://create-images-results.d-id.com/DefaultPresenters/Alex_f/image.png",
+        "voice": {"type": "microsoft", "voice_id": "en-US-DavisNeural"},
+        "description": "Energetic and dynamic",
     },
 ]
 
 
-def _pick_presenter(topic: str) -> dict:
-    """Pick a consistent presenter based on topic name (same topic → same face)."""
+# ── Presenter lookup helpers ──────────────────────────────────
+_PRESENTER_MAP = {p["id"]: p for p in PROFESSIONAL_PRESENTERS}
+
+
+def get_presenters() -> list[dict]:
+    """Return sanitized presenter list for the frontend avatar picker."""
+    return [
+        {
+            "id": p["id"],
+            "name": p["name"],
+            "gender": p.get("gender", ""),
+            "source_url": p["thumbnail_url"],   # Frontend sees thumbnail
+            "description": p.get("description", ""),
+        }
+        for p in PROFESSIONAL_PRESENTERS
+    ]
+
+
+def get_presenter_by_id(presenter_id: str) -> dict | None:
+    """Look up a presenter by ID, returns None if not found."""
+    return _PRESENTER_MAP.get(presenter_id)
+
+
+def _pick_presenter(topic: str, presenter_id: str = "") -> dict:
+    """Pick a presenter: use explicit ID if given, else consistent hash pick."""
+    if presenter_id and presenter_id in _PRESENTER_MAP:
+        return _PRESENTER_MAP[presenter_id]
     h = int(hashlib.md5(topic.encode()).hexdigest(), 16)
     return PROFESSIONAL_PRESENTERS[h % len(PROFESSIONAL_PRESENTERS)]
 
 
-def _did_cache_key(topic: str, doc_name: str, language: str) -> str:
-    raw = f"{topic}|{doc_name}|{language}"
+
+def _did_cache_key(topic: str, doc_name: str, language: str, presenter_id: str = "") -> str:
+    raw = f"{topic.strip().lower()}|{doc_name.strip().lower()}|{language.strip().lower()}|{presenter_id.strip().lower()}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -98,21 +154,80 @@ _did_mem_cache: dict = {}
 DID_CACHE_TTL = 86400 * 7  # 7 days
 
 
-def get_cached_did_video(topic: str, doc_name: str, language: str) -> dict | None:
-    """Return cached D-ID video dict if still valid, else None."""
-    key = _did_cache_key(topic, doc_name, language)
-    entry = _did_mem_cache.get(key)
-    if entry and (time.time() - entry.get("ts", 0)) < DID_CACHE_TTL:
-        return entry["data"]
+# ═══════════════════════════════════════════════════════════════════
+# ▸ Supabase Persistent Video Cache — ai_videos table
+# ═══════════════════════════════════════════════════════════════════
+
+def get_supabase_cached_did_video(topic: str, doc_name: str, language: str, presenter_id: str = "") -> dict | None:
+    """Check Supabase ai_videos for an already-generated D-ID video. Returns row dict or None."""
+    try:
+        from database import supabase as sb
+        if not sb:
+            return None
+        key = _did_cache_key(topic, doc_name, language, presenter_id)
+        result = sb.table("ai_videos").select("*").eq("cache_key", key).eq("status", "completed").limit(1).execute()
+        if result.data:
+            logger.info(f"🎯 Supabase D-ID cache HIT: {topic} (presenter={presenter_id})")
+            return result.data[0]
+    except Exception as e:
+        logger.warning(f"Supabase D-ID cache lookup failed (non-fatal): {e}")
     return None
 
 
-def cache_did_video(topic: str, doc_name: str, language: str, data: dict):
-    key = _did_cache_key(topic, doc_name, language)
+def save_supabase_did_video(topic: str, doc_name: str, language: str, talk_id: str,
+                           video_url: str, script: str = "", presenter: str = "",
+                           presenter_id: str = "") -> None:
+    """Upsert a completed D-ID video into Supabase ai_videos for permanent caching."""
+    try:
+        from database import supabase as sb
+        if not sb:
+            return
+        key = _did_cache_key(topic, doc_name, language, presenter_id)
+        sb.table("ai_videos").upsert({
+            "cache_key": key,
+            "topic": topic,
+            "doc_name": doc_name,
+            "language": language,
+            "video_id": talk_id,
+            "video_url": video_url,
+            "script": (script or "")[:500],
+            "presenter": presenter,
+            "status": "completed",
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }, on_conflict="cache_key").execute()
+        logger.info(f"✅ Supabase D-ID video saved: {topic} → {video_url[:60]}...")
+    except Exception as e:
+        logger.warning(f"Supabase D-ID video save failed (non-fatal): {e}")
+
+
+def get_cached_did_video(topic: str, doc_name: str, language: str, presenter_id: str = "") -> dict | None:
+    """Return cached D-ID video dict if still valid (memory → Supabase), else None."""
+    # 1. In-memory cache
+    key = _did_cache_key(topic, doc_name, language, presenter_id)
+    entry = _did_mem_cache.get(key)
+    if entry and (time.time() - entry.get("ts", 0)) < DID_CACHE_TTL:
+        return entry["data"]
+    # 2. Supabase persistent cache
+    sb_entry = get_supabase_cached_did_video(topic, doc_name, language, presenter_id)
+    if sb_entry and sb_entry.get("video_url"):
+        # Promote to in-memory
+        data = {
+            "video_url": sb_entry["video_url"],
+            "talk_id": sb_entry.get("video_id", ""),
+            "presenter": sb_entry.get("presenter", "AI Presenter"),
+            "cached": True,
+        }
+        _did_mem_cache[key] = {"data": data, "ts": time.time()}
+        return data
+    return None
+
+
+def cache_did_video(topic: str, doc_name: str, language: str, data: dict, presenter_id: str = ""):
+    key = _did_cache_key(topic, doc_name, language, presenter_id)
     _did_mem_cache[key] = {"data": data, "ts": time.time()}
 
 
-def create_did_talk(script: str, topic: str, language: str = "en") -> dict:
+def create_did_talk(script: str, topic: str, language: str = "en", presenter_id: str = "") -> dict:
     """
     Submit a D-ID /talks job with a text script.
 
@@ -126,7 +241,7 @@ def create_did_talk(script: str, topic: str, language: str = "en") -> dict:
         raise ValueError("DID_API_KEY environment variable is not set. "
                          "Get a free key at https://www.d-id.com/")
 
-    presenter = _pick_presenter(topic)
+    presenter = _pick_presenter(topic, presenter_id)
 
     # Truncate script to D-ID's limit (~4000 chars per talk)
     script_text = script[:4000].strip()
@@ -155,8 +270,9 @@ def create_did_talk(script: str, topic: str, language: str = "en") -> dict:
             },
         },
         "config": {
-            "fluent": True,
-            "pad_audio": 0.0,
+            "stitch": True,
+            "fluent": False,
+            "pad_audio": 0.5,
             "result_format": "mp4",
         },
     }
@@ -217,7 +333,7 @@ def poll_did_talk(talk_id: str, max_wait: int = 180, interval: int = 5) -> dict:
     raise TimeoutError(f"D-ID talk {talk_id} did not finish within {max_wait}s")
 
 
-def generate_did_video_sync(script: str, topic: str, doc_name: str = "", language: str = "en") -> dict:
+def generate_did_video_sync(script: str, topic: str, doc_name: str = "", language: str = "en", presenter_id: str = "") -> dict:
     """
     Full synchronous pipeline: submit + poll + return result.
     Suitable for running inside asyncio.run_in_executor.
@@ -230,14 +346,14 @@ def generate_did_video_sync(script: str, topic: str, doc_name: str = "", languag
             "cached": False,
         }
     """
-    # Check in-memory cache first
-    cached = get_cached_did_video(topic, doc_name, language)
+    # Check cache first (memory → Supabase)
+    cached = get_cached_did_video(topic, doc_name, language, presenter_id)
     if cached:
-        logger.info(f"🎯 D-ID cache HIT: {topic}")
+        logger.info(f"🎯 D-ID cache HIT: {topic} (presenter={presenter_id})")
         return {**cached, "cached": True}
 
     # Submit
-    submit_data = create_did_talk(script, topic, language)
+    submit_data = create_did_talk(script, topic, language, presenter_id)
     talk_id = submit_data["id"]
 
     # Poll until done
@@ -247,15 +363,157 @@ def generate_did_video_sync(script: str, topic: str, doc_name: str = "", languag
     if not video_url:
         raise RuntimeError("D-ID returned no result_url after completion")
 
-    presenter = _pick_presenter(topic)
+    presenter = _pick_presenter(topic, presenter_id)
     output = {
         "video_url": video_url,
         "talk_id": talk_id,
         "presenter": presenter["name"],
+        "script": script,
         "cached": False,
     }
 
-    # Save to memory cache
-    cache_did_video(topic, doc_name, language, output)
+    # Save to memory cache + Supabase persistent cache
+    cache_did_video(topic, doc_name, language, output, presenter_id)
+    save_supabase_did_video(
+        topic, doc_name, language, talk_id, video_url,
+        script=script, presenter=presenter["name"], presenter_id=presenter_id
+    )
     logger.info(f"✅ D-ID video ready: {video_url}")
     return output
+
+
+def create_did_talk_with_source(
+    script_text: str,
+    source_url: str,
+    language: str = "en",
+    voice_id: str = "",
+) -> dict:
+    """
+    Submit a D-ID /talks job using a custom source image URL.
+    Unlike create_did_talk, this lets the caller specify any avatar face.
+
+    Returns:
+        {"id": "tlk_xxx", "status": "created"}
+    """
+    if not DID_API_KEY:
+        raise ValueError("DID_API_KEY environment variable is not set. "
+                         "Get a free key at https://www.d-id.com/")
+
+    script_text = script_text[:4000].strip()
+
+    # Default voice per language
+    if not voice_id:
+        _lang_voices = {
+            "en": "en-US-JennyNeural",
+            "ta": "ta-IN-PallaviNeural",
+            "hi": "hi-IN-SwaraNeural",
+            "de": "de-DE-KatjaNeural",
+            "fr": "fr-FR-DeniseNeural",
+            "es": "es-ES-ElviraNeural",
+        }
+        voice_id = _lang_voices.get(language, "en-US-JennyNeural")
+
+    payload = {
+        "source_url": source_url,
+        "script": {
+            "type": "text",
+            "input": script_text,
+            "provider": {
+                "type": "microsoft",
+                "voice_id": voice_id,
+            },
+        },
+        "config": {
+            "stitch": True,
+            "fluent": False,
+            "pad_audio": 0.5,
+            "result_format": "mp4",
+        },
+    }
+
+    headers = {
+        "Authorization": _get_auth_header(),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    logger.info(f"📽️ D-ID: submitting talk with custom source ({len(script_text)} chars)")
+    response = requests.post(
+        f"{DID_BASE_URL}/talks",
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    logger.info(f"✅ D-ID talk submitted: {data.get('id')}")
+    return data
+
+
+def download_did_video(video_url: str, output_path: str) -> str:
+    """
+    Download a D-ID result video to a local file.
+
+    Returns the output_path on success.
+    Raises RuntimeError on failure.
+    """
+    logger.info(f"⬇️ D-ID: downloading video to {output_path}")
+    resp = requests.get(video_url, timeout=120, stream=True)
+    resp.raise_for_status()
+
+    with open(output_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    file_size = os.path.getsize(output_path)
+    logger.info(f"✅ D-ID video downloaded: {file_size} bytes → {output_path}")
+    return output_path
+
+
+# ── Image upload cache (avoid re-uploading the same image) ────────
+_uploaded_image_cache: dict = {}
+
+
+def upload_image_to_did(local_image_path: str) -> str:
+    """
+    Upload a local image file to D-ID's /images endpoint.
+    Returns a publicly accessible URL that can be used as source_url.
+
+    D-ID stores uploaded images for 24-48 hours.
+    Results are cached per file path to avoid redundant uploads.
+    """
+    # Check cache first
+    if local_image_path in _uploaded_image_cache:
+        cached_url = _uploaded_image_cache[local_image_path]
+        logger.info(f"📎 D-ID: using cached image URL for {local_image_path}")
+        return cached_url
+
+    auth = _get_auth_header()
+
+    if not os.path.exists(local_image_path):
+        raise FileNotFoundError(f"Avatar image not found: {local_image_path}")
+
+    file_size = os.path.getsize(local_image_path)
+    logger.info(f"📤 D-ID: uploading image {local_image_path} ({file_size:,} bytes)")
+
+    with open(local_image_path, "rb") as img_file:
+        resp = requests.post(
+            f"{DID_BASE_URL}/images",
+            headers={"Authorization": auth},
+            files={"image": (os.path.basename(local_image_path), img_file, "image/png")},
+            timeout=60,
+        )
+
+    resp.raise_for_status()
+    data = resp.json()
+    image_url = data.get("url", "")
+
+    if not image_url:
+        raise RuntimeError(f"D-ID image upload returned no URL: {data}")
+
+    logger.info(f"✅ D-ID image uploaded: {image_url}")
+
+    # Cache it
+    _uploaded_image_cache[local_image_path] = image_url
+    return image_url
+

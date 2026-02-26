@@ -181,6 +181,14 @@ else:
 _avatar_video_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/static/avatar_video_temp", StaticFiles(directory=str(_avatar_video_dir)), name="avatar_video_temp")
 
+# Mount static files for avatar images (thumbnails)
+if os.name == "nt":
+    _avatars_dir = _pathlib.Path(__file__).parent / "static" / "avatars"
+else:
+    _avatars_dir = _pathlib.Path("/tmp") / "avatars"
+_avatars_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/static/avatars", StaticFiles(directory=str(_avatars_dir)), name="avatars")
+
 # RESOURCES_DIR is split into WRITE and STATIC. 
 # Helpers will resolve paths dynamically.
 
@@ -2126,126 +2134,89 @@ async def edtech_lesson_audio_status(
         return {"audio_urls": [], "audio_generating": False}
 
 
+@app.get("/api/edtech/did-presenters")
+async def edtech_did_presenters(current_user: User = Depends(get_current_user)):
+    """Return available D-ID presenter avatars for the frontend picker."""
+    from did_service import get_presenters
+    return {"success": True, "presenters": get_presenters()}
+
 
 @app.post("/api/edtech/generate-did-video")
-async def edtech_generate_video(
+async def edtech_generate_did_video(
     request: Request,
     topic: str = Form(...),
     language: str = Form("en"),
     doc_name: str = Form(""),
+    presenter_id: str = Form(""),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Generate an AI Teacher video for the Individual Learner role.
-    Uses LOCAL TTS+Video engine (OpenAI TTS + moviepy — no paid video API).
+    Return a pre-generated AI Teacher video from the database cache.
+
+    D-ID API calls are DISABLED to save cost.  This endpoint now only
+    looks up videos that were previously generated and stored in the
+    Supabase `ai_videos` table.  If no cached video is found for the
+    requested topic, a user-friendly message is returned instead.
     """
     try:
-        from local_video_service import (
-            generate_local_video_sync,
-            get_supabase_cached_video,
-        )
-        from embedder import embed_User_query
-        from vectorstore import search_user_documents
+        from did_service import get_cached_did_video
+        from local_video_service import get_supabase_cached_video
 
-        # ── 1. Check Supabase cache first ──
-        cached = get_supabase_cached_video(topic, doc_name, language)
+        logger.info(f"🎬 Video request (DB-only, D-ID disabled): topic='{topic}', "
+                     f"lang={language}, presenter={presenter_id}")
+
+        # ── 1. Check D-ID cache (memory → Supabase ai_videos) ──
+        cached = get_cached_did_video(topic, doc_name, language, presenter_id)
+
+        # ── 2. Fallback: check local/generic video cache ──
+        if not cached or not cached.get("video_url"):
+            cached_local = get_supabase_cached_video(topic, doc_name, language)
+            if cached_local and cached_local.get("video_url"):
+                logger.info(f"🎯 Local video cache HIT: {topic}")
+                video_url = cached_local["video_url"]
+                if video_url and video_url.startswith("/"):
+                    base = str(request.base_url).rstrip("/")
+                    video_url = f"{base}{video_url}"
+                return {
+                    "success": True,
+                    "video_url": video_url,
+                    "video_id": cached_local.get("video_id", ""),
+                    "presenter": cached_local.get("presenter", "AI Teacher"),
+                    "script": cached_local.get("script", ""),
+                    "cached": True,
+                    "lip_sync": False,
+                }
+
+        # ── 3. Return D-ID cached video if found ──
         if cached and cached.get("video_url"):
-            logger.info(f"🎯 Local video cache HIT: {topic}")
+            logger.info(f"🎯 D-ID cache HIT: {topic}")
+            video_url = cached["video_url"]
+            if video_url and video_url.startswith("/"):
+                base = str(request.base_url).rstrip("/")
+                video_url = f"{base}{video_url}"
             return {
                 "success": True,
-                "video_url": cached["video_url"],
-                "video_id": cached.get("video_id", ""),
+                "video_url": video_url,
+                "video_id": cached.get("talk_id", ""),
                 "presenter": cached.get("presenter", "AI Teacher"),
                 "script": cached.get("script", ""),
                 "cached": True,
+                "lip_sync": True,
             }
 
-        # ── 2. Retrieve relevant RAG context ──
-        loop = asyncio.get_event_loop()
-        query_vec = await loop.run_in_executor(None, lambda: embed_User_query(topic))
-
-        if doc_name:
-            from vectorstore import search_by_doc_name
-            results = await loop.run_in_executor(
-                None, lambda: search_by_doc_name(query_vec, doc_name, top_k=8)
-            )
-            if not results:
-                results = await loop.run_in_executor(
-                    None, lambda: search_user_documents(query_vec, current_user.id, top_k=8)
-                )
-        else:
-            results = await loop.run_in_executor(
-                None, lambda: search_user_documents(query_vec, current_user.id, top_k=8)
-            )
-
-        if not results:
-            raise HTTPException(status_code=404, detail="No relevant content found for this topic.")
-
-        context_chunks = [r.get("text", "") for r in results if r.get("text")]
-        combined = "\n\n".join(context_chunks[:6])
-
-        # ── 3. Generate professional narration script via GPT ──
-        from openai import OpenAI
-        openai_client = OpenAI()
-
-        lang_instruction = ""
-        if language == "ta":
-            lang_instruction = "\nIMPORTANT: Write the entire script in Tamil (தமிழ்)."
-        elif language == "hi":
-            lang_instruction = "\nIMPORTANT: Write the entire script in Hindi."
-
-        system_prompt = (
-            "You are an expert course instructor creating a professional educational video script. "
-            "The script will be read aloud by an AI voice presenter to an adult learner. "
-            "Style: clear, authoritative, engaging, no filler words. "
-            "Length: 3-5 paragraphs (about 90-150 seconds of speech). "
-            "Do NOT add stage directions, [pause], or speaker names — pure spoken text only."
-            + lang_instruction
-        )
-        user_prompt = (
-            f"Create a professional educational video script about: '{topic}'\n\n"
-            f"Use this content as your source material:\n{combined}\n\n"
-            f"Write a flowing, well-structured narration that an expert would deliver to peers."
-        )
-
-        gpt_resp = await loop.run_in_executor(None, lambda: openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=800,
-            temperature=0.7,
-        ))
-        script = gpt_resp.choices[0].message.content.strip()
-        logger.info(f"📝 Script generated ({len(script)} chars) for '{topic}'")
-
-        # ── 4. Local TTS+Video pipeline (runs in thread pool) ──
-        result = await loop.run_in_executor(
-            None,
-            lambda: generate_local_video_sync(script, topic, doc_name, language)
-        )
-
-        # Make video_url absolute so the browser can load it directly.
-        video_url = result["video_url"]
-        if video_url and video_url.startswith("/"):
-            base = str(request.base_url).rstrip("/")
-            video_url = f"{base}{video_url}"
-
+        # ── 4. No cached video available — do NOT call D-ID API ──
+        logger.info(f"📋 No cached video found for '{topic}' — D-ID API disabled")
         return {
-            "success": True,
-            "video_url": video_url,
-            "video_id": result.get("video_id", ""),
-            "presenter": result.get("presenter", "AI Teacher"),
-            "script": script,
-            "cached": result.get("cached", False),
+            "success": False,
+            "detail": (
+                "No pre-generated video is available for this topic yet. "
+                "Please try the Conversation mode or TTS Video mode instead."
+            ),
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Local video generation failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Video generation failed: {str(e)}")
+        logger.error(f"Video lookup failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Video lookup failed: {str(e)}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3834,6 +3805,7 @@ async def billing_sync_subscription(current_user: User = Depends(get_current_use
 @app.post("/api/avatar-video/generate")
 async def avatar_video_generate(
     topic: str = Form(...),
+    script: str = Form(""),
     doc_name: str = Form(""),
     language: str = Form("en"),
     voice: str = Form("nova"),
@@ -3854,9 +3826,9 @@ async def avatar_video_generate(
     import hashlib
     import time
 
-    # Gather content from uploaded doc (if any)
-    content = ""
-    if doc_name:
+    # User-provided script takes priority
+    content = script.strip() if script else ""
+    if not content and doc_name:
         try:
             import vectorstore as vs
             chunks = vs.vector_search(topic, doc_name=doc_name, top_k=8)

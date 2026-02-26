@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+DID_API_KEY = os.getenv("DID_API_KEY", "")
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -102,7 +103,60 @@ DEFAULT_AVATARS = [
         "image": "corporate_male_1.png",
         "style": "corporate",
     },
+    {
+        "id": "banana_character",
+        "name": "Banana Buddy",
+        "description": "Fun banana character",
+        "image": "banana_character.png",
+        "style": "fun",
+    },
+    {
+        "id": "robot_buddy",
+        "name": "Robo Teacher",
+        "description": "Friendly robot assistant",
+        "image": "robot_buddy.png",
+        "style": "fun",
+    },
+    {
+        "id": "cat_presenter",
+        "name": "Professor Whiskers",
+        "description": "Adorable cat presenter",
+        "image": "cat_presenter.png",
+        "style": "fun",
+    },
+    {
+        "id": "red_car",
+        "name": "Red Racer",
+        "description": "Sporty red car character",
+        "image": "red_car.png",
+        "style": "fun",
+    },
+    {
+        "id": "dog_buddy",
+        "name": "Doggo",
+        "description": "Friendly dog presenter",
+        "image": "dog_buddy.png",
+        "style": "fun",
+    },
 ]
+
+# ── Avatar type detection ───────────────────────────────────────────
+_FACE_STYLES = {"professional", "academic", "casual", "modern", "corporate", "custom"}
+
+
+def _is_face_avatar(avatar_id: str) -> bool:
+    """
+    Return True if the avatar is a human face (suitable for lip-sync).
+    Returns False for fun objects (banana, car, robot, etc.) that have no face.
+    Custom uploads are assumed to be face images.
+    """
+    if avatar_id.startswith("custom_"):
+        return True
+    for av in DEFAULT_AVATARS:
+        if av["id"] == avatar_id:
+            return av.get("style", "") in _FACE_STYLES
+    # Unknown avatar — assume face
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -300,8 +354,11 @@ def generate_scene_audio(
     if not text.strip():
         return None
 
-    # Remove [PAUSE] markers and clean text
-    clean_text = text.replace("[PAUSE]", "... ").strip()
+    # Remove [PAUSE] markers cleanly — avoid "..." which confuses TTS timing
+    clean_text = text.replace("[PAUSE]", " ").strip()
+    # Collapse multiple spaces
+    import re as _re
+    clean_text = _re.sub(r'\s+', ' ', clean_text)
     audio_path = WORK_DIR / f"{job_id}_scene_{scene_index}.mp3"
 
     # Return cached if exists
@@ -598,27 +655,32 @@ def generate_talking_head(
         # Upload files to Replicate
         face_url = _upload_file_to_replicate(avatar_image_path)
         audio_url = _upload_file_to_replicate(audio_path)
+        logger.info(f"   Face URL: {'set' if face_url else 'EMPTY'}, Audio URL: {'set' if audio_url else 'EMPTY'}")
 
         if not face_url or not audio_url:
-            # Fallback: try with file:// URLs or base64 encoding
+            # Fallback: use base64 data URIs
             import base64
-            with open(avatar_image_path, "rb") as f:
-                face_b64 = base64.b64encode(f.read()).decode()
-            face_url = f"data:image/png;base64,{face_b64}"
+            if not face_url:
+                with open(avatar_image_path, "rb") as f:
+                    face_b64 = base64.b64encode(f.read()).decode()
+                face_url = f"data:image/png;base64,{face_b64}"
+            if not audio_url:
+                with open(audio_path, "rb") as f:
+                    audio_b64 = base64.b64encode(f.read()).decode()
+                audio_url = f"data:audio/mp3;base64,{audio_b64}"
 
-            with open(audio_path, "rb") as f:
-                audio_b64 = base64.b64encode(f.read()).decode()
-            audio_url = f"data:audio/mp3;base64,{audio_b64}"
-
+        # Use SadTalker — robust single-image talking face animation
         result = _replicate_api(
-            # devxpy/cog-wav2lip — high quality lip sync
-            "8d65e3f4f4298520e079198b493c25adfc43c058ffec924f2aefc8010ed25eef",
+            # cjwbw/sadtalker — audio-driven single image talking face
+            "a519cc0cfebaaeade068b23899165a11ec76aaa1d2b313d40d214f204ec957a3",
             {
-                "face": face_url,
-                "audio": audio_url,
-                "pads": "0 10 0 0",
-                "smooth": True,
-                "fps": 25,
+                "source_image": face_url,
+                "driven_audio": audio_url,
+                "pose_style": 0,
+                "facerender": "facevid2vid",
+                "expression_scale": 0.5,  # Low value to minimize ghost mouth during silence
+                "still": True,           # Keep head still, only animate mouth
+                "preprocess": "full",     # Keep full image (crop outputs only 256x256 face)
             },
             timeout=300,
         )
@@ -626,6 +688,7 @@ def generate_talking_head(
         output = result.get("output")
         if output:
             video_url = str(output)
+            logger.info(f"   SadTalker output URL: {video_url[:100]}")
             resp = requests.get(video_url, stream=True, timeout=120)
             if resp.status_code == 200:
                 with open(output_path, "wb") as f:
@@ -633,12 +696,15 @@ def generate_talking_head(
                         f.write(chunk)
                 logger.info(f"✅ Lip-sync avatar generated for scene {scene_index} ({output_path.stat().st_size} bytes)")
                 return str(output_path)
+            else:
+                logger.error(f"   Download failed with status {resp.status_code}")
 
-        logger.warning(f"Talking head generation returned no output for scene {scene_index}")
+        logger.warning(f"Talking head generation returned no output for scene {scene_index}: {result.get('error', 'unknown')}")
         return None
 
     except Exception as e:
-        logger.error(f"Talking head generation failed for scene {scene_index}: {e}")
+        import traceback as _tb_mod
+        logger.error(f"Talking head generation failed for scene {scene_index}: {e}\n{_tb_mod.format_exc()}")
         return None
 
 
@@ -648,14 +714,85 @@ def generate_all_talking_heads(
     job_id: str,
 ) -> List[Optional[str]]:
     """Generate talking head clips for all scenes (sequentially — Replicate rate limits)."""
-    avatar_clips = []
-    for i, audio_path in enumerate(audio_paths):
-        if audio_path:
-            clip = generate_talking_head(avatar_image_path, audio_path, i, job_id)
-            avatar_clips.append(clip)
+    clips = []
+    for idx, ap in enumerate(audio_paths):
+        if ap:
+            clip = generate_talking_head(avatar_image_path, ap, idx, job_id)
+            clips.append(clip)
         else:
-            avatar_clips.append(None)
-    return avatar_clips
+            clips.append(None)
+    return clips
+
+
+def generate_did_talking_head(
+    scene_text: str,
+    scene_index: int,
+    job_id: str,
+    avatar_image_url: str = "",
+    language: str = "en",
+) -> Optional[str]:
+    """
+    Generate a talking head clip for a single scene using D-ID.
+    D-ID handles TTS + lip-sync in one call.
+    Returns local path to downloaded MP4 clip, or None on failure.
+    """
+    try:
+        from did_service import create_did_talk_with_source, poll_did_talk, download_did_video
+
+        logger.info(f"🎬 [{job_id}] D-ID scene {scene_index}: submitting ({len(scene_text)} chars)")
+
+        # Submit talk to D-ID
+        result = create_did_talk_with_source(
+            script_text=scene_text,
+            source_url=avatar_image_url,
+            language=language,
+        )
+        talk_id = result["id"]
+
+        # Poll until done
+        talk_data = poll_did_talk(talk_id, max_wait=180, interval=5)
+        video_url = talk_data.get("result_url", "")
+
+        if not video_url:
+            logger.error(f"❌ [{job_id}] D-ID scene {scene_index}: no result_url")
+            return None
+
+        # Download to local file
+        output_path = str(WORK_DIR / f"{job_id}_did_scene{scene_index}.mp4")
+        download_did_video(video_url, output_path)
+        logger.info(f"✅ [{job_id}] D-ID scene {scene_index}: ready → {output_path}")
+        return output_path
+
+    except Exception as e:
+        logger.error(f"❌ [{job_id}] D-ID scene {scene_index} failed: {e}")
+        return None
+
+
+def generate_all_did_talking_heads(
+    scenes: List[Dict],
+    job_id: str,
+    avatar_image_url: str = "",
+    language: str = "en",
+) -> List[Optional[str]]:
+    """
+    Generate D-ID talking head clips for all scenes sequentially.
+    D-ID handles TTS internally — audio_paths not needed.
+    """
+    clips: List[Optional[str]] = []
+    for idx, scene in enumerate(scenes):
+        narration = scene.get("narration", scene.get("text", ""))
+        if narration:
+            clip = generate_did_talking_head(
+                scene_text=narration,
+                scene_index=idx,
+                job_id=job_id,
+                avatar_image_url=avatar_image_url,
+                language=language,
+            )
+            clips.append(clip)
+        else:
+            clips.append(None)
+    return clips
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1019,6 +1156,7 @@ def compose_final_video(
     job_id: str,
     aspect_ratio: str = "16:9",
     include_captions: bool = True,
+    avatar_image_path: str = "",
 ) -> Optional[str]:
     """
     Professional video composition engine (reference-quality output).
@@ -1058,7 +1196,7 @@ def compose_final_video(
     # Choose font path — use Inter if available, else system default
     font_file = FONT_PATH if Path(FONT_PATH).exists() else ""
     if font_file:
-        escaped_font = font_file.replace(chr(92), '/').replace(':', '\\\\:')
+        escaped_font = font_file.replace(chr(92), '/').replace(':', '\\:')
         font_opt = f"fontfile='{escaped_font}'"
     else:
         font_opt = ""
@@ -1071,7 +1209,6 @@ def compose_final_video(
             audio_path = audio_paths[i] if i < len(audio_paths) else None
             broll_path = broll_paths[i] if i < len(broll_paths) else None
             avatar_clip = avatar_clips[i] if i < len(avatar_clips) else None
-            caption_text = scene.get("text_overlay", "")
 
             scene_out = WORK_DIR / f"{job_id}_scene_{i}.mp4"
             logger.info(f"🎬 [{job_id}] Scene {i}/{len(scenes)}: dur={duration}s, "
@@ -1080,6 +1217,34 @@ def compose_final_video(
                         f"avatar={'yes' if avatar_clip else 'no'}")
             update_job_status(job_id, progress=82 + int(i / len(scenes) * 10),
                               stage=f"Composing scene {i+1}/{len(scenes)}...")
+
+            # ── Detect if avatar clip has its own audio (SadTalker bakes it in) ──
+            avatar_has_audio = False
+            avatar_native_fps = FPS
+            if avatar_clip and Path(avatar_clip).exists():
+                try:
+                    # Probe avatar clip for audio streams and native FPS
+                    probe_json = subprocess.run(
+                        ["ffprobe", "-v", "quiet", "-print_format", "json",
+                         "-show_streams", str(avatar_clip)],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    import json as _json
+                    probe_data = _json.loads(probe_json.stdout)
+                    for stream in probe_data.get("streams", []):
+                        if stream.get("codec_type") == "audio":
+                            avatar_has_audio = True
+                        if stream.get("codec_type") == "video":
+                            # Extract native FPS (e.g. "25/1" -> 25.0)
+                            fps_str = stream.get("r_frame_rate", "25/1")
+                            if "/" in fps_str:
+                                num, den = fps_str.split("/")
+                                avatar_native_fps = float(num) / float(den) if float(den) > 0 else FPS
+                            else:
+                                avatar_native_fps = float(fps_str)
+                    logger.info(f"   [{job_id}] Scene {i}: Avatar native FPS={avatar_native_fps:.1f}, has_audio={avatar_has_audio}")
+                except Exception as probe_err:
+                    logger.warning(f"   [{job_id}] Scene {i}: Avatar probe failed: {probe_err}")
 
             # Determine actual duration from audio if available
             actual_duration = duration
@@ -1095,213 +1260,163 @@ def compose_final_video(
                 except Exception:
                     pass
 
-            # ── Build complex ffmpeg filter graph ──
-            cmd = ["ffmpeg", "-y"]
-            filter_parts = []
-            input_idx = 0
-
-            # Input 0: Background (b-roll or solid color)
-            if broll_path and Path(broll_path).exists():
-                cmd += ["-stream_loop", "-1", "-i", str(broll_path)]
-                # Scale b-roll to fill frame with slight zoom effect
-                filter_parts.append(
-                    f"[{input_idx}:v]scale={width*2}:{height*2}:force_original_aspect_ratio=increase,"
-                    f"crop={width}:{height},setsar=1,fps={FPS}[bg]"
-                )
-            else:
-                # Generate gradient background instead of solid color
-                cmd += [
-                    "-f", "lavfi",
-                    "-i", f"color=c=#0f0f2e:s={width}x{height}:r={FPS}:d={actual_duration}"
-                ]
-                filter_parts.append(f"[{input_idx}:v]fps={FPS}[bg]")
-            input_idx += 1
-
-            # Input 1: Audio narration
-            has_audio = False
-            if audio_path and Path(audio_path).exists():
-                cmd += ["-i", str(audio_path)]
-                audio_input_idx = input_idx
-                has_audio = True
-                input_idx += 1
-
-            # Input 2: Avatar PiP (if available)
-            has_avatar = False
+            # ═══════════════════════════════════════════════════════════
+            # FAST PATH: Lip-sync avatar clip exists
+            # SadTalker output already has audio+video perfectly synced.
+            # Just scale the video to fit our frame — do NOT re-encode
+            # the timing, do NOT force a different FPS, do NOT use
+            # separate audio. This preserves exact lip-sync.
+            # ═══════════════════════════════════════════════════════════
             if avatar_clip and Path(avatar_clip).exists():
-                cmd += ["-stream_loop", "-1", "-i", str(avatar_clip)]
-                avatar_input_idx = input_idx
-                has_avatar = True
-                input_idx += 1
+                # Use avatar's native FPS for output to avoid frame duplication
+                scene_fps = int(round(avatar_native_fps)) if avatar_native_fps > 0 else FPS
 
-            # ── Build filter graph ──
-            if has_avatar:
-                # PiP Layout: avatar circle in bottom-right corner
-                pip_size = int(min(width, height) * 0.28)  # 28% of smaller dimension
-                pip_x = width - pip_size - 20  # 20px from right edge
-                pip_y = height - pip_size - 80  # 80px from bottom (room for captions)
+                cmd = ["ffmpeg", "-y"]
 
-                # Scale avatar and make circular with border
-                filter_parts.append(
-                    f"[{avatar_input_idx}:v]scale={pip_size}:{pip_size}:force_original_aspect_ratio=decrease,"
-                    f"pad={pip_size}:{pip_size}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,"
-                    f"format=rgba,"
-                    f"geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':"
-                    f"a='if(gt(pow((X-{pip_size}/2),2)+pow((Y-{pip_size}/2),2),pow({pip_size}/2-4,2)),0,255)',"
-                    f"fps={FPS}[avatar]"
+                # Input 0: avatar clip (video + synced audio from SadTalker)
+                cmd += ["-i", str(avatar_clip)]
+
+                # Build filter: scale to frame, keep native FPS
+                vf_filter = (
+                    f"[0:v]scale={width}:{height}:"
+                    f"force_original_aspect_ratio=decrease:flags=lanczos,"
+                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#0f0f2e,"
+                    f"setsar=1[outv]"
                 )
 
-                # Overlay avatar on background
-                filter_parts.append(
-                    f"[bg][avatar]overlay={pip_x}:{pip_y}:format=auto[composed]"
-                )
-                current_label = "composed"
-            else:
-                current_label = "bg"
+                cmd += ["-filter_complex", vf_filter, "-map", "[outv]"]
 
-            # ── Per-word highlighting captions (reference video style) ──
-            narration_text = scene.get("narration", caption_text or "")
-            if include_captions and narration_text:
-                words = narration_text.split()
-                if words:
-                    caption_fontsize = max(int(height * 0.042), 28)
-                    caption_y = int(height * 0.85)
-                    word_duration = actual_duration / len(words) if words else actual_duration
+                # Audio: prefer avatar's own audio (perfectly synced by SadTalker)
+                # Fall back to separate TTS audio only if avatar has no audio track
+                if avatar_has_audio:
+                    cmd += ["-map", "0:a"]
+                    logger.info(f"   [{job_id}] Scene {i}: Using avatar's own synced audio")
+                elif audio_path and Path(audio_path).exists():
+                    cmd += ["-i", str(audio_path), "-map", "1:a"]
+                    logger.info(f"   [{job_id}] Scene {i}: Avatar has no audio, using separate TTS")
 
-                    # Show 3-4 words at a time with the active word highlighted red
-                    chunk_size = min(4, max(2, len(words) // max(1, int(actual_duration / 2))))
-                    if chunk_size < 2:
-                        chunk_size = 3
-                    word_chunks = []
-                    for ci in range(0, len(words), chunk_size):
-                        chunk_words = words[ci:ci + chunk_size]
-                        chunk_start = ci * word_duration
-                        chunk_end = min((ci + chunk_size) * word_duration, actual_duration)
-                        word_chunks.append((chunk_words, chunk_start, chunk_end, ci))
-
-                    # Build drawtext filters for each word in each chunk
-                    # Two layers per word: dark bg (inactive) + red bg (active)
-                    prev_label = current_label
-                    label_counter = 0
-                    for ci, (chunk_words, chunk_start, chunk_end, word_offset) in enumerate(word_chunks):
-                        for wi, word in enumerate(chunk_words):
-                            # Sanitize word for drawtext
-                            safe_word = word.replace("'", "").replace(":", "").replace("%", "")
-                            safe_word = safe_word.replace("\\", "").replace('"', '')
-                            safe_word = safe_word.replace(";", "").replace("[", "").replace("]", "")
-                            if not safe_word:
-                                continue
-
-                            word_abs_idx = word_offset + wi
-                            word_start = word_abs_idx * word_duration
-                            word_end = (word_abs_idx + 1) * word_duration
-
-                            # Calculate x position: center the chunk, offset each word
-                            char_w = caption_fontsize * 0.55
-                            total_chunk_w = sum(len(w) for w in chunk_words) * char_w + (len(chunk_words) - 1) * caption_fontsize * 0.4
-                            chunk_start_x = f"(w-{int(total_chunk_w)})/2"
-                            preceding_w = sum(len(chunk_words[k]) for k in range(wi)) * char_w + wi * caption_fontsize * 0.4
-                            x_expr = f"{chunk_start_x}+{int(preceding_w)}"
-
-                            boxbw = int(caption_fontsize * 0.35)
-
-                            # Layer 1: Dark background (shown during chunk time)
-                            lbl_dark = f"c{label_counter}"
-                            label_counter += 1
-                            dt_dark = [
-                                f"text='{safe_word}'",
-                                f"fontsize={caption_fontsize}",
-                                "fontcolor=white",
-                                f"x={x_expr}",
-                                f"y={caption_y}",
-                                "box=1",
-                                "boxcolor=black@0.65",
-                                f"boxborderw={boxbw}",
-                                f"enable='between(t,{chunk_start:.2f},{chunk_end:.2f})'",
-                            ]
-                            filter_parts.append(
-                                f"[{prev_label}]drawtext={':'.join(dt_dark)}[{lbl_dark}]"
-                            )
-                            prev_label = lbl_dark
-
-                            # Layer 2: Red background (shown only when this word is active)
-                            lbl_red = f"c{label_counter}"
-                            label_counter += 1
-                            dt_red = [
-                                f"text='{safe_word}'",
-                                f"fontsize={caption_fontsize}",
-                                "fontcolor=white",
-                                f"x={x_expr}",
-                                f"y={caption_y}",
-                                "box=1",
-                                "boxcolor=red@0.9",
-                                f"boxborderw={boxbw}",
-                                f"enable='between(t,{word_start:.2f},{word_end:.2f})'",
-                            ]
-                            filter_parts.append(
-                                f"[{prev_label}]drawtext={':'.join(dt_red)}[{lbl_red}]"
-                            )
-                            prev_label = lbl_red
-
-                    current_label = prev_label
-
-            # Final output label
-            filter_parts.append(f"[{current_label}]null[outv]")
-
-            # Build the full filter
-            full_filter = ";\n".join(filter_parts)
-
-            # Output options
-            cmd += [
-                "-filter_complex", full_filter,
-                "-map", "[outv]",
-            ]
-
-            if has_audio:
-                cmd += ["-map", f"{audio_input_idx}:a"]
-
-            cmd += [
-                "-t", str(actual_duration),
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "20",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-r", str(FPS),
-                "-shortest",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                str(scene_out)
-            ]
-
-            logger.info(f"   [{job_id}] Scene {i}: Running ffmpeg (PiP + captions)...")
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                timeout=180  # 3-minute timeout per scene
-            )
-
-            if result.returncode != 0:
-                logger.warning(f"   [{job_id}] Scene {i}: Complex filter failed, using simple mode: {result.stderr[-300:]}")
-                # Fallback: simple b-roll + audio without PiP/captions
-                fallback_cmd = ["ffmpeg", "-y"]
-                if broll_path and Path(broll_path).exists():
-                    fallback_cmd += ["-stream_loop", "-1", "-i", str(broll_path)]
-                    vf = f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#141428,setsar=1,fps={FPS}"
-                else:
-                    fallback_cmd += ["-f", "lavfi", "-i", f"color=c=#141428:s={width}x{height}:r={FPS}:d={actual_duration}"]
-                    vf = f"fps={FPS}"
-
-                if audio_path and Path(audio_path).exists():
-                    fallback_cmd += ["-i", str(audio_path)]
-
-                fallback_cmd += [
-                    "-vf", vf,
-                    "-t", str(actual_duration),
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-shortest", "-movflags", "+faststart",
+                cmd += [
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-crf", "20",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
                     str(scene_out)
                 ]
-                subprocess.run(fallback_cmd, capture_output=True, timeout=120)
+
+                logger.info(f"   [{job_id}] Scene {i}: Running ffmpeg (lip-sync fast path, fps={scene_fps})...")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+                if result.returncode != 0:
+                    logger.warning(f"   [{job_id}] Scene {i}: Lip-sync fast path failed: {result.stderr[-400:]}")
+                    # Fallback: simple re-encode without complex filter
+                    fb_cmd = [
+                        "ffmpeg", "-y", "-i", str(avatar_clip),
+                        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                               f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=#0f0f2e,setsar=1",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                        str(scene_out)
+                    ]
+                    fb_result = subprocess.run(fb_cmd, capture_output=True, text=True, timeout=120)
+                    if fb_result.returncode != 0:
+                        logger.error(f"   [{job_id}] Scene {i}: Fallback also failed: {fb_result.stderr[-300:]}")
+
+            else:
+                # ═══════════════════════════════════════════════════════
+                # STANDARD PATH: No lip-sync clip (static image or no avatar)
+                # ═══════════════════════════════════════════════════════
+                cmd = ["ffmpeg", "-y"]
+                filter_parts = []
+                input_idx = 0
+
+                # Input 0: Background (b-roll or solid color)
+                if broll_path and Path(broll_path).exists():
+                    cmd += ["-stream_loop", "-1", "-i", str(broll_path)]
+                    filter_parts.append(
+                        f"[{input_idx}:v]scale={width*2}:{height*2}:force_original_aspect_ratio=increase,"
+                        f"crop={width}:{height},setsar=1,fps={FPS}[bg]"
+                    )
+                else:
+                    cmd += [
+                        "-f", "lavfi",
+                        "-i", f"color=c=#0f0f2e:s={width}x{height}:r={FPS}:d={actual_duration}"
+                    ]
+                    filter_parts.append(f"[{input_idx}:v]fps={FPS}[bg]")
+                input_idx += 1
+
+                # Input 1: Audio narration
+                has_audio = False
+                if audio_path and Path(audio_path).exists():
+                    cmd += ["-i", str(audio_path)]
+                    audio_input_idx = input_idx
+                    has_audio = True
+                    input_idx += 1
+
+                # Input 2: Static avatar image (if available)
+                has_avatar_img = False
+                if avatar_image_path and Path(avatar_image_path).exists():
+                    cmd += ["-loop", "1", "-i", str(avatar_image_path)]
+                    avatar_input_idx = input_idx
+                    has_avatar_img = True
+                    input_idx += 1
+
+                if has_avatar_img:
+                    filter_parts.append(
+                        f"[{avatar_input_idx}:v]scale={width}:{height}:"
+                        f"force_original_aspect_ratio=increase:flags=lanczos,"
+                        f"crop={width}:{height},setsar=1,"
+                        f"fps={FPS}[avatar]"
+                    )
+                    filter_parts.append(
+                        f"[bg][avatar]overlay=0:0:format=auto[composed]"
+                    )
+                    current_label = "composed"
+                else:
+                    current_label = "bg"
+
+                filter_parts.append(f"[{current_label}]null[outv]")
+                full_filter = ";\n".join(filter_parts)
+
+                cmd += ["-filter_complex", full_filter, "-map", "[outv]"]
+                if has_audio:
+                    cmd += ["-map", f"{audio_input_idx}:a"]
+                cmd += [
+                    "-t", str(actual_duration),
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-r", str(FPS),
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    str(scene_out)
+                ]
+
+                logger.info(f"   [{job_id}] Scene {i}: Running ffmpeg (static/broll path)...")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+                if result.returncode != 0:
+                    logger.warning(f"   [{job_id}] Scene {i}: Composition failed: {result.stderr[-500:]}")
+                    # Minimal fallback
+                    fallback_cmd = ["ffmpeg", "-y"]
+                    if avatar_image_path and Path(avatar_image_path).exists():
+                        fallback_cmd += ["-loop", "1", "-i", str(avatar_image_path)]
+                    elif broll_path and Path(broll_path).exists():
+                        fallback_cmd += ["-i", str(broll_path)]
+                    else:
+                        fallback_cmd += ["-f", "lavfi", "-i", f"color=c=#141428:s={width}x{height}:r={FPS}:d={actual_duration}"]
+                    if audio_path and Path(audio_path).exists():
+                        fallback_cmd += ["-i", str(audio_path)]
+                    fallback_cmd += [
+                        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,crop={width}:{height},setsar=1",
+                        "-t", str(actual_duration),
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-movflags", "+faststart",
+                        str(scene_out)
+                    ]
+                    subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=120)
 
             if scene_out.exists() and scene_out.stat().st_size > 0:
                 scene_files.append(scene_out)
@@ -1533,8 +1648,13 @@ def update_job_status(job_id: str, **kwargs):
 def get_avatar_image_path(avatar_id: str) -> str:
     """Resolve avatar ID to image file path. Auto-generates if missing."""
     # Check custom upload directory first
-    custom_path = AVATAR_DIR / f"custom_{avatar_id}.png"
+    # Handle both 'custom_xxx' (from upload endpoint) and raw IDs
+    if avatar_id.startswith("custom_"):
+        custom_path = AVATAR_DIR / f"{avatar_id}.png"
+    else:
+        custom_path = AVATAR_DIR / f"custom_{avatar_id}.png"
     if custom_path.exists():
+        logger.info(f"✅ Found custom avatar: {custom_path}")
         return str(custom_path)
 
     # Check pre-made avatars
@@ -1624,19 +1744,54 @@ def generate_avatar_video(
             logger.info(f"   Audio[{idx}]: {ap}")
 
         # ── Stage 4: Generate talking head avatars ──
-        # Skip avatar for animated_explainer style (voiceover only, no PiP)
+        # Routes: D-ID (primary) → SadTalker (fallback) → voiceover (objects)
         avatar_image = get_avatar_image_path(avatar_id)
         avatar_clips = [None] * len(scenes)
+        is_face = _is_face_avatar(avatar_id)
+        use_did = is_face and DID_API_KEY
+
         if video_style == "animated_explainer":
             logger.info(f"🎨 [{job_id}] Stage 4: Skipping avatar (animated_explainer style — voiceover only)")
             update_job_status(job_id, progress=45, stage="Animated explainer — skipping avatar...")
+
+        elif not is_face:
+            # Object avatar (banana, car, etc.) — voiceover mode, no lip-sync
+            logger.info(f"🍌 [{job_id}] Stage 4: Object avatar '{avatar_id}' — voiceover mode (no lip-sync)")
+            update_job_status(job_id, progress=45, stage="Object avatar — voiceover mode...")
+            # avatar_clips stays [None, ...], compose will use static image + audio
+
+        elif use_did:
+            # D-ID primary path — text-in, video-out with lip-sync
+            logger.info(f"🎬 [{job_id}] Stage 4: Using D-ID for lip-sync (avatar='{avatar_id}')")
+            update_job_status(job_id, progress=45, stage="Creating AI avatar via D-ID...")
+            # Upload avatar image to D-ID so it gets a publicly accessible URL
+            try:
+                from did_service import upload_image_to_did
+                avatar_url = upload_image_to_did(avatar_image) if avatar_image else ""
+                logger.info(f"📤 [{job_id}] Avatar uploaded to D-ID: {avatar_url[:80]}...")
+            except Exception as e:
+                logger.error(f"❌ [{job_id}] Failed to upload avatar to D-ID: {e}")
+                avatar_url = ""
+            if avatar_url:
+                avatar_clips = generate_all_did_talking_heads(
+                    scenes, job_id, avatar_image_url=avatar_url, language=language,
+                )
+                did_count = sum(1 for c in avatar_clips if c)
+                logger.info(f"✅ [{job_id}] D-ID: {did_count}/{len(scenes)} clips generated")
+            else:
+                logger.warning(f"⚠️ [{job_id}] D-ID avatar upload failed, falling back to SadTalker")
+                if avatar_image and REPLICATE_API_TOKEN:
+                    avatar_clips = generate_all_talking_heads(avatar_image, audio_paths, job_id)
+
         elif avatar_image and REPLICATE_API_TOKEN:
-            logger.info(f"📋 [{job_id}] Stage 4: avatar_image='{avatar_image}', REPLICATE_TOKEN={'set' if REPLICATE_API_TOKEN else 'NOT SET'}")
-            update_job_status(job_id, progress=45, stage="Creating AI avatar...")
+            # SadTalker fallback — needs separate audio + image
+            logger.info(f"📋 [{job_id}] Stage 4: Falling back to SadTalker (no DID_API_KEY)")
+            update_job_status(job_id, progress=45, stage="Creating AI avatar via SadTalker...")
             avatar_clips = generate_all_talking_heads(avatar_image, audio_paths, job_id)
+
         else:
-            update_job_status(job_id, progress=45, stage="Skipping avatar (no image/token)...")
-            logger.info(f"⏭️ [{job_id}] Skipping talking head generation")
+            update_job_status(job_id, progress=45, stage="Skipping avatar (no API keys)...")
+            logger.info(f"⏭️ [{job_id}] Skipping talking head generation (no DID/Replicate keys)")
 
         # ── Stage 5: Search B-roll footage ──
         broll_paths = [None] * len(scenes)
@@ -1654,6 +1809,7 @@ def generate_avatar_video(
         video_path = compose_final_video(
             scenes, audio_paths, avatar_clips, broll_paths,
             job_id, aspect_ratio, include_captions,
+            avatar_image_path=avatar_image or "",
         )
 
         if not video_path:
@@ -1666,6 +1822,20 @@ def generate_avatar_video(
         # ── Stage 7: Upload to storage ──
         update_job_status(job_id, progress=95, stage="Uploading video...")
 
+        # Build scene timing data for frontend side text panel
+        scene_timings = []
+        cumulative = 0.0
+        for idx_s, sc in enumerate(scenes):
+            dur = sc.get("duration_estimate", 10)
+            scene_timings.append({
+                "index": idx_s,
+                "start_time": round(cumulative, 2),
+                "end_time": round(cumulative + dur, 2),
+                "narration": sc.get("narration", ""),
+                "text_overlay": sc.get("text_overlay", ""),
+            })
+            cumulative += dur
+
         result = {
             "status": "completed",
             "job_id": job_id,
@@ -1673,6 +1843,7 @@ def generate_avatar_video(
             "video_url": "",  # Will be set after Supabase upload
             "script": script,
             "scenes": scenes,
+            "scene_timings": scene_timings,
             "scene_count": len(scenes),
             "duration_estimate": sum(s.get("duration_estimate", 10) for s in scenes),
         }
@@ -1680,6 +1851,7 @@ def generate_avatar_video(
         update_job_status(job_id, status="completed", progress=100, stage="Done!",
                           video_path=video_path, video_url="",
                           scene_count=len(scenes),
+                          scene_timings=scene_timings,
                           duration_estimate=sum(s.get("duration_estimate", 10) for s in scenes))
         return result
 
