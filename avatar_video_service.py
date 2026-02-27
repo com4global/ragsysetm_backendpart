@@ -608,8 +608,10 @@ def generate_talking_head(
     job_id: str,
 ) -> Optional[str]:
     """
-    Generate a talking head video with lip-sync using Replicate's Wav2Lip.
-    Input: avatar image + audio → Output: MP4 video of avatar speaking with synced lips.
+    Generate a realistic talking head video using a two-step pipeline:
+      Step 1: SadTalker — generates head animation from still image + audio
+      Step 2: MuseTalk — refines lip-sync on the video for accurate pronunciation
+    If MuseTalk fails, SadTalker's output is used directly (graceful fallback).
     """
     if not REPLICATE_API_TOKEN:
         logger.warning("REPLICATE_API_TOKEN not set — skipping talking head generation")
@@ -629,7 +631,6 @@ def generate_talking_head(
         logger.info(f"   Face URL: {'set' if face_url else 'EMPTY'}, Audio URL: {'set' if audio_url else 'EMPTY'}")
 
         if not face_url or not audio_url:
-            # Fallback: use base64 data URIs
             import base64
             if not face_url:
                 with open(avatar_image_path, "rb") as f:
@@ -640,37 +641,105 @@ def generate_talking_head(
                     audio_b64 = base64.b64encode(f.read()).decode()
                 audio_url = f"data:audio/mp3;base64,{audio_b64}"
 
-        # Use SadTalker — robust single-image talking face animation
-        result = _replicate_api(
-            # cjwbw/sadtalker — audio-driven single image talking face
-            "a519cc0cfebaaeade068b23899165a11ec76aaa1d2b313d40d214f204ec957a3",
-            {
-                "source_image": face_url,
-                "driven_audio": audio_url,
-                "pose_style": 0,
-                "facerender": "facevid2vid",
-                "expression_scale": 1.5,  # Higher value for more pronounced lip/mouth movement
-                "still": False,           # Allow natural head movement for realism
-                "preprocess": "full",     # Keep full image (crop outputs only 256x256 face)
-            },
-            timeout=300,
-        )
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 1: SadTalker — head animation (image → video)
+        # Generates natural head movement + basic mouth animation
+        # ═══════════════════════════════════════════════════════════════
+        sadtalker_path = WORK_DIR / f"{job_id}_st_{scene_index}.mp4"
+        sadtalker_result = None
+        try:
+            logger.info(f"   [{job_id}] Step 1/2: SadTalker head animation for scene {scene_index}...")
+            sadtalker_result = _replicate_api(
+                # cjwbw/sadtalker — audio-driven single image talking face
+                "a519cc0cfebaaeade068b23899165a11ec76aaa1d2b313d40d214f204ec957a3",
+                {
+                    "source_image": face_url,
+                    "driven_audio": audio_url,
+                    "pose_style": 0,
+                    "facerender": "facevid2vid",
+                    "expression_scale": 1.5,
+                    "still": False,
+                    "preprocess": "full",
+                },
+                timeout=300,
+            )
+        except Exception as st_err:
+            logger.error(f"   [{job_id}] SadTalker failed for scene {scene_index}: {st_err}")
 
-        output = result.get("output")
-        if output:
-            video_url = str(output)
-            logger.info(f"   SadTalker output URL: {video_url[:100]}")
-            resp = requests.get(video_url, stream=True, timeout=120)
+        # Download SadTalker output
+        st_output = sadtalker_result.get("output") if sadtalker_result else None
+        if st_output:
+            st_video_url = str(st_output)
+            resp = requests.get(st_video_url, stream=True, timeout=120)
             if resp.status_code == 200:
-                with open(output_path, "wb") as f:
+                with open(sadtalker_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         f.write(chunk)
-                logger.info(f"✅ Lip-sync avatar generated for scene {scene_index} ({output_path.stat().st_size} bytes)")
-                return str(output_path)
+                logger.info(f"   [{job_id}] SadTalker video saved ({sadtalker_path.stat().st_size} bytes)")
             else:
-                logger.error(f"   Download failed with status {resp.status_code}")
+                logger.error(f"   [{job_id}] SadTalker download failed: {resp.status_code}")
+                return None
+        else:
+            logger.error(f"   [{job_id}] SadTalker returned no output for scene {scene_index}")
+            return None
 
-        logger.warning(f"Talking head generation returned no output for scene {scene_index}: {result.get('error', 'unknown')}")
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 2: MuseTalk — lip-sync refinement (video + audio → video)
+        # Refines lip movement for accurate pronunciation
+        # ═══════════════════════════════════════════════════════════════
+        try:
+            logger.info(f"   [{job_id}] Step 2/2: MuseTalk lip refinement for scene {scene_index}...")
+            # Upload SadTalker video to Replicate for MuseTalk input
+            st_video_url_upload = _upload_file_to_replicate(str(sadtalker_path))
+
+            if st_video_url_upload:
+                muse_result = _replicate_api(
+                    # tmappdev/lipsync — MuseTalk-based lip-sync refinement
+                    "569bcd925698ea23d4bece4528546992012d84267ce2438ecc803618ce23764c",
+                    {
+                        "video_input": st_video_url_upload,
+                        "audio_input": audio_url,
+                        "fps": 25,
+                        "bbox_shift": 0,
+                    },
+                    timeout=300,
+                )
+
+                muse_output = muse_result.get("output") if muse_result else None
+                if muse_output:
+                    muse_video_url = str(muse_output)
+                    resp = requests.get(muse_video_url, stream=True, timeout=120)
+                    if resp.status_code == 200:
+                        with open(output_path, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        logger.info(f"✅ [{job_id}] MuseTalk lip-sync refined for scene {scene_index} ({output_path.stat().st_size} bytes)")
+                        # Clean up SadTalker intermediate
+                        try:
+                            sadtalker_path.unlink()
+                        except Exception:
+                            pass
+                        return str(output_path)
+                    else:
+                        logger.warning(f"   [{job_id}] MuseTalk download failed: {resp.status_code}")
+                else:
+                    logger.warning(f"   [{job_id}] MuseTalk returned no output")
+            else:
+                logger.warning(f"   [{job_id}] Could not upload SadTalker video for MuseTalk")
+
+        except Exception as muse_err:
+            logger.warning(f"   [{job_id}] MuseTalk failed for scene {scene_index}: {muse_err}")
+
+        # ═══════════════════════════════════════════════════════════════
+        # FALLBACK: Use SadTalker output directly if MuseTalk fails
+        # ═══════════════════════════════════════════════════════════════
+        if sadtalker_path.exists() and sadtalker_path.stat().st_size > 1000:
+            import shutil
+            shutil.move(str(sadtalker_path), str(output_path))
+            logger.info(f"⚠️ [{job_id}] Using SadTalker fallback for scene {scene_index}")
+            return str(output_path)
+
+        logger.warning(f"Talking head generation returned no output for scene {scene_index}")
         return None
 
     except Exception as e:
@@ -700,8 +769,8 @@ def generate_all_talking_heads(
         idx, ap = idx_ap
         return idx, generate_talking_head(avatar_image_path, ap, idx, job_id)
 
-    # Max 2 parallel to respect Replicate rate limits
-    with ThreadPoolExecutor(max_workers=min(2, len(tasks))) as pool:
+    # Max 3 parallel for speed (Replicate handles concurrent requests)
+    with ThreadPoolExecutor(max_workers=min(3, len(tasks))) as pool:
         for idx, clip in pool.map(_gen, tasks):
             clips[idx] = clip
 
@@ -1283,7 +1352,7 @@ def compose_final_video(
 
                 cmd += [
                     "-c:v", "libx264",
-                    "-preset", "medium",
+                    "-preset", "fast",
                     "-crf", "20",
                     "-c:a", "aac",
                     "-b:a", "192k",
@@ -1618,8 +1687,159 @@ def compose_final_video(
 # ▸ Stage 7: Full Pipeline Orchestrator
 # ═══════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════
+# Persistent topic → video mapping (survives server restarts)
+# ═══════════════════════════════════════════════════════════════════
+_TOPIC_MAP_FILE = WORK_DIR / "_video_topics.json"
+
+def _load_topic_map() -> dict:
+    """Load topic→video mapping from persistent file."""
+    try:
+        if _TOPIC_MAP_FILE.exists():
+            import json
+            return json.loads(_TOPIC_MAP_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_topic_video(topic: str, video_filename: str, user_id: str = ""):
+    """Save a topic→video mapping to the persistent file."""
+    try:
+        import json
+        mapping = _load_topic_map()
+        key = topic.strip().lower()
+        mapping[key] = {
+            "filename": video_filename,
+            "topic": topic,
+            "user_id": user_id,
+        }
+        _TOPIC_MAP_FILE.write_text(json.dumps(mapping, indent=2))
+    except Exception as e:
+        logger.warning(f"Could not save topic mapping: {e}")
+
+def find_video_by_topic(topic: str) -> Optional[dict]:
+    """Find a video for a given topic. Returns dict with url + scene data, or None."""
+    import json
+    key = topic.strip().lower()
+    
+    def _build_result(video_file: str) -> Optional[dict]:
+        """Read meta file for a video and return full result dict."""
+        video_path = WORK_DIR / video_file
+        if not (video_path.exists() and video_path.stat().st_size > 1000):
+            return None
+        url = f"/static/avatar_video_temp/{video_file}"
+        # Try to read scene data from .meta.json
+        job_id = video_file.replace("_final.mp4", "")
+        meta_path = WORK_DIR / f"{job_id}_final.meta.json"
+        script_path = WORK_DIR / f"{job_id}_script.json"
+        scene_timings = []
+        scenes = []
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                scene_timings = meta.get("scene_timings", [])
+                scenes = meta.get("scenes", [])
+            except Exception:
+                pass
+        # Fallback: _script.json has narration text even if meta is old
+        if not scenes and script_path.exists():
+            try:
+                sdata = json.loads(script_path.read_text())
+                scenes = sdata.get("scenes", [])
+            except Exception:
+                pass
+        return {
+            "url": url,
+            "topic": topic,
+            "scene_timings": scene_timings,
+            "scenes": scenes,
+        }
+
+    # 1. Check persistent mapping file first (fastest)
+    mapping = _load_topic_map()
+    entry = mapping.get(key)
+    if entry:
+        result = _build_result(entry["filename"])
+        if result:
+            return result
+
+    # 2. Fallback: scan all .meta.json files for a matching topic
+    for meta_file in WORK_DIR.glob("*_final.meta.json"):
+        try:
+            meta = json.loads(meta_file.read_text())
+            meta_topic = meta.get("topic", "")
+            if meta_topic and meta_topic.strip().lower() == key:
+                job_id = meta_file.name.replace("_final.meta.json", "")
+                video_file = f"{job_id}_final.mp4"
+                result = _build_result(video_file)
+                if result:
+                    _save_topic_video(meta_topic, video_file)
+                    return result
+        except Exception:
+            pass
+
+    return None
+
+
+# Bootstrap: populate topic map from existing .meta.json files on startup
+# Also write _script.json for completed jobs in _jobs dict
+def _bootstrap_topic_map():
+    """Scan all existing .meta.json and _script.json files and populate the topic→video mapping.
+    Also persist scene data from _jobs dict to disk."""
+    import json
+    mapping = _load_topic_map()
+    count = 0
+
+    # 1. Scan .meta.json files
+    for meta_file in WORK_DIR.glob("*_final.meta.json"):
+        try:
+            meta = json.loads(meta_file.read_text())
+            topic = meta.get("topic", "")
+            if topic:
+                key = topic.strip().lower()
+                job_id = meta_file.name.replace("_final.meta.json", "")
+                video_file = f"{job_id}_final.mp4"
+                video_path = WORK_DIR / video_file
+                if video_path.exists() and video_path.stat().st_size > 1000:
+                    if key not in mapping:
+                        mapping[key] = {
+                            "filename": video_file,
+                            "topic": topic,
+                            "user_id": meta.get("user_id", ""),
+                        }
+                        count += 1
+        except Exception:
+            pass
+
+    # 2. Scan _script.json files (have topic + scene data)
+    for script_file in WORK_DIR.glob("*_script.json"):
+        try:
+            sdata = json.loads(script_file.read_text())
+            topic = sdata.get("topic", "")
+            if topic:
+                key = topic.strip().lower()
+                job_id = script_file.name.replace("_script.json", "")
+                video_file = f"{job_id}_final.mp4"
+                video_path = WORK_DIR / video_file
+                if video_path.exists() and video_path.stat().st_size > 1000:
+                    if key not in mapping:
+                        mapping[key] = {
+                            "filename": video_file,
+                            "topic": topic,
+                        }
+                        count += 1
+        except Exception:
+            pass
+
+    if count > 0:
+        _TOPIC_MAP_FILE.write_text(json.dumps(mapping, indent=2))
+        logger.info(f"📋 Bootstrapped {count} new topic→video mappings (total: {len(mapping)})")
+
+
 # In-memory job store for status tracking
 _jobs: Dict[str, Dict] = {}
+
+_bootstrap_topic_map()
 
 
 def get_job_status(job_id: str) -> Optional[Dict]:
@@ -1630,6 +1850,21 @@ def update_job_status(job_id: str, **kwargs):
     if job_id not in _jobs:
         _jobs[job_id] = {}
     _jobs[job_id].update(kwargs)
+    
+    # Auto-persist scene data to disk when job completes
+    if kwargs.get("status") == "completed" and _jobs[job_id].get("scene_timings"):
+        try:
+            import json
+            script_path = WORK_DIR / f"{job_id}_script.json"
+            if not script_path.exists():
+                jdata = _jobs[job_id]
+                json.dump({
+                    "scenes": [{"narration": st.get("narration", ""), "text_overlay": st.get("text_overlay", "")}
+                               for st in jdata.get("scene_timings", [])],
+                    "scene_count": jdata.get("scene_count", 0),
+                }, script_path.open("w"))
+        except Exception:
+            pass
 
 
 def get_avatar_image_path(avatar_id: str) -> str:
@@ -1721,6 +1956,21 @@ def generate_avatar_video(
             update_job_status(job_id, status="failed", error=err)
             return {"status": "failed", "error": err, "job_id": job_id}
         logger.info(f"✅ [{job_id}] Stage 2 done: {len(scenes)} scenes planned")
+
+        # Persist scene data to disk early (survives crashes and restarts)
+        try:
+            import json as _json
+            script_path = WORK_DIR / f"{job_id}_script.json"
+            _json.dump({
+                "topic": topic,
+                "script": script,
+                "scenes": [{"narration": s.get("narration", ""), "text_overlay": s.get("text_overlay", ""),
+                            "duration_estimate": s.get("duration_estimate", 10)} for s in scenes],
+                "scene_count": len(scenes),
+            }, script_path.open("w"))
+            logger.info(f"💾 [{job_id}] Saved script data to {script_path.name}")
+        except Exception:
+            pass
 
         # ── Stage 3: Generate audio for all scenes ──
         update_job_status(job_id, progress=30, stage="Generating voice narration...")
@@ -1865,6 +2115,27 @@ def generate_avatar_video(
                           scene_count=len(scenes),
                           scene_timings=scene_timings,
                           duration_estimate=sum(s.get("duration_estimate", 10) for s in scenes))
+
+        # Save topic metadata + scene data alongside the video for the list endpoint
+        try:
+            import json as _json
+            meta_path = WORK_DIR / f"{job_id}_final.meta.json"
+            _json.dump({
+                "topic": topic,
+                "avatar_id": avatar_id,
+                "language": language,
+                "scene_timings": scene_timings,
+                "scenes": [{"narration": s.get("narration", ""), "text_overlay": s.get("text_overlay", "")} for s in scenes],
+                "script": script,
+                "scene_count": len(scenes),
+                "status": "completed",
+            }, meta_path.open("w"))
+        except Exception:
+            pass
+
+        # Persist topic → video mapping for instant lookup
+        _save_topic_video(topic, f"{job_id}_final.mp4", user_id)
+
         return result
 
     except Exception as e:

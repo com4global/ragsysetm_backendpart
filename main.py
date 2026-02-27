@@ -1555,7 +1555,7 @@ async def edtech_list_documents(
 # In-memory caches for chapters/topics (results don't change once doc is processed)
 _chapters_cache: dict = {}   # key: "user_id:doc_name" → {"data": response, "ts": time}
 _topics_cache: dict = {}     # key: "user_id:doc_name:chapter:language" → {"data": response, "ts": time}
-_EDTECH_CACHE_TTL = 1800     # 30 minutes (chapters/topics don't change)
+_EDTECH_CACHE_TTL = 86400    # 24 hours (topics don't change once extracted)
 
 @app.get("/api/edtech/chapters")
 async def edtech_get_chapters(
@@ -1861,8 +1861,23 @@ async def edtech_extract_topics(
             "chunks_used": len(content_parts),
             "total_chunks": len(all_chunks)
         }
-        # Cache the result
+        # Cache the result in memory
         _topics_cache[topic_cache_key] = {"data": response, "ts": _time.time()}
+
+        # Persist to lesson_cache DB so topics survive server restarts
+        try:
+            persist_chapter = "__all__" if (not chapter or chapter == UNTITLED_DISPLAY) else chapter
+            db_cache_key = _lesson_cache_key(current_user.id, doc_name, persist_chapter, language, "topics")
+            _save_lesson_cache(
+                user_id=current_user.id, cache_key=db_cache_key,
+                doc_name=doc_name, topic=persist_chapter,
+                language=language, lesson_type="topics",
+                lesson_json={"topics": topics, "chapter": chapter},
+            )
+            logger.info(f"💾 Topics saved to DB cache: {doc_name} / {persist_chapter}")
+        except Exception as db_err:
+            logger.warning(f"Could not persist topics to DB (non-fatal): {db_err}")
+
         return response
 
     except Exception as e:
@@ -3815,6 +3830,7 @@ async def avatar_video_generate(
     include_captions: bool = Form(True),
     include_broll: bool = Form(True),
     video_style: str = Form("educational_diagram"),
+    video_mode: str = Form("avatar"),
     current_user: User = Depends(get_current_user),
 ):
     """
@@ -3919,11 +3935,53 @@ async def avatar_video_generate(
 @app.get("/api/avatar-video/status/{job_id}")
 async def avatar_video_status(job_id: str, current_user: User = Depends(get_current_user)):
     """Poll the status of an avatar video generation job."""
-    from avatar_video_service import get_job_status
+    from avatar_video_service import get_job_status, WORK_DIR
     status = get_job_status(job_id)
-    if not status:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return {"success": True, **status}
+    if status:
+        return {"success": True, **status}
+
+    # Fallback: read from .meta.json (persisted scene data survives restarts)
+    import json as _json
+    meta_path = WORK_DIR / f"{job_id}_final.meta.json"
+    script_path = WORK_DIR / f"{job_id}_script.json"
+    scene_timings = []
+    scenes = []
+    script_text = ""
+    found = False
+
+    # Try .meta.json first (has scene_timings with real durations)
+    if meta_path.exists():
+        try:
+            meta = _json.loads(meta_path.read_text())
+            scene_timings = meta.get("scene_timings", [])
+            scenes = meta.get("scenes", [])
+            script_text = meta.get("script", "")
+            found = True
+        except Exception:
+            pass
+
+    # Try _script.json for scene text (always has narration even if meta is old)
+    if not scenes and script_path.exists():
+        try:
+            sdata = _json.loads(script_path.read_text())
+            scenes = sdata.get("scenes", [])
+            script_text = sdata.get("script", "") or script_text
+            found = True
+        except Exception:
+            pass
+
+    if found:
+        return {
+            "success": True,
+            "status": "completed",
+            "progress": 100,
+            "scene_timings": scene_timings,
+            "scenes": scenes,
+            "script": script_text,
+            "scene_count": len(scene_timings) or len(scenes),
+        }
+
+    raise HTTPException(status_code=404, detail="Job not found")
 
 
 @app.get("/api/avatar-video/avatars")
@@ -3933,6 +3991,40 @@ async def avatar_video_list_avatars(current_user: User = Depends(get_current_use
     avatars = list_available_avatars()
     return {"success": True, "avatars": avatars}
 
+
+@app.post("/api/avatar-video/migrate-scripts")
+async def avatar_video_migrate_scripts(current_user: User = Depends(get_current_user)):
+    """One-time migration: persist scene data from memory to disk for all completed jobs."""
+    from avatar_video_service import _jobs, WORK_DIR
+    import json as _json
+    count = 0
+    for jid, jdata in _jobs.items():
+        if jdata.get("status") == "completed" and jdata.get("scene_timings"):
+            script_path = WORK_DIR / f"{jid}_script.json"
+            if not script_path.exists():
+                try:
+                    _json.dump({
+                        "scenes": [{"narration": st.get("narration", ""), "text_overlay": st.get("text_overlay", "")}
+                                   for st in jdata.get("scene_timings", [])],
+                        "scene_count": jdata.get("scene_count", 0),
+                    }, script_path.open("w"))
+                    count += 1
+                except Exception:
+                    pass
+            # Also update .meta.json with scene data if it exists but is missing scenes
+            meta_path = WORK_DIR / f"{jid}_final.meta.json"
+            if meta_path.exists():
+                try:
+                    meta = _json.loads(meta_path.read_text())
+                    if not meta.get("scene_timings"):
+                        meta["scene_timings"] = jdata.get("scene_timings", [])
+                        meta["scenes"] = [{"narration": st.get("narration", ""), "text_overlay": st.get("text_overlay", "")}
+                                         for st in jdata.get("scene_timings", [])]
+                        meta["status"] = "completed"
+                        _json.dump(meta, meta_path.open("w"))
+                except Exception:
+                    pass
+    return {"success": True, "migrated": count, "total_jobs": len(_jobs)}
 
 @app.post("/api/avatar-video/avatar/upload")
 async def avatar_video_upload_avatar(
@@ -3958,6 +4050,19 @@ async def avatar_video_upload_avatar(
         "avatar_id": f"custom_{avatar_id}",
         "message": "Avatar uploaded successfully",
     }
+
+
+@app.get("/api/avatar-video/find-by-topic")
+async def avatar_video_find_by_topic(
+    topic: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Find an already-generated video for a specific topic. Returns URL + scene data if found."""
+    from avatar_video_service import find_video_by_topic
+    result = find_video_by_topic(topic)
+    if result and result.get("url"):
+        return {"success": True, "has_video": True, **result}
+    return {"success": True, "has_video": False}
 
 
 @app.get("/api/avatar-video/list")
@@ -3991,12 +4096,22 @@ async def avatar_video_list(current_user: User = Depends(get_current_user)):
                 local_url = f"/static/avatar_video_temp/{mp4.name}"
                 # Avoid duplicates if already listed from Supabase
                 if not any(v.get("url", "").endswith(mp4.name) for v in videos):
-                    import datetime
+                    import datetime, json as _json
                     mtime = datetime.datetime.fromtimestamp(mp4.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
                     size_mb = mp4.stat().st_size / (1024 * 1024)
                     job_id = mp4.stem.replace("_final", "")
+                    # Read topic metadata if available
+                    vid_topic = ""
+                    meta_path = mp4.parent / f"{job_id}_final.meta.json"
+                    if meta_path.exists():
+                        try:
+                            meta = _json.loads(meta_path.read_text())
+                            vid_topic = meta.get("topic", "")
+                        except Exception:
+                            pass
                     videos.append({
-                        "name": f"Video {job_id[:8]}",
+                        "name": vid_topic or f"Video {job_id[:8]}",
+                        "topic": vid_topic,
                         "url": local_url,
                         "created_at": mtime,
                         "size": f"{size_mb:.1f} MB",
