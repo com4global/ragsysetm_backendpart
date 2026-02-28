@@ -2186,6 +2186,9 @@ def list_available_avatars() -> List[Dict]:
 # ▸ Background Batch Video Pre-Generation Worker
 # ═══════════════════════════════════════════════════════════════════
 
+import threading as _threading
+_cancel_event = _threading.Event()
+
 _batch_worker_status = {
     "running": False,
     "current_topic": "",
@@ -2197,6 +2200,7 @@ _batch_worker_status = {
     "started_at": "",
     "last_completed_at": "",
     "cancelled": False,
+    "paused": False,
 }
 
 
@@ -2263,7 +2267,9 @@ def get_batch_worker_status() -> dict:
 def cancel_batch_worker():
     """Signal the batch worker to stop after the current video."""
     _batch_worker_status["cancelled"] = True
-    logger.info("🛑 Batch video worker cancellation requested")
+    _batch_worker_status["paused"] = True
+    _cancel_event.set()  # Signal immediately
+    logger.info("🛑 Batch video worker cancellation requested — will stop after current topic")
 
 
 def batch_generate_videos(
@@ -2286,6 +2292,7 @@ def batch_generate_videos(
         logger.info("✅ All topics already have avatar videos!")
         return
 
+    _cancel_event.clear()  # Reset cancel signal
     _batch_worker_status.update({
         "running": True,
         "current_topic": "",
@@ -2297,13 +2304,15 @@ def batch_generate_videos(
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "last_completed_at": "",
         "cancelled": False,
+        "paused": False,
     })
 
     logger.info(f"🎬 Batch video worker starting: {len(topics)} topics to generate")
 
     for i, topic in enumerate(topics):
-        if _batch_worker_status["cancelled"]:
-            logger.info(f"🛑 Batch worker cancelled after {i} videos")
+        if _batch_worker_status["cancelled"] or _cancel_event.is_set():
+            logger.info(f"🛑 Batch worker cancelled/paused after {i} videos")
+            _batch_worker_status["paused"] = True
             break
 
         # Skip if video was generated while we were working
@@ -2359,12 +2368,19 @@ def batch_generate_videos(
             logger.error(f"❌ [{i+1}/{len(topics)}] Error generating '{topic}': {e}")
 
         # Brief pause between videos to avoid overloading
-        time.sleep(2)
+        # Also check cancel during the pause for faster response
+        for _ in range(4):
+            if _cancel_event.is_set():
+                break
+            time.sleep(0.5)
 
+    was_cancelled = _batch_worker_status["cancelled"] or _cancel_event.is_set()
     _batch_worker_status["running"] = False
     _batch_worker_status["current_topic"] = ""
+    if was_cancelled:
+        _batch_worker_status["paused"] = True
     logger.info(
-        f"🎉 Batch video worker finished: "
+        f"{'⏸️ Batch video worker paused' if was_cancelled else '🎉 Batch video worker finished'}: "
         f"{_batch_worker_status['completed']} completed, "
         f"{_batch_worker_status['failed']} failed, "
         f"{_batch_worker_status['skipped']} skipped"

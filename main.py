@@ -4379,7 +4379,13 @@ async def avatar_video_batch_cancel(current_user: User = Depends(get_current_use
     if not status.get("running"):
         return {"success": False, "message": "No batch worker is running"}
     cancel_batch_worker()
-    return {"success": True, "message": "Batch worker cancellation requested"}
+    # Return updated status immediately
+    updated = get_batch_worker_status()
+    return {
+        "success": True,
+        "message": "Batch worker cancellation requested — will stop after current topic finishes",
+        "status": updated,
+    }
 
 
 @app.get("/api/avatar-video/topics-without-videos")
