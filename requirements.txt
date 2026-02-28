@@ -19,3 +19,7 @@ Pillow
 stripe
 replicate
 moviepy
+rank-bm25
+sentence-transformers
+tiktoken
+pyyaml

@@ -1,0 +1,78 @@
+{
+    "_description": "Golden evaluation dataset for RAG pipeline quality testing. Each entry is a manually verified QA pair that the system should answer correctly from uploaded documents.",
+    "_instructions": "Add your own QA pairs based on documents your users upload. Each entry needs: question, expected_answer (what the correct answer should contain), relevant_doc (which document has the answer), relevant_page (which page), and difficulty (easy/medium/hard).",
+    "_version": "1.0",
+    "_created": "2026-02-28",
+    "eval_pairs": [
+        {
+            "id": "eval_001",
+            "question": "What are the working hours?",
+            "expected_answer_contains": [
+                "9 AM",
+                "5 PM",
+                "working hours"
+            ],
+            "expected_doc": "HRPolicy.pdf",
+            "expected_page": "any",
+            "difficulty": "easy",
+            "category": "hr_policy",
+            "should_cite_document": true,
+            "notes": "Basic factual question - should be directly answered from HR policy"
+        },
+        {
+            "id": "eval_002",
+            "question": "How many days of annual leave do employees get?",
+            "expected_answer_contains": [
+                "leave",
+                "days"
+            ],
+            "expected_doc": "HRPolicy.pdf",
+            "expected_page": "any",
+            "difficulty": "easy",
+            "category": "hr_policy",
+            "should_cite_document": true,
+            "notes": "Direct factual lookup"
+        },
+        {
+            "id": "eval_003",
+            "question": "What is the company's policy on remote work?",
+            "expected_answer_contains": [
+                "remote",
+                "work"
+            ],
+            "expected_doc": "HRPolicy.pdf",
+            "expected_page": "any",
+            "difficulty": "medium",
+            "category": "hr_policy",
+            "should_cite_document": true,
+            "notes": "May require synthesizing info from multiple paragraphs"
+        },
+        {
+            "id": "eval_004",
+            "question": "What is the capital of France?",
+            "expected_answer_contains": [
+                "Paris"
+            ],
+            "expected_doc": null,
+            "expected_page": null,
+            "difficulty": "easy",
+            "category": "general_knowledge",
+            "should_cite_document": false,
+            "notes": "General knowledge question - should NOT cite documents, should clearly label as general knowledge"
+        },
+        {
+            "id": "eval_005",
+            "question": "Tell me about the performance review process",
+            "expected_answer_contains": [
+                "performance",
+                "review"
+            ],
+            "expected_doc": "HRPolicy.pdf",
+            "expected_page": "any",
+            "difficulty": "medium",
+            "category": "hr_policy",
+            "should_cite_document": true,
+            "notes": "Requires multi-paragraph synthesis"
+        }
+    ]
+}

@@ -1,64 +1,144 @@
 """
-Query Processor with User Isolation
-Processes user queries with proper data isolation
+Query Processor with User Isolation + Hybrid Search + Re-ranking
+================================================================
+Phase 1 RAG Enhancement: 
+  1. Vector search (Pinecone) — semantic similarity
+  2. BM25 search (keyword matching) — exact term/phrase matching  
+  3. Reciprocal Rank Fusion (RRF) — merge results
+  4. Cross-encoder re-ranking — precision scoring
 """
 
 from embedder import embed_User_query
 from vectorstore import search_in_pinecone, search_user_documents
 from llm import query_llm_with_context 
 from typing import Dict, Optional
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
+# Safely import hybrid search modules (graceful fallback if not available)
+try:
+    from bm25_search import bm25_search, merge_search_results
+    BM25_AVAILABLE = True
+    logger.info("✅ BM25 hybrid search module loaded")
+except ImportError:
+    BM25_AVAILABLE = False
+    logger.warning("⚠️ BM25 module not available — using vector-only search")
+
+try:
+    from reranker import rerank_chunks
+    RERANKER_AVAILABLE = True
+    logger.info("✅ Cross-encoder re-ranker module loaded")
+except ImportError:
+    RERANKER_AVAILABLE = False
+    logger.warning("⚠️ Re-ranker module not available — using original ranking")
+
+try:
+    from rag_monitor import QueryTrace
+    MONITOR_AVAILABLE = True
+except ImportError:
+    MONITOR_AVAILABLE = False
 
 
 def process_user_query(query: str, user_id: Optional[str] = None, language: str = "en") -> Dict:
     """
-    Process user query with optional user-specific context
+    Process user query with hybrid search (Vector + BM25) and cross-encoder re-ranking.
     
-    Args:
-        query: The user's question
-        user_id: Optional user ID for data isolation
-        
-    Returns:
-        Dictionary with answer and sources:
-        {
-            "answer": "The work timing is 9 AM to 5 PM...",
-            "sources": [
-                {
-                    "doc_name": "HRPolicy.pdf",
-                    "path": "/resources/user-123/HRPolicy.pdf",
-                    "page": "Page 3"
-                }
-            ]
-        }
+    Pipeline:
+        1. Embed query → Pinecone vector search (semantic)
+        2. BM25 keyword search (exact term matching) 
+        3. Reciprocal Rank Fusion to merge results
+        4. Cross-encoder re-ranker for precision
+        5. Build context → LLM generates answer
+    
+    Graceful degradation:
+        - If BM25 fails → vector-only search  
+        - If re-ranker fails → use merged/vector ranking as-is
     """
+    start_time = time.time()
+    
+    # Initialize monitoring trace (Phase 4)
+    trace = None
+    if MONITOR_AVAILABLE and user_id:
+        try:
+            trace = QueryTrace(user_id, query)
+        except Exception:
+            pass
+    
     # 1. Embed the user question
-    print(f"🔍 Processing query: {query}")
+    logger.info(f"🔍 Processing query: {query[:100]}...")
     if user_id:
-        print(f"👤 User ID: {user_id}")
+        logger.info(f"👤 User ID: {user_id}")
     
     query_vector = embed_User_query(query)
+    embed_time = time.time()
     
-    # 2. Search Pinecone with user context
+    # 2. VECTOR SEARCH (Pinecone — semantic similarity)
+    # Retrieve more candidates (top_k=10) to give re-ranker better options
     if user_id:
-        # User-specific search (isolated data)
-        matches = search_user_documents(
+        vector_results = search_user_documents(
             query_vector=query_vector,
             user_id=user_id,
-            top_k=5
+            top_k=10
         )
     else:
-        # Legacy mode: search all namespaces (no isolation)
-        matches = search_in_pinecone(
+        vector_results = search_in_pinecone(
             query_vector=query_vector,
-            top_k=5
+            top_k=10
         )
     
-    print(f"📄 Found {len(matches)} relevant matches")
+    # Tag vector results with source
+    for r in vector_results:
+        r["source"] = "vector"
     
-    # 3. Build context and sources
+    vector_time = time.time()
+    logger.info(f"📄 Vector search: {len(vector_results)} results ({(vector_time - embed_time)*1000:.0f}ms)")
+    
+    # 3. BM25 KEYWORD SEARCH (if available and user_id provided)
+    bm25_results = []
+    if BM25_AVAILABLE and user_id:
+        try:
+            bm25_results = bm25_search(
+                query=query,
+                user_id=user_id,
+                top_k=10
+            )
+            logger.info(f"🔤 BM25 search: {len(bm25_results)} results")
+        except Exception as e:
+            logger.warning(f"⚠️ BM25 search failed (using vector-only): {e}")
+    
+    bm25_time = time.time()
+    
+    # 4. MERGE RESULTS (Reciprocal Rank Fusion)
+    if bm25_results:
+        merged_results = merge_search_results(vector_results, bm25_results, top_k=10)
+    else:
+        merged_results = vector_results
+    
+    merge_time = time.time()
+    
+    # 5. RE-RANK with cross-encoder (if available)
+    if RERANKER_AVAILABLE and merged_results:
+        try:
+            final_results = rerank_chunks(
+                query=query,
+                chunks=merged_results,
+                top_k=5
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Re-ranking failed (using merged ranking): {e}")
+            final_results = merged_results[:5]
+    else:
+        final_results = merged_results[:5]
+    
+    rerank_time = time.time()
+    
+    # 6. Build context and sources for LLM
     context = ""
     sources = [] 
     
-    for m in matches:
+    for m in final_results:
         # Build sources for the frontend 'Proof'
         if m.get('doc_name') and m.get('doc_name') != 'Unknown':
             source_entry = {
@@ -72,24 +152,82 @@ def process_user_query(query: str, user_id: Optional[str] = None, language: str 
                 sources.append(source_entry)
         
         # Build the context for the LLM
-        # Include the Doc Name and Page so the LLM can 'see' the proof
-        context += f"Document: {m.get('doc_name')} | Page: {m.get('page')} | Path: {m.get('path')}\nContent: {m.get('text')}\n---\n"
+        # Include match info for debugging
+        match_info = ""
+        if m.get("matched_by"):
+            match_info = f" | Matched by: {', '.join(m['matched_by'])}"
+        elif m.get("source"):
+            match_info = f" | Matched by: {m['source']}"
+        
+        context += f"Document: {m.get('doc_name')} | Page: {m.get('page')} | Path: {m.get('path')}{match_info}\nContent: {m.get('text')}\n---\n"
 
-    # 4. Get answer from LLM
+    # 7. Get answer from LLM
     if not context:
         # No documents found — fall back to LLM's general knowledge
-        print("ℹ️ No relevant documents found — falling back to LLM general knowledge")
+        logger.info("ℹ️ No relevant documents found — falling back to LLM general knowledge")
         answer = query_llm_with_context(query, "(No documents uploaded yet. Answer purely from your general knowledge.)", language=language)
         return {
             "answer": answer,
-            "sources": []
+            "sources": [],
+            "citation_coverage": 0.0,
+            "is_grounded": False
         }
 
     answer = query_llm_with_context(query, context, language=language)
     
+    total_time = time.time() - start_time
+    
+    # 8. CITATION COVERAGE SCORING (Phase 2 Enhancement)
+    citation_info = {"citation_coverage": 0.0, "is_grounded": False, "citations_found": [], "has_general_knowledge": True}
+    try:
+        from llm import compute_citation_coverage
+        citation_info = compute_citation_coverage(answer, sources)
+        logger.info(
+            f"📊 Citation coverage: {citation_info['citation_coverage']*100:.0f}% | "
+            f"Grounded: {citation_info['is_grounded']} | "
+            f"Citations: {citation_info['citations_found']}"
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Citation scoring failed (non-critical): {e}")
+    
+    # Log performance breakdown
+    logger.info(
+        f"⏱️ Query pipeline: embed={int((embed_time-start_time)*1000)}ms, "
+        f"vector={int((vector_time-embed_time)*1000)}ms, "
+        f"bm25={int((bm25_time-vector_time)*1000)}ms, "
+        f"merge={int((merge_time-bm25_time)*1000)}ms, "
+        f"rerank={int((rerank_time-merge_time)*1000)}ms, "
+        f"llm={int((total_time-(rerank_time-start_time))*1000)}ms, "
+        f"total={int(total_time*1000)}ms"
+    )
+    
+    # 9. SAVE MONITORING TRACE (Phase 4 — fire-and-forget)
+    if trace:
+        try:
+            trace.record_stage("embed", latency_ms=(embed_time - start_time) * 1000)
+            trace.record_stage("vector_search", latency_ms=(vector_time - embed_time) * 1000, extra={"results": len(vector_results)})
+            trace.record_stage("bm25_search", latency_ms=(bm25_time - vector_time) * 1000, extra={"results": len(bm25_results)})
+            trace.record_stage("merge", latency_ms=(merge_time - bm25_time) * 1000)
+            trace.record_stage("rerank", latency_ms=(rerank_time - merge_time) * 1000, extra={"results": len(final_results)})
+            trace.record_stage("llm", latency_ms=(total_time - (rerank_time - start_time)) * 1000)
+            trace.finalize(
+                answer=answer,
+                sources=sources,
+                citation_coverage=citation_info.get("citation_coverage", 0.0),
+                is_grounded=citation_info.get("is_grounded", False),
+                chunks_retrieved=len(final_results),
+                bm25_used=bool(bm25_results),
+                reranker_used=RERANKER_AVAILABLE
+            )
+            trace.save()
+        except Exception as e:
+            logger.warning(f"⚠️ Monitoring trace save failed (non-critical): {e}")
+    
     result = {
         "answer": answer,
-        "sources": sources
+        "sources": sources,
+        "citation_coverage": citation_info.get("citation_coverage", 0.0),
+        "is_grounded": citation_info.get("is_grounded", False)
     }
     
     if user_id:

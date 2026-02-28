@@ -32,8 +32,8 @@ def create_user_namespace(user_id: str, file_type: str) -> str:
 def process_file(
     file_path: str, 
     user_id: str = None,
-    chunk_size: int = 900, 
-    chunk_overlap: int = 150, 
+    chunk_size: int = 600,     # Phase 3: now token-based (was 900 chars)
+    chunk_overlap: int = 100,  # Phase 3: now token-based (was 150 chars)
     source: str = "single",
     progress_callback=None
 ) -> Dict:
@@ -174,6 +174,20 @@ def process_file(
     if chapters_found:
         print(f"📚 Chapters indexed: {len(chapters_found)}")
 
+    # ─── STEP 4: Store chunks for BM25 keyword search (Phase 1 RAG Enhancement) ───
+    if user_id:
+        try:
+            from bm25_search import store_bm25_chunks
+            bm25_stored = store_bm25_chunks(
+                chunks=all_chunk_texts,
+                metadata_list=all_chunk_metadata,
+                user_id=user_id,
+                doc_name=file_name
+            )
+            print(f"🔤 BM25 indexed: {bm25_stored} chunks for hybrid search")
+        except Exception as e:
+            print(f"⚠️ BM25 indexing skipped (non-critical): {e}")
+
     return {
         "file_name": file_name,
         "file_path": file_path,
@@ -188,8 +202,8 @@ def process_file(
 def process_folder(
     folder_path: str,
     user_id: str = None,
-    chunk_size: int = 900,
-    chunk_overlap: int = 150,
+    chunk_size: int = 600,     # Phase 3: token-based
+    chunk_overlap: int = 100,  # Phase 3: token-based
     source: str = "sharepoint"
 ) -> List[Dict]:
     """

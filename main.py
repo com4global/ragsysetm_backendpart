@@ -126,6 +126,13 @@ async def lifespan(app: FastAPI):
     _auto_batch_task = asyncio.create_task(_auto_batch_video_scheduler())
     logger.info("🎬 Auto-batch video scheduler registered (starts in 60s)")
     
+    # Warmup cross-encoder re-ranker model (Phase 1 RAG Enhancement)
+    try:
+        from reranker import warmup_reranker
+        warmup_reranker()
+    except Exception as e:
+        logger.warning(f"⚠️ Re-ranker warmup skipped: {e}")
+    
     yield
     
     # Shutdown: stop workers gracefully
@@ -903,6 +910,20 @@ async def ingest_url(
 ):
     """Extract text from a web page URL and process it through the embedding pipeline."""
     try:
+        # ── Plan enforcement ──────────────────────────────────────────────
+        from billing_service import get_user_subscription as _get_sub, check_file_type_allowed, check_total_storage
+        sub_info = _get_sub(current_user.id)
+        plan_name = sub_info.get("plan", "free")
+
+        # Web URL ingestion produces .txt files — check if plan allows it
+        type_ok, type_reason = check_file_type_allowed(plan_name, "webpage.txt")
+        if not type_ok:
+            raise HTTPException(
+                status_code=403,
+                detail={"upgrade_required": True, "reason": f"Web URL ingestion is not available on the {plan_name.capitalize()} plan. Upgrade to Pro or above.", "current_plan": plan_name},
+            )
+        # ── End enforcement ───────────────────────────────────────────────
+
         logger.info(f"🌐 Ingesting URL: {url} for user {current_user.id}")
 
         # Fetch the web page
@@ -1022,6 +1043,20 @@ async def process_youtube(
 ):
     """Fetch YouTube video transcript via captions API, save as text, and process through RAG pipeline."""
     try:
+        # ── Plan enforcement ──────────────────────────────────────────────
+        from billing_service import get_user_subscription as _get_sub, check_file_type_allowed
+        sub_info = _get_sub(current_user.id)
+        plan_name = sub_info.get("plan", "free")
+
+        # YouTube ingestion produces .txt files — check if plan allows it
+        type_ok, type_reason = check_file_type_allowed(plan_name, "youtube.txt")
+        if not type_ok:
+            raise HTTPException(
+                status_code=403,
+                detail={"upgrade_required": True, "reason": f"YouTube processing is not available on the {plan_name.capitalize()} plan. Upgrade to Pro or above.", "current_plan": plan_name},
+            )
+        # ── End enforcement ───────────────────────────────────────────────
+
         url = request.url.strip()
         logger.info(f"🎬 Processing YouTube URL: {url} for user {current_user.id}")
 
@@ -4686,6 +4721,84 @@ async def admin_platform_stats(admin: User = Depends(require_admin)):
         logger.error(f"Admin stats failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Admin: RAG Pipeline Metrics (Phase 4) ────────────────────────────────────
+
+@app.get("/api/admin/rag-metrics")
+async def admin_rag_metrics(
+    days: int = 7,
+    user_id: str = None,
+    admin: User = Depends(require_admin)
+):
+    """Return RAG pipeline performance metrics: latency, cost, citation quality."""
+    try:
+        from rag_monitor import get_rag_metrics
+        metrics = get_rag_metrics(days=days, user_id=user_id)
+        return {"success": True, "metrics": metrics}
+    except Exception as e:
+        logger.error(f"RAG metrics failed: {e}")
+        return {"success": False, "error": str(e), "metrics": {}}
+
+# ── Admin: RAG Evaluation (Phase 5) ──────────────────────────────────────────
+
+@app.post("/api/admin/run-evaluation")
+async def admin_run_evaluation(
+    user_id: str = None,
+    admin: User = Depends(require_admin)
+):
+    """Run RAG evaluation against golden QA dataset. Returns quality scores."""
+    try:
+        from evaluations.eval_runner import run_evaluation
+        # Use admin's own user_id if none specified
+        eval_user = user_id or admin.id
+        report = run_evaluation(user_id=eval_user, save_results=True)
+        return {"success": True, "report": report}
+    except Exception as e:
+        logger.error(f"Evaluation run failed: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/admin/evaluation-results")
+async def admin_get_evaluation_results(admin: User = Depends(require_admin)):
+    """Get the most recent evaluation results."""
+    try:
+        import glob
+        eval_dir = os.path.join(os.path.dirname(__file__), "evaluations")
+        result_files = sorted(glob.glob(os.path.join(eval_dir, "eval_results_*.json")), reverse=True)
+        
+        if not result_files:
+            return {"success": True, "results": [], "message": "No evaluation runs yet"}
+        
+        # Return latest 5 results
+        results = []
+        for f in result_files[:5]:
+            with open(f, "r") as fp:
+                data = json.loads(fp.read())
+                # Only include summary, not full details
+                results.append({
+                    "file": os.path.basename(f),
+                    "timestamp": data.get("timestamp"),
+                    "pass_rate": data.get("pass_rate"),
+                    "total_pairs": data.get("total_pairs"),
+                    "aggregate_scores": data.get("aggregate_scores"),
+                })
+        
+        return {"success": True, "results": results}
+    except Exception as e:
+        logger.error(f"Evaluation results fetch failed: {e}")
+        return {"success": False, "error": str(e)}
+
+# ── Admin: Prompt Management (Phase 6) ───────────────────────────────────────
+
+@app.get("/api/admin/prompts")
+async def admin_list_prompts(admin: User = Depends(require_admin)):
+    """List all available prompt configs with version info."""
+    try:
+        from prompt_loader import list_prompts
+        prompts = list_prompts()
+        return {"success": True, "prompts": prompts}
+    except Exception as e:
+        logger.error(f"Prompt listing failed: {e}")
+        return {"success": False, "error": str(e), "prompts": []}
 
 # ── Admin: List All Users ─────────────────────────────────────────────────────
 
