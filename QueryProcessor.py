@@ -227,7 +227,9 @@ def process_user_query(query: str, user_id: Optional[str] = None, language: str 
         "answer": answer,
         "sources": sources,
         "citation_coverage": citation_info.get("citation_coverage", 0.0),
-        "is_grounded": citation_info.get("is_grounded", False)
+        "is_grounded": citation_info.get("is_grounded", False),
+        "context_chunks": [m.get("text", "") for m in final_results],  # For faithfulness monitoring
+        "response_time_ms": total_time * 1000,
     }
     
     if user_id:

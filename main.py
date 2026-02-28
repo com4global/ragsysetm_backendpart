@@ -133,6 +133,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ Re-ranker warmup skipped: {e}")
     
+    # Start faithfulness background monitor (Phase 7 — zero latency impact)
+    try:
+        from faithfulness_monitor import start_worker as start_faithfulness_worker
+        start_faithfulness_worker()
+    except Exception as e:
+        logger.warning(f"⚠️ Faithfulness monitor start skipped: {e}")
+    
     yield
     
     # Shutdown: stop workers gracefully
@@ -142,6 +149,12 @@ async def lifespan(app: FastAPI):
         _auto_batch_task.cancel()
     from avatar_video_service import cancel_batch_worker
     cancel_batch_worker()
+    # Stop faithfulness monitor
+    try:
+        from faithfulness_monitor import stop_worker as stop_faithfulness_worker
+        stop_faithfulness_worker()
+    except Exception:
+        pass
     for _ in range(MAX_CONCURRENT_WORKERS):
         await _job_queue.put(None)  # Poison pill
     for task in _worker_tasks:
@@ -1501,6 +1514,22 @@ async def chat_endpoint(request: QueryRequest, current_user: User = Depends(get_
     except Exception as e:
         logger.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Faithfulness monitoring — runs AFTER response is sent, zero latency
+        try:
+            from faithfulness_monitor import maybe_enqueue
+            if 'result' in dir():
+                doc_name = result.get("sources", [{}])[0].get("doc_name") if result.get("sources") else None
+                maybe_enqueue(
+                    question=request.query,
+                    answer=result.get("answer", ""),
+                    context_chunks=result.get("context_chunks", []),
+                    user_id=current_user.id,
+                    doc_name=doc_name,
+                    response_time_ms=result.get("response_time_ms"),
+                )
+        except Exception:
+            pass  # Never let monitoring break the response
 
 def _read_local_file_metadata():
     """Read file metadata from local .file_metadata.json"""
@@ -4799,6 +4828,51 @@ async def admin_list_prompts(admin: User = Depends(require_admin)):
     except Exception as e:
         logger.error(f"Prompt listing failed: {e}")
         return {"success": False, "error": str(e), "prompts": []}
+
+
+# ── Admin: Faithfulness Monitoring Stats ──────────────────────────────────────
+
+@app.get("/api/admin/faithfulness")
+async def admin_faithfulness_stats(admin: User = Depends(require_admin)):
+    """Return faithfulness monitoring stats and recent scores."""
+    try:
+        from faithfulness_monitor import get_stats
+        stats = get_stats()
+
+        # Also fetch recent scores from DB if available
+        recent_scores = []
+        try:
+            result = supabase.table("faithfulness_scores") \
+                .select("question,score,hallucinated,reason,doc_name,scored_at") \
+                .order("scored_at", desc=True) \
+                .limit(20) \
+                .execute()
+            recent_scores = result.data or []
+        except Exception:
+            pass  # Table may not exist yet
+
+        # Fetch low-score alerts
+        low_scores = []
+        try:
+            result = supabase.table("faithfulness_scores") \
+                .select("question,answer_preview,score,reason,doc_name,scored_at") \
+                .lt("score", 0.5) \
+                .order("scored_at", desc=True) \
+                .limit(10) \
+                .execute()
+            low_scores = result.data or []
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "monitor": stats,
+            "recent_scores": recent_scores,
+            "low_score_alerts": low_scores,
+        }
+    except Exception as e:
+        logger.error(f"Faithfulness stats failed: {e}")
+        return {"success": False, "error": str(e)}
 
 # ── Admin: List All Users ─────────────────────────────────────────────────────
 
