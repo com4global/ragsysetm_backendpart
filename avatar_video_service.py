@@ -1734,11 +1734,13 @@ def find_video_by_topic(topic: str) -> Optional[dict]:
         script_path = WORK_DIR / f"{job_id}_script.json"
         scene_timings = []
         scenes = []
+        video_mode = "presentation"
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text())
                 scene_timings = meta.get("scene_timings", [])
                 scenes = meta.get("scenes", [])
+                video_mode = meta.get("video_mode", "presentation")
             except Exception:
                 pass
         # Fallback: _script.json has narration text even if meta is old
@@ -1751,6 +1753,7 @@ def find_video_by_topic(topic: str) -> Optional[dict]:
         return {
             "url": url,
             "topic": topic,
+            "video_mode": video_mode,
             "scene_timings": scene_timings,
             "scenes": scenes,
         }
@@ -1924,6 +1927,7 @@ def generate_avatar_video(
     include_broll: bool = True,
     job_id: str = "",
     video_style: str = "educational_diagram",
+    video_mode: str = "presentation",
 ) -> Dict:
     """
     Full avatar video generation pipeline.
@@ -2124,6 +2128,7 @@ def generate_avatar_video(
                 "topic": topic,
                 "avatar_id": avatar_id,
                 "language": language,
+                "video_mode": video_mode,
                 "scene_timings": scene_timings,
                 "scenes": [{"narration": s.get("narration", ""), "text_overlay": s.get("text_overlay", "")} for s in scenes],
                 "script": script,

@@ -3875,6 +3875,7 @@ async def avatar_video_generate(
                 include_broll=include_broll,
                 job_id=job_id,
                 video_style=video_style,
+                video_mode=video_mode,
             )
 
             logger.info(f"📋 [{job_id}] Pipeline returned: status={result.get('status')}, error={result.get('error', 'none')}")
@@ -3971,10 +3972,22 @@ async def avatar_video_status(job_id: str, current_user: User = Depends(get_curr
             pass
 
     if found:
+        # Read video_mode from meta file  
+        _video_mode = "presentation"
+        if meta_path.exists():
+            try:
+                meta_data = _json.loads(meta_path.read_text())
+                _video_mode = meta_data.get("video_mode", "presentation")
+            except Exception:
+                pass
+        # Build video_url from job_id
+        _video_url = f"/static/avatar_video_temp/{job_id}_final.mp4"
         return {
             "success": True,
             "status": "completed",
             "progress": 100,
+            "video_url": _video_url,
+            "video_mode": _video_mode,
             "scene_timings": scene_timings,
             "scenes": scenes,
             "script": script_text,
@@ -4102,17 +4115,20 @@ async def avatar_video_list(current_user: User = Depends(get_current_user)):
                     job_id = mp4.stem.replace("_final", "")
                     # Read topic metadata if available
                     vid_topic = ""
+                    vid_mode = "presentation"
                     meta_path = mp4.parent / f"{job_id}_final.meta.json"
                     if meta_path.exists():
                         try:
                             meta = _json.loads(meta_path.read_text())
                             vid_topic = meta.get("topic", "")
+                            vid_mode = meta.get("video_mode", "presentation")
                         except Exception:
                             pass
                     videos.append({
                         "name": vid_topic or f"Video {job_id[:8]}",
                         "topic": vid_topic,
                         "url": local_url,
+                        "video_mode": vid_mode,
                         "created_at": mtime,
                         "size": f"{size_mb:.1f} MB",
                         "source": "local",
