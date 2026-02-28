@@ -2180,3 +2180,192 @@ def list_available_avatars() -> List[Dict]:
         })
 
     return avatars
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ▸ Background Batch Video Pre-Generation Worker
+# ═══════════════════════════════════════════════════════════════════
+
+_batch_worker_status = {
+    "running": False,
+    "current_topic": "",
+    "completed": 0,
+    "total": 0,
+    "failed": 0,
+    "skipped": 0,
+    "errors": [],
+    "started_at": "",
+    "last_completed_at": "",
+    "cancelled": False,
+}
+
+
+def get_all_topics_without_videos() -> list:
+    """
+    Discover all topics from local .meta.json files and the _video_topics.json,
+    then find which ones DON'T have avatar videos yet.
+    Returns list of topic titles that need video generation.
+    """
+    import json
+
+    existing = _load_topic_map()
+    existing_keys = set(existing.keys())
+
+    # Strategy 1: Scan all lesson_cache topics from local meta/script files
+    all_topics = set()
+
+    # Scan _script.json files for topics
+    for script_file in WORK_DIR.glob("*_script.json"):
+        try:
+            sdata = json.loads(script_file.read_text())
+            topic = sdata.get("topic", "")
+            if topic:
+                all_topics.add(topic.strip())
+        except Exception:
+            pass
+
+    # Scan _final.meta.json files for topics
+    for meta_file in WORK_DIR.glob("*_final.meta.json"):
+        try:
+            meta = json.loads(meta_file.read_text())
+            topic = meta.get("topic", "")
+            if topic:
+                all_topics.add(topic.strip())
+        except Exception:
+            pass
+
+    # Strategy 2: Also include topics from existing mapping (already generated)
+    for entry in existing.values():
+        topic = entry.get("topic", "")
+        if topic:
+            all_topics.add(topic.strip())
+
+    # Filter: only topics that DON'T have a valid video
+    missing = []
+    for topic in sorted(all_topics):
+        key = topic.strip().lower()
+        if key in existing_keys:
+            # Verify the video file actually exists
+            entry = existing[key]
+            video_file = entry.get("filename", "")
+            if video_file and (WORK_DIR / video_file).exists():
+                continue  # Already has a valid video
+        missing.append(topic)
+
+    return missing
+
+
+def get_batch_worker_status() -> dict:
+    """Return the current status of the background batch worker."""
+    return dict(_batch_worker_status)
+
+
+def cancel_batch_worker():
+    """Signal the batch worker to stop after the current video."""
+    _batch_worker_status["cancelled"] = True
+    logger.info("🛑 Batch video worker cancellation requested")
+
+
+def batch_generate_videos(
+    topics: list = None,
+    user_id: str = "",
+    voice: str = "nova",
+    avatar_id: str = "teacher_female_1",
+    video_mode: str = "presentation",
+):
+    """
+    Generate avatar videos for a list of topics (or all missing topics).
+    Runs synchronously — should be called from a background thread.
+    """
+    import time
+
+    if topics is None:
+        topics = get_all_topics_without_videos()
+
+    if not topics:
+        logger.info("✅ All topics already have avatar videos!")
+        return
+
+    _batch_worker_status.update({
+        "running": True,
+        "current_topic": "",
+        "completed": 0,
+        "total": len(topics),
+        "failed": 0,
+        "skipped": 0,
+        "errors": [],
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "last_completed_at": "",
+        "cancelled": False,
+    })
+
+    logger.info(f"🎬 Batch video worker starting: {len(topics)} topics to generate")
+
+    for i, topic in enumerate(topics):
+        if _batch_worker_status["cancelled"]:
+            logger.info(f"🛑 Batch worker cancelled after {i} videos")
+            break
+
+        # Skip if video was generated while we were working
+        key = topic.strip().lower()
+        mapping = _load_topic_map()
+        if key in mapping:
+            entry = mapping[key]
+            video_file = entry.get("filename", "")
+            if video_file and (WORK_DIR / video_file).exists():
+                _batch_worker_status["skipped"] += 1
+                _batch_worker_status["completed"] += 1
+                logger.info(f"⏭️ [{i+1}/{len(topics)}] Skipping '{topic}' — already exists")
+                continue
+
+        _batch_worker_status["current_topic"] = topic
+        logger.info(f"🎬 [{i+1}/{len(topics)}] Generating video for: '{topic}'")
+
+        try:
+            import hashlib
+            job_id = hashlib.md5(
+                f"batch:{topic}:{time.time()}".encode()
+            ).hexdigest()[:12]
+
+            result = generate_avatar_video(
+                topic=topic,
+                content="",  # Let the pipeline search for content
+                user_id=user_id,
+                avatar_id=avatar_id,
+                language="en",
+                voice=voice,
+                style="educational",
+                aspect_ratio="16:9",
+                include_captions=True,
+                include_broll=True,
+                job_id=job_id,
+                video_style="educational_diagram",
+                video_mode=video_mode,
+            )
+
+            if result.get("status") == "completed":
+                _batch_worker_status["completed"] += 1
+                _batch_worker_status["last_completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                logger.info(f"✅ [{i+1}/{len(topics)}] Video generated: '{topic}'")
+            else:
+                _batch_worker_status["failed"] += 1
+                err_msg = result.get("error", "Unknown error")
+                _batch_worker_status["errors"].append(f"{topic}: {err_msg}")
+                logger.warning(f"❌ [{i+1}/{len(topics)}] Failed for '{topic}': {err_msg}")
+
+        except Exception as e:
+            _batch_worker_status["failed"] += 1
+            _batch_worker_status["errors"].append(f"{topic}: {str(e)}")
+            logger.error(f"❌ [{i+1}/{len(topics)}] Error generating '{topic}': {e}")
+
+        # Brief pause between videos to avoid overloading
+        time.sleep(2)
+
+    _batch_worker_status["running"] = False
+    _batch_worker_status["current_topic"] = ""
+    logger.info(
+        f"🎉 Batch video worker finished: "
+        f"{_batch_worker_status['completed']} completed, "
+        f"{_batch_worker_status['failed']} failed, "
+        f"{_batch_worker_status['skipped']} skipped"
+    )
