@@ -148,8 +148,10 @@ app = FastAPI(title="RAG HR Assistant", version="2.0", lifespan=lifespan)
 origins = [
     "http://localhost:3000",
     "http://localhost:3001",
+    "http://localhost:3002",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
+    "http://127.0.0.1:3002",
     "https://ragsysetm-backendpart.onrender.com",
     "https://zenzeebot.netlify.app",
     "https://ragsystem-1f65p6bm4-com4globals-projects.vercel.app",
@@ -4147,6 +4149,102 @@ async def avatar_video_list(current_user: User = Depends(get_current_user)):
         logger.warning(f"Local video scan failed: {e}")
 
     return {"success": True, "videos": videos}
+
+
+@app.get("/api/avatar-video/dashboard")
+async def avatar_video_dashboard(current_user: User = Depends(get_current_user)):
+    """
+    Dashboard endpoint: returns all documents with their topics,
+    each annotated with video generation status (has_video, video_url).
+    Also includes batch worker status for real-time progress display.
+    """
+    from avatar_video_service import (
+        _load_topic_map, get_batch_worker_status, WORK_DIR
+    )
+
+    # 1. Get all topics from lesson_cache grouped by document
+    documents = {}  # doc_name -> { topics: [...], ... }
+    try:
+        result = supabase.table("lesson_cache").select("doc_name, lesson_json, topic") \
+            .eq("lesson_type", "topics").execute()
+        for row in (result.data or []):
+            doc_name = row.get("doc_name", "Unknown")
+            lesson_json = row.get("lesson_json", {})
+            if isinstance(lesson_json, str):
+                import json as _j
+                try:
+                    lesson_json = _j.loads(lesson_json)
+                except Exception:
+                    continue
+            topics_list = lesson_json.get("topics", [])
+            if doc_name not in documents:
+                documents[doc_name] = {"doc_name": doc_name, "topics": []}
+            for t in topics_list:
+                if isinstance(t, dict):
+                    title = t.get("title") or t.get("name") or ""
+                    desc = t.get("description", "")
+                    difficulty = t.get("difficulty", "")
+                    key_concepts = t.get("key_concepts", [])
+                else:
+                    title = str(t)
+                    desc = ""
+                    difficulty = ""
+                    key_concepts = []
+                if title.strip():
+                    # Skip duplicate topics within same document
+                    existing_titles = [tp["title"].lower() for tp in documents[doc_name]["topics"]]
+                    if title.strip().lower() not in existing_titles:
+                        documents[doc_name]["topics"].append({
+                            "title": title.strip(),
+                            "description": desc,
+                            "difficulty": difficulty,
+                            "key_concepts": key_concepts,
+                        })
+    except Exception as e:
+        logger.warning(f"Dashboard: lesson_cache query failed: {e}")
+
+    # 2. Load video topic map and check which topics have videos
+    topic_map = _load_topic_map()
+    total_topics = 0
+    total_with_video = 0
+
+    for doc_name, doc_data in documents.items():
+        for topic_entry in doc_data["topics"]:
+            total_topics += 1
+            key = topic_entry["title"].strip().lower()
+            if key in topic_map:
+                entry = topic_map[key]
+                video_file = entry.get("filename", "")
+                if video_file and (WORK_DIR / video_file).exists():
+                    topic_entry["has_video"] = True
+                    topic_entry["video_url"] = f"/static/avatar_video_temp/{video_file}"
+                    topic_entry["video_mode"] = entry.get("video_mode", "presentation")
+                    total_with_video += 1
+                else:
+                    topic_entry["has_video"] = False
+                    topic_entry["video_url"] = None
+            else:
+                topic_entry["has_video"] = False
+                topic_entry["video_url"] = None
+
+    # 3. Get batch worker status
+    batch_status = get_batch_worker_status()
+
+    # 4. Sort documents by name
+    doc_list = sorted(documents.values(), key=lambda d: d["doc_name"])
+
+    return {
+        "success": True,
+        "documents": doc_list,
+        "summary": {
+            "total_documents": len(doc_list),
+            "total_topics": total_topics,
+            "topics_with_video": total_with_video,
+            "topics_without_video": total_topics - total_with_video,
+            "completion_percent": round((total_with_video / total_topics * 100) if total_topics > 0 else 0, 1),
+        },
+        "batch_status": batch_status,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
