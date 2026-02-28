@@ -77,7 +77,11 @@ def extract_topics(chunks_text: str, language: str = "en", doc_names: Optional[L
     """
     lang_instruction = ""
     if language == "ta":
-        lang_instruction = "\nIMPORTANT: Generate all topic titles and descriptions in Tamil (தமிழ்). Keep document names in English."
+        lang_instruction = (
+            "\nIMPORTANT: Generate topic titles and descriptions in THANGLISH style "
+            "(Tamil script mixed with English technical terms and common words). "
+            "Example: 'AI Technology-ன் Basics'. Keep document names in English."
+        )
 
     doc_list = ""
     if doc_names:
@@ -151,9 +155,14 @@ def generate_teacher_dialogue(topic: str, content: str, language: str = "en") ->
     lang_instruction = ""
     if language == "ta":
         lang_instruction = """
-CRITICAL: Generate the ENTIRE dialogue in Tamil (தமிழ்). 
-Teacher names can stay in English, but ALL dialogue text MUST be in Tamil.
-Use simple, conversational Tamil that students can easily understand."""
+CRITICAL: Generate the ENTIRE dialogue in THANGLISH style — this means:
+- Write in Tamil script (தமிழ்) as the primary language.
+- Mix in English words naturally for technical terms, greetings, and common phrases.
+- Use everyday conversational Tamil, NOT formal literary Tamil.
+- Example style: 'Hello friends! இன்று நாம் AI technology பற்றி learn பண்ணலாம்.'
+- Keep the tone friendly, casual, and easy to understand like daily Tamil conversation.
+- Students should feel like a friend is explaining, not a textbook.
+- Teacher names can stay in English."""
 
     prompt = f"""You are a script writer for an EdTech platform. Create an engaging dialogue between two AI teachers.
 

@@ -28,13 +28,14 @@ def query_llm_with_context(question: str, context: str, language: str = "en") ->
     # Add Tamil language instruction when requested
     if language == "ta":
         system_prompt += (
-            "\n\nCRITICAL LANGUAGE INSTRUCTION: You MUST respond ENTIRELY in Tamil (தமிழ்). "
-            "Use Tamil script for ALL text in your response. "
-            "Document names and technical terms can remain in English, but all explanations, "
-            "sentences, and descriptions must be in Tamil. "
-            "For example, instead of 'According to [HRPolicy.pdf], the policy is...', "
-            "say '[HRPolicy.pdf] படி, கொள்கை என்னவென்றால்...'. "
-            "If answering from general knowledge, say: 'பொது அறிவிலிருந்து (உங்கள் ஆவணங்களிலிருந்து அல்ல):'"
+            "\n\nCRITICAL LANGUAGE INSTRUCTION: You MUST respond in THANGLISH style. "
+            "Use Tamil script (தமிழ்) as the primary language, but mix in English words "
+            "naturally for technical terms, greetings, and common phrases. "
+            "Use everyday conversational Tamil, NOT formal literary Tamil. "
+            "Example: '[HRPolicy.pdf] படி, இந்த policy-ன் main point என்னன்னா...' "
+            "Document names and technical terms can stay in English. "
+            "If answering from general knowledge, say: 'General knowledge-லிருந்து (உங்க documents-ல இல்ல):' "
+            "Keep the tone friendly and easy to understand like daily Tamil conversation."
         )
 
     user_prompt = f"CONTEXT:\n{context}\n\nUSER QUESTION:\n{question}"

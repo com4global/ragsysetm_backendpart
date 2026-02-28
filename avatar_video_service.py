@@ -149,11 +149,22 @@ def generate_video_script(
     }
     style_desc = style_prompts.get(style, style_prompts["educational"])
 
+    lang_rule = f"- Write in {language} language"
+    if language == "ta":
+        lang_rule = (
+            "- Write the ENTIRE script in THANGLISH style:\n"
+            "  - Use Tamil script (தமிழ்) as the primary language.\n"
+            "  - Mix in English words naturally for technical terms, greetings, and common phrases.\n"
+            "  - Use everyday conversational Tamil, NOT formal literary Tamil.\n"
+            "  - Example: 'Hello friends! இன்று நாம் AI technology பற்றி learn பண்ணலாம்.'\n"
+            "  - Keep the tone friendly, casual, and easy to understand."
+        )
+
     system_prompt = f"""You are an expert video script writer. Write a script for {style_desc}.
 
 Rules:
 - Target duration: {duration_target}
-- Write in {language} language
+{lang_rule}
 - Use a conversational, engaging tone
 - Include natural pauses (marked as [PAUSE])
 - Structure: Opening hook → Main content → Summary/CTA
@@ -359,23 +370,101 @@ def generate_scene_audio(
 
 
 def _generate_sarvam_tts(text: str, output_path: Path, language: str = "ta"):
-    """Generate TTS using Sarvam AI for Indian languages."""
+    """Generate TTS using Sarvam AI bulbul:v2 for Indian languages.
+    Handles long text by chunking at sentence boundaries (400 char limit).
+    Uses the same correct approach as heygen_service.generate_sarvam_tts."""
+    import base64, io, wave, re as _re, random as _rnd
+
     headers = {"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"}
-    payload = {
-        "inputs": [text[:500]],
-        "target_language_code": language,
-        "speaker": "meera",
-        "model": "bulbul:v1",
-        "enable_preprocessing": True,
-    }
-    resp = requests.post("https://api.sarvam.ai/text-to-speech", json=payload, headers=headers)
-    if resp.status_code == 200:
-        data = resp.json()
-        import base64
-        audio_b64 = data.get("audios", [""])[0]
-        if audio_b64:
-            with open(output_path, "wb") as f:
-                f.write(base64.b64decode(audio_b64))
+
+    # ── Chunk text at sentence boundaries (Sarvam v2 limit: ~400 chars) ──
+    CHUNK_SIZE = 400
+    sentence_list = _re.split(r'(?<=[.!?।])\s+', text.strip())
+    sentence_list = [s.strip() for s in sentence_list if s.strip()]
+
+    chunks = []
+    current_chunk = ""
+    for sentence in sentence_list:
+        if len(sentence) > CHUNK_SIZE:
+            words = sentence.split()
+            for word in words:
+                if len(current_chunk) + len(word) + 1 > CHUNK_SIZE:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = word
+                else:
+                    current_chunk = (current_chunk + " " + word).strip()
+        else:
+            if len(current_chunk) + len(sentence) + 1 > CHUNK_SIZE:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence
+            else:
+                current_chunk = (current_chunk + " " + sentence).strip()
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    # Pick a random Tamil speaker for consistency within this call
+    _TAMIL_SPEAKERS = ["anushka", "manisha", "vidya", "arya"]
+    chosen_speaker = _rnd.choice(_TAMIL_SPEAKERS)
+    logger.info(f"🔢 Sarvam TTS (avatar): {len(text)} chars → {len(chunks)} chunks, speaker={chosen_speaker}")
+
+    audio_segments = []
+    for chunk in chunks:
+        payload = {
+            "text": chunk,
+            "target_language_code": "ta-IN",
+            "speaker": chosen_speaker,
+            "pitch": 0,
+            "pace": 1.0,
+            "loudness": 1.5,
+            "speech_sample_rate": 22050,
+            "enable_preprocessing": True,
+            "model": "bulbul:v2",
+        }
+        try:
+            resp = requests.post("https://api.sarvam.ai/text-to-speech", json=payload, headers=headers, timeout=30)
+            if not resp.ok:
+                logger.error(f"Sarvam TTS error {resp.status_code}: {resp.text[:500]}")
+                resp.raise_for_status()
+            data = resp.json()
+            audio_b64 = data.get("audios", [None])[0]
+            if audio_b64:
+                audio_segments.append(base64.b64decode(audio_b64))
+        except Exception as e:
+            logger.error(f"Sarvam TTS chunk failed: {e}")
+            raise
+
+    if not audio_segments:
+        raise RuntimeError("Sarvam TTS returned no audio")
+
+    # Merge WAV chunks into single file, then convert to MP3
+    merged_frames = b""
+    first_params = None
+    for seg in audio_segments:
+        with wave.open(io.BytesIO(seg), 'rb') as wf:
+            if first_params is None:
+                first_params = wf.getparams()
+            merged_frames += wf.readframes(wf.getnframes())
+
+    if not first_params:
+        raise RuntimeError("Sarvam TTS: no valid WAV params")
+
+    wav_path = output_path.with_suffix(".wav")
+    with wave.open(str(wav_path), 'wb') as out:
+        out.setparams(first_params)
+        out.writeframes(merged_frames)
+
+    # Convert WAV → MP3 using pydub if available
+    try:
+        from pydub import AudioSegment
+        AudioSegment.from_wav(str(wav_path)).export(str(output_path), format="mp3", bitrate="128k")
+        wav_path.unlink(missing_ok=True)
+        logger.info(f"✅ Sarvam Tamil TTS saved (MP3): {output_path}")
+    except Exception:
+        import shutil
+        shutil.move(str(wav_path), str(output_path))
+        logger.info(f"✅ Sarvam Tamil TTS saved (WAV→MP3 rename): {output_path}")
 
 
 def generate_all_scene_audio(
@@ -2189,6 +2278,30 @@ def list_available_avatars() -> List[Dict]:
 import threading as _threading
 _cancel_event = _threading.Event()
 
+# ── Persistent batch control file (survives backend restarts) ──
+_BATCH_CONTROL_FILE = WORK_DIR / "_batch_control.json"
+
+def _load_batch_control() -> dict:
+    """Load persistent batch control state from disk."""
+    try:
+        if _BATCH_CONTROL_FILE.exists():
+            import json
+            return json.loads(_BATCH_CONTROL_FILE.read_text())
+    except Exception:
+        pass
+    return {"user_cancelled": False}
+
+def _save_batch_control(state: dict):
+    """Save batch control state to disk (persists across restarts)."""
+    try:
+        import json
+        _BATCH_CONTROL_FILE.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        logger.error(f"Failed to save batch control state: {e}")
+
+# Load persistent cancel state on startup
+_persisted = _load_batch_control()
+
 _batch_worker_status = {
     "running": False,
     "current_topic": "",
@@ -2199,8 +2312,9 @@ _batch_worker_status = {
     "errors": [],
     "started_at": "",
     "last_completed_at": "",
-    "cancelled": False,
-    "paused": False,
+    "cancelled": _persisted.get("user_cancelled", False),
+    "paused": _persisted.get("user_cancelled", False),
+    "user_cancelled": _persisted.get("user_cancelled", False),
 }
 
 
@@ -2261,15 +2375,33 @@ def get_all_topics_without_videos() -> list:
 
 def get_batch_worker_status() -> dict:
     """Return the current status of the background batch worker."""
-    return dict(_batch_worker_status)
+    status = dict(_batch_worker_status)
+    # Always reflect persistent user_cancelled state
+    persisted = _load_batch_control()
+    status["user_cancelled"] = persisted.get("user_cancelled", False)
+    return status
 
 
 def cancel_batch_worker():
-    """Signal the batch worker to stop after the current video."""
+    """Signal the batch worker to stop after the current video.
+    Persists user_cancelled to disk so it survives backend restarts."""
     _batch_worker_status["cancelled"] = True
     _batch_worker_status["paused"] = True
+    _batch_worker_status["user_cancelled"] = True
     _cancel_event.set()  # Signal immediately
-    logger.info("🛑 Batch video worker cancellation requested — will stop after current topic")
+    # Persist to disk — this survives backend restarts
+    _save_batch_control({"user_cancelled": True})
+    logger.info("🛑 Batch video worker cancellation requested — persisted to disk")
+
+
+def resume_batch_worker():
+    """Clear the persistent user_cancelled flag so auto-scheduler or manual start can proceed."""
+    _batch_worker_status["cancelled"] = False
+    _batch_worker_status["paused"] = False
+    _batch_worker_status["user_cancelled"] = False
+    _cancel_event.clear()
+    _save_batch_control({"user_cancelled": False})
+    logger.info("▶ Batch worker resume requested — persistent cancel flag cleared")
 
 
 def batch_generate_videos(
@@ -2293,6 +2425,8 @@ def batch_generate_videos(
         return
 
     _cancel_event.clear()  # Reset cancel signal
+    # Clear persistent cancel flag when batch is explicitly started
+    _save_batch_control({"user_cancelled": False})
     _batch_worker_status.update({
         "running": True,
         "current_topic": "",
@@ -2305,6 +2439,7 @@ def batch_generate_videos(
         "last_completed_at": "",
         "cancelled": False,
         "paused": False,
+        "user_cancelled": False,
     })
 
     logger.info(f"🎬 Batch video worker starting: {len(topics)} topics to generate")

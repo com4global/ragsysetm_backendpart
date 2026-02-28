@@ -1714,7 +1714,7 @@ async def edtech_extract_topics(
             # Also check any user's pre-warm (teacher uploaded, student accesses)
             cross = supabase.table("lesson_cache").select("*") \
                 .eq("doc_name", doc_name).eq("lesson_type", "topics") \
-                .eq("topic", cache_chapter_key).limit(1).execute()
+                .eq("topic", cache_chapter_key).eq("language", language).limit(1).execute()
             if cross.data:
                 lc_row = cross.data[0]
         if lc_row and lc_row.get("lesson_json", {}).get("topics"):
@@ -2000,7 +2000,7 @@ async def edtech_generate_lesson(
         if not cached and doc_name:
             try:
                 cross = supabase.table("lesson_cache").select("*") \
-                    .eq("topic", topic).eq("lesson_type", "conversation").limit(1).execute()
+                    .eq("topic", topic).eq("lesson_type", "conversation").eq("language", language).limit(1).execute()
                 if cross.data:
                     cached = cross.data[0]
                     import time as _t
@@ -2010,12 +2010,49 @@ async def edtech_generate_lesson(
         if cached:
             cached_lesson = cached.get("lesson_json", {})
             cached_audio = cached_lesson.get("audio_urls", [])
-            # If cached lesson has audio, return it; otherwise regenerate with audio
-            if cached_audio and any(u for u in cached_audio):
-                logger.info(f"🎯 Lesson cache HIT (with audio): {topic}")
+            # Always return cached lesson if it has dialogue content
+            if cached_lesson.get("dialogue"):
+                if cached_audio and any(u for u in cached_audio):
+                    logger.info(f"🎯 Lesson cache HIT (with audio): {topic}")
+                else:
+                    logger.info(f"🎯 Lesson cache HIT (no audio yet — will try background TTS): {topic}")
+                    # Fire-and-forget: try generating audio in background
+                    async def _bg_audio():
+                        try:
+                            from heygen_service import generate_dialogue_audio, TTS_AUDIO_DIR as _TD
+                            _loop = asyncio.get_event_loop()
+                            _dialogue = cached_lesson.get("dialogue", [])
+                            _voice_map = cached_lesson.get("voice_map", {})
+                            if _dialogue and _voice_map:
+                                _vm = {**_voice_map, "__language__": language}
+                                _af = await _loop.run_in_executor(None, lambda: generate_dialogue_audio(
+                                    dialogue_lines=_dialogue, voice_map=_vm,
+                                    topic=topic, user_id=current_user.id, doc_name=doc_name
+                                ))
+                                _urls = []
+                                _paths = []
+                                for _fn in _af:
+                                    if _fn:
+                                        _lf = _TD / _fn
+                                        _sp = f"dialogue/{current_user.id}/{_fn}"
+                                        _pu = _upload_audio_to_storage(str(_lf), _sp)
+                                        _urls.append(_pu or f"/static/tts_audio/{_fn}")
+                                        _paths.append(_sp if _pu else "")
+                                    else:
+                                        _urls.append("")
+                                        _paths.append("")
+                                cached_lesson["audio_urls"] = _urls
+                                _save_lesson_cache(
+                                    user_id=current_user.id, cache_key=cache_key,
+                                    topic=topic, doc_name=doc_name,
+                                    language=language, lesson_type="conversation",
+                                    lesson_json=cached_lesson, audio_storage_paths=_paths
+                                )
+                                logger.info(f"✅ Background audio generated for cached lesson: {topic}")
+                        except Exception as _e:
+                            logger.warning(f"Background audio gen failed (non-fatal): {_e}")
+                    asyncio.create_task(_bg_audio())
                 return {"success": True, "lesson": cached_lesson, "cached": True}
-            else:
-                logger.info(f"🔄 Lesson cache HIT but NO audio — regenerating: {topic}")
 
         # ── 2. Cache miss — generate dialogue text only (fast GPT call) ──
         logger.info(f"🔄 Lesson cache MISS: {topic}")
@@ -2478,7 +2515,14 @@ async def edtech_ask_doubt(
 
         lang_instruction = ""
         if language == "ta":
-            lang_instruction = "\nIMPORTANT: Answer in Tamil (தமிழ்). Use simple, conversational Tamil."
+            lang_instruction = (
+                "\nIMPORTANT: Answer in THANGLISH style — "
+                "Use Tamil script (தமிழ்) as the primary language, "
+                "but mix in English words naturally for technical terms, greetings, and common phrases. "
+                "Use everyday conversational Tamil, NOT formal literary Tamil. "
+                "Example: 'இது oru important concept. இதை நாம் simple-ஆ புரிஞ்சுக்கலாம்.' "
+                "Keep it friendly and easy to understand like daily Tamil conversation."
+            )
 
         system_msg = (
             "You are a helpful, friendly teacher answering a student's doubt during a lesson. "
@@ -2756,7 +2800,7 @@ async def edtech_generate_tts_video(
             try:
                 cross = supabase.table("lesson_cache").select("*") \
                     .eq("doc_name", doc_name).eq("topic", topic) \
-                    .eq("lesson_type", "tts_video").limit(1).execute()
+                    .eq("lesson_type", "tts_video").eq("language", language).limit(1).execute()
                 if cross.data:
                     cached = cross.data[0]
                     import time as _t
@@ -4375,18 +4419,73 @@ async def avatar_video_batch_status(current_user: User = Depends(get_current_use
 
 @app.post("/api/avatar-video/batch-cancel")
 async def avatar_video_batch_cancel(current_user: User = Depends(get_current_user)):
-    """Cancel the running batch video generation worker."""
+    """Cancel the running batch video generation worker.
+    Sets persistent user_cancelled flag — batch will NOT auto-restart."""
     from avatar_video_service import cancel_batch_worker, get_batch_worker_status
-    status = get_batch_worker_status()
-    if not status.get("running"):
-        return {"success": False, "message": "No batch worker is running"}
-    cancel_batch_worker()
-    # Return updated status immediately
+    cancel_batch_worker()  # Always set the persistent flag, even if not running
     updated = get_batch_worker_status()
     return {
         "success": True,
-        "message": "Batch worker cancellation requested — will stop after current topic finishes",
+        "message": "Batch cancelled — will NOT auto-restart until you click Resume",
         "status": updated,
+    }
+
+
+@app.post("/api/avatar-video/batch-resume")
+async def avatar_video_batch_resume(current_user: User = Depends(get_current_user)):
+    """Clear the persistent user_cancelled flag and restart batch generation."""
+    from avatar_video_service import (
+        resume_batch_worker, get_batch_worker_status,
+        batch_generate_videos, get_all_topics_without_videos,
+        _load_topic_map, WORK_DIR,
+    )
+
+    # Clear persistent cancel flag
+    resume_batch_worker()
+
+    status = get_batch_worker_status()
+    if status.get("running"):
+        return {"success": True, "message": "Batch is already running"}
+
+    # Discover topics and start batch
+    db_topics = _discover_all_topics_from_db()
+    local_missing = get_all_topics_without_videos()
+    all_topic_set = set(t.strip().lower() for t in db_topics)
+    all_topic_set.update(t.strip().lower() for t in local_missing)
+
+    existing = _load_topic_map()
+    topics_to_generate = []
+    for topic_key in sorted(all_topic_set):
+        if topic_key in existing:
+            entry = existing[topic_key]
+            video_file = entry.get("filename", "")
+            if video_file and (WORK_DIR / video_file).exists():
+                continue
+        original = next((t for t in db_topics if t.strip().lower() == topic_key), None)
+        if not original:
+            original = next((t for t in local_missing if t.strip().lower() == topic_key), None)
+        topics_to_generate.append(original or topic_key)
+
+    if not topics_to_generate:
+        return {"success": True, "message": "All topics already have videos"}
+
+    import threading
+    def _run():
+        batch_generate_videos(
+            topics=topics_to_generate,
+            user_id=str(current_user.id),
+            voice="nova",
+            avatar_id="teacher_female_1",
+            video_mode="presentation",
+        )
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    return {
+        "success": True,
+        "message": f"Batch resumed — generating {len(topics_to_generate)} topics",
+        "topics_count": len(topics_to_generate),
     }
 
 
@@ -4416,6 +4515,7 @@ async def _auto_batch_video_scheduler():
     """
     Background scheduler that automatically generates videos for topics
     that don't have them yet. Runs every 5 minutes when idle.
+    Respects the persistent user_cancelled flag — will NOT auto-start if the user cancelled.
     """
     import asyncio
     import threading
@@ -4428,8 +4528,16 @@ async def _auto_batch_video_scheduler():
         try:
             from avatar_video_service import (
                 get_batch_worker_status, batch_generate_videos,
-                get_all_topics_without_videos, _load_topic_map, WORK_DIR
+                get_all_topics_without_videos, _load_topic_map, WORK_DIR,
+                _load_batch_control,
             )
+
+            # Check persistent user_cancelled flag FIRST
+            control = _load_batch_control()
+            if control.get("user_cancelled", False):
+                logger.debug("⏸️ User cancelled batch — auto-scheduler will not start. Waiting for resume.")
+                await asyncio.sleep(300)
+                continue
 
             status = get_batch_worker_status()
             if status.get("running"):
@@ -4485,3 +4593,4 @@ async def _auto_batch_video_scheduler():
 
         # Wait 5 minutes before next check
         await asyncio.sleep(300)
+
