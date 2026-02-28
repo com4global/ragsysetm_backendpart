@@ -154,13 +154,15 @@ origins = [
     "http://127.0.0.1:3002",
     "https://ragsysetm-backendpart.onrender.com",
     "https://zenzeebot.netlify.app",
+    "https://zenzeebot1.netlify.app",
     "https://ragsystem-1f65p6bm4-com4globals-projects.vercel.app",
+    "https://ragsystem-api1.vercel.app",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_origin_regex=r"https://.*-zenzeebot\.netlify\.app",
+    allow_origin_regex=r"https://.*(-zenzeebot|zenzeebot1?)\.netlify\.app",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
