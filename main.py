@@ -4594,3 +4594,357 @@ async def _auto_batch_video_scheduler():
         # Wait 5 minutes before next check
         await asyncio.sleep(300)
 
+
+# ============================================================
+# ▸ SUPER ADMIN PANEL — API Endpoints
+# ============================================================
+
+# Admin guard: only emails in ADMIN_EMAILS env var may access these endpoints
+ADMIN_EMAILS = set(
+    e.strip().lower()
+    for e in os.getenv("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+)
+
+async def require_admin(current_user: User = Depends(get_current_user)):
+    """Dependency: raise 403 unless the user's email is in ADMIN_EMAILS."""
+    if current_user.email.lower() not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Forbidden — admin access only")
+    return current_user
+
+
+# ── Usage Logging Helper ──────────────────────────────────────────────────────
+
+def _log_usage(user_id: str, service: str, action: str,
+               tokens_used: int = 0, cost_usd: float = 0.0,
+               metadata: dict = None):
+    """Log a 3rd-party API usage event to the usage_logs table (fire-and-forget)."""
+    try:
+        supabase.table("usage_logs").insert({
+            "user_id": user_id,
+            "service": service,
+            "action": action,
+            "tokens_used": tokens_used,
+            "cost_usd": round(cost_usd, 6),
+            "metadata": metadata or {},
+        }).execute()
+    except Exception as e:
+        logger.warning(f"Usage log insert failed (non-fatal): {e}")
+
+
+# ── Admin: Platform-wide Stats ───────────────────────────────────────────────
+
+@app.get("/api/admin/stats")
+async def admin_platform_stats(admin: User = Depends(require_admin)):
+    """Return global platform metrics."""
+    try:
+        # Total users
+        users_res = supabase.table("profiles").select("id", count="exact").execute()
+        total_users = users_res.count or 0
+
+        # Active vs restricted
+        active_res = supabase.table("profiles").select("id", count="exact") \
+            .eq("is_active", True).execute()
+        active_users = active_res.count or 0
+
+        # Total files and storage
+        files_res = supabase.table("user_files").select("file_size,chunks_created").execute()
+        total_files = len(files_res.data) if files_res.data else 0
+        total_storage = sum(f.get("file_size", 0) for f in (files_res.data or []))
+        total_chunks = sum(f.get("chunks_created", 0) for f in (files_res.data or []))
+
+        # Subscription breakdown
+        subs_res = supabase.table("subscriptions").select("plan,status").execute()
+        plan_counts = {}
+        for s in (subs_res.data or []):
+            p = s.get("plan", "free")
+            plan_counts[p] = plan_counts.get(p, 0) + 1
+
+        # Replicate usage (from usage_logs — table may not exist yet)
+        total_replicate_cost = 0.0
+        try:
+            rep_res = supabase.table("usage_logs").select("cost_usd") \
+                .eq("service", "replicate").execute()
+            total_replicate_cost = sum(r.get("cost_usd", 0) for r in (rep_res.data or []))
+        except Exception:
+            logger.warning("usage_logs table not found — skipping replicate cost aggregation")
+
+        return {
+            "success": True,
+            "stats": {
+                "total_users": total_users,
+                "active_users": active_users,
+                "restricted_users": total_users - active_users,
+                "total_files": total_files,
+                "total_storage_bytes": total_storage,
+                "total_chunks": total_chunks,
+                "subscription_breakdown": plan_counts,
+                "total_replicate_cost_usd": round(total_replicate_cost, 4),
+            }
+        }
+    except Exception as e:
+        logger.error(f"Admin stats failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Admin: List All Users ─────────────────────────────────────────────────────
+
+@app.get("/api/admin/users")
+async def admin_list_users(admin: User = Depends(require_admin)):
+    """Return every user with profile, subscription, file stats, and usage."""
+    try:
+        # 1. All profiles
+        profiles = supabase.table("profiles").select("*").execute()
+        users_raw = profiles.data or []
+
+        # 2. All subscriptions
+        subs_res = supabase.table("subscriptions").select("user_id,plan,status,current_period_end").execute()
+        subs_map = {s["user_id"]: s for s in (subs_res.data or [])}
+
+        # 3. Files aggregated per user
+        files_res = supabase.table("user_files").select("user_id,file_size,chunks_created,processed").execute()
+        files_map = {}
+        for f in (files_res.data or []):
+            uid = f.get("user_id", "")
+            if uid not in files_map:
+                files_map[uid] = {"total_files": 0, "processed_files": 0,
+                                  "total_size": 0, "total_chunks": 0}
+            files_map[uid]["total_files"] += 1
+            files_map[uid]["total_size"] += f.get("file_size", 0)
+            files_map[uid]["total_chunks"] += f.get("chunks_created", 0)
+            if f.get("processed"):
+                files_map[uid]["processed_files"] += 1
+
+        # 4. Replicate usage aggregated per user (table may not exist yet)
+        usage_map = {}
+        try:
+            usage_res = supabase.table("usage_logs").select("user_id,cost_usd,tokens_used,service").execute()
+        except Exception:
+            logger.warning("usage_logs table not found — skipping usage aggregation")
+            usage_res = type('obj', (object,), {'data': []})()  # empty mock
+        for u in (usage_res.data or []):
+            uid = u.get("user_id", "")
+            if uid not in usage_map:
+                usage_map[uid] = {"replicate_cost": 0.0, "replicate_calls": 0,
+                                  "total_api_cost": 0.0, "total_api_calls": 0}
+            cost = u.get("cost_usd", 0) or 0
+            usage_map[uid]["total_api_cost"] += cost
+            usage_map[uid]["total_api_calls"] += 1
+            if u.get("service") == "replicate":
+                usage_map[uid]["replicate_cost"] += cost
+                usage_map[uid]["replicate_calls"] += 1
+
+        # 5. Merge everything
+        users_out = []
+        for p in users_raw:
+            uid = p["id"]
+            sub = subs_map.get(uid, {})
+            fstats = files_map.get(uid, {"total_files": 0, "processed_files": 0,
+                                          "total_size": 0, "total_chunks": 0})
+            ustats = usage_map.get(uid, {"replicate_cost": 0.0, "replicate_calls": 0,
+                                          "total_api_cost": 0.0, "total_api_calls": 0})
+
+            plan_name = sub.get("plan", "free")
+            if sub.get("status") in ("canceled", "unpaid"):
+                plan_name = "free"
+
+            users_out.append({
+                "id": uid,
+                "email": p.get("email", ""),
+                "full_name": p.get("full_name", ""),
+                "role": p.get("role", "student"),
+                "is_active": p.get("is_active", True),
+                "created_at": p.get("created_at", ""),
+                "last_sign_in": p.get("last_sign_in_at", ""),
+                "plan": plan_name,
+                "plan_status": sub.get("status", "active"),
+                "plan_expires": sub.get("current_period_end", ""),
+                **fstats,
+                **ustats,
+            })
+
+        # Sort by creation date (newest first)
+        users_out.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+        return {"success": True, "users": users_out, "total": len(users_out)}
+
+    except Exception as e:
+        logger.error(f"Admin list users failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Admin: Restrict / Unrestrict User ─────────────────────────────────────────
+
+@app.patch("/api/admin/users/{user_id}/restrict")
+async def admin_toggle_restrict(
+    user_id: str,
+    active: bool = Form(...),
+    admin: User = Depends(require_admin)
+):
+    """Set a user's is_active flag. active=false to restrict."""
+    try:
+        supabase.table("profiles").update({"is_active": active}).eq("id", user_id).execute()
+        status_word = "activated" if active else "restricted"
+        logger.info(f"🔒 Admin {admin.email} {status_word} user {user_id}")
+        return {"success": True, "user_id": user_id, "is_active": active}
+    except Exception as e:
+        logger.error(f"Admin restrict failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Admin: Change User Role ──────────────────────────────────────────────────
+
+@app.patch("/api/admin/users/{user_id}/role")
+async def admin_change_role(
+    user_id: str,
+    role: str = Form(...),
+    admin: User = Depends(require_admin)
+):
+    """Override a user's role."""
+    VALID = {"student", "teacher", "individual", "admin", "other"}
+    if role not in VALID:
+        raise HTTPException(status_code=400, detail=f"Role must be one of: {', '.join(sorted(VALID))}")
+    try:
+        supabase.table("profiles").update({"role": role}).eq("id", user_id).execute()
+        logger.info(f"🔧 Admin {admin.email} changed user {user_id} role to '{role}'")
+        return {"success": True, "user_id": user_id, "role": role}
+    except Exception as e:
+        logger.error(f"Admin role change failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Admin: Change User Plan ──────────────────────────────────────────────────
+
+@app.patch("/api/admin/users/{user_id}/plan")
+async def admin_change_plan(
+    user_id: str,
+    plan: str = Form(...),
+    admin: User = Depends(require_admin)
+):
+    """Override a user's subscription plan directly (no Stripe)."""
+    from billing_service import PLANS
+    if plan not in PLANS:
+        raise HTTPException(status_code=400, detail=f"Plan must be one of: {', '.join(sorted(PLANS.keys()))}")
+    try:
+        # Upsert into subscriptions table
+        supabase.table("subscriptions").upsert({
+            "user_id": user_id,
+            "plan": plan,
+            "status": "active",
+        }, on_conflict="user_id").execute()
+        logger.info(f"💳 Admin {admin.email} changed user {user_id} plan to '{plan}'")
+        return {"success": True, "user_id": user_id, "plan": plan}
+    except Exception as e:
+        logger.error(f"Admin plan change failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Admin: Get User Detail ───────────────────────────────────────────────────
+
+@app.get("/api/admin/users/{user_id}")
+async def admin_user_detail(user_id: str, admin: User = Depends(require_admin)):
+    """Detailed info for a single user including file list and usage history."""
+    try:
+        # Profile
+        prof_res = supabase.table("profiles").select("*").eq("id", user_id).limit(1).execute()
+        if not prof_res.data:
+            raise HTTPException(status_code=404, detail="User not found")
+        profile = prof_res.data[0]
+
+        # Subscription
+        sub_res = supabase.table("subscriptions").select("*").eq("user_id", user_id).limit(1).execute()
+        subscription = sub_res.data[0] if sub_res.data else {"plan": "free", "status": "active"}
+
+        # Files
+        files_res = supabase.table("user_files").select("*").eq("user_id", user_id) \
+            .order("uploaded_at", desc=True).execute()
+        files = files_res.data or []
+
+        # Usage logs (table may not exist yet)
+        usage_logs = []
+        try:
+            usage_res = supabase.table("usage_logs").select("*").eq("user_id", user_id) \
+                .order("created_at", desc=True).limit(100).execute()
+            usage_logs = usage_res.data or []
+        except Exception:
+            logger.warning("usage_logs table not found — skipping user usage logs")
+
+        # Aggregate usage
+        total_api_cost = sum(u.get("cost_usd", 0) or 0 for u in usage_logs)
+        replicate_cost = sum(u.get("cost_usd", 0) or 0 for u in usage_logs if u.get("service") == "replicate")
+
+        return {
+            "success": True,
+            "user": {
+                **profile,
+                "subscription": subscription,
+                "files": files,
+                "usage_logs": usage_logs,
+                "total_api_cost": round(total_api_cost, 4),
+                "replicate_cost": round(replicate_cost, 4),
+                "total_files": len(files),
+                "total_chunks": sum(f.get("chunks_created", 0) for f in files),
+                "total_storage": sum(f.get("file_size", 0) for f in files),
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin user detail failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Admin: Replicate Account Usage (from Replicate API) ──────────────────────
+
+@app.get("/api/admin/replicate-usage")
+async def admin_replicate_usage(admin: User = Depends(require_admin)):
+    """Fetch recent predictions from Replicate API to show account-level usage."""
+    try:
+        replicate_token = os.getenv("REPLICATE_API_TOKEN", "")
+        if not replicate_token:
+            return {"success": False, "error": "REPLICATE_API_TOKEN not set"}
+
+        headers = {"Authorization": f"Bearer {replicate_token}"}
+        loop = asyncio.get_event_loop()
+
+        def _fetch():
+            resp = requests.get(
+                "https://api.replicate.com/v1/predictions?limit=50",
+                headers=headers, timeout=15
+            )
+            if resp.status_code != 200:
+                return {"error": f"Replicate API returned {resp.status_code}"}
+            return resp.json()
+
+        data = await loop.run_in_executor(None, _fetch)
+        if "error" in data:
+            return {"success": False, **data}
+
+        predictions = data.get("results", [])
+        total_predict_time = 0.0
+        total_predictions = len(predictions)
+        succeeded = 0
+        failed = 0
+
+        for p in predictions:
+            status = p.get("status", "")
+            metrics = p.get("metrics", {})
+            if status == "succeeded":
+                succeeded += 1
+                total_predict_time += metrics.get("predict_time", 0) or 0
+            elif status == "failed":
+                failed += 1
+
+        return {
+            "success": True,
+            "replicate": {
+                "recent_predictions": total_predictions,
+                "succeeded": succeeded,
+                "failed": failed,
+                "total_predict_time_seconds": round(total_predict_time, 2),
+                "estimated_cost_usd": round(total_predict_time * 0.000225, 4),  # ~$0.000225/sec on GPU
+            }
+        }
+    except Exception as e:
+        logger.error(f"Admin replicate usage failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

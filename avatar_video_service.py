@@ -47,6 +47,10 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 client = OpenAI(api_key=OPENAI_API_KEY)
 MODEL = "gpt-4o-mini"
 
+# Thread-local storage for tracking which user triggers Replicate calls
+import threading as _threading
+_tls = _threading.local()
+
 # ── Directories ─────────────────────────────────────────────────────
 BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 AVATAR_DIR = BASE_DIR / "static" / "avatars"
@@ -508,6 +512,34 @@ def generate_all_scene_audio(
 FONT_PATH = str(BASE_DIR / "static" / "fonts" / "Inter.ttf")
 MUSIC_DIR = BASE_DIR / "static" / "music"
 
+
+def _log_replicate_usage(status_data: dict, model_ref: str):
+    """Log Replicate prediction usage to usage_logs table."""
+    try:
+        user_id = getattr(_tls, 'current_user_id', None) or 'system'
+        metrics = status_data.get('metrics', {})
+        predict_time = metrics.get('predict_time', 0) or 0
+        # Replicate GPU cost is ~$0.000225/s for standard GPU
+        estimated_cost = predict_time * 0.000225
+
+        from database import supabase as sb
+        if sb:
+            sb.table("usage_logs").insert({
+                "user_id": user_id,
+                "service": "replicate",
+                "action": "prediction",
+                "tokens_used": 0,
+                "cost_usd": round(estimated_cost, 6),
+                "metadata": {
+                    "model": model_ref,
+                    "predict_time_seconds": round(predict_time, 2),
+                    "prediction_id": status_data.get("id", ""),
+                }
+            }).execute()
+            logger.info(f"   📊 Replicate usage logged: {predict_time:.1f}s, ~${estimated_cost:.4f} for user {user_id}")
+    except Exception as e:
+        logger.warning(f"   Replicate usage logging failed (non-fatal): {e}")
+
 def _replicate_api(model_version: str, input_data: dict, timeout: int = 300) -> dict:
     """Call Replicate API via direct HTTP (avoids pip dependency conflicts)."""
     headers = {
@@ -539,6 +571,7 @@ def _replicate_api(model_version: str, input_data: dict, timeout: int = 300) -> 
         status = status_data.get("status", "")
 
         if status == "succeeded":
+            _log_replicate_usage(status_data, model_version)
             return status_data
         elif status == "failed":
             raise RuntimeError(f"Replicate prediction failed: {status_data.get('error', 'unknown')}")
@@ -594,6 +627,7 @@ def _replicate_model_api(model_owner: str, model_name: str, input_data: dict, ti
         status = status_data.get("status", "")
 
         if status == "succeeded":
+            _log_replicate_usage(status_data, f"{model_owner}/{model_name}")
             return status_data
         elif status == "failed":
             raise RuntimeError(f"Replicate prediction failed: {status_data.get('error', 'unknown')}")
@@ -2027,6 +2061,8 @@ def generate_avatar_video(
         job_id = hashlib.md5(f"{user_id}:{topic}:{language}:{style}:{time.time()}".encode()).hexdigest()[:12]
 
     update_job_status(job_id, status="starting", progress=0, stage="Initializing...")
+    # Set current user for Replicate usage tracking
+    _tls.current_user_id = user_id
 
     try:
         # ── Stage 1: Generate script ──
