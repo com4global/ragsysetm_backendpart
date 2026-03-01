@@ -21,5 +21,4 @@ replicate
 rank-bm25
 tiktoken
 pyyaml
-sentence-transformers
 pydub
