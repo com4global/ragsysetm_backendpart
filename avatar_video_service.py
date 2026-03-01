@@ -776,10 +776,7 @@ def generate_talking_head(
         sadtalker_result = None
         try:
             logger.info(f"   [{job_id}] SadTalker lip-sync for scene {scene_index}...")
-            sadtalker_result = _replicate_model_api(
-                # cjwbw/sadtalker — audio-driven single image talking face
-                "cjwbw", "sadtalker",
-                {
+            st_input = {
                     "source_image": face_url,
                     "driven_audio": audio_url,
                     "pose_style": 0,
@@ -787,9 +784,22 @@ def generate_talking_head(
                     "expression_scale": 1.5,
                     "still": False,
                     "preprocess": "full",
-                },
-                timeout=300,
-            )
+            }
+            try:
+                # Primary: lucataco/sadtalker (verified working)
+                sadtalker_result = _replicate_api(
+                    "85c698db7c0a66d5011435d0191db323034e1da04b912a6d365833141b6a285b",
+                    st_input,
+                    timeout=300,
+                )
+            except Exception as primary_err:
+                logger.warning(f"   [{job_id}] Primary SadTalker failed: {primary_err}, trying fallback...")
+                # Fallback: cjwbw/sadtalker (original)
+                sadtalker_result = _replicate_api(
+                    "a519cc0cfebaaeade068b23899165a11ec76aaa1d2b313d40d214f204ec957a3",
+                    st_input,
+                    timeout=300,
+                )
         except Exception as st_err:
             logger.error(f"   [{job_id}] SadTalker failed for scene {scene_index}: {st_err}")
 
