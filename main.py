@@ -549,7 +549,20 @@ async def _background_process_and_pregenerate(user_id: str, filename: str, acces
         _update_batch_status(job_id, "generating_videos", progress=80, completed_steps=3)
         logger.info(f"✅ [BG] Step 3 done: {generated} lessons pre-generated")
 
-        # ── Step 4: Pre-generate TTS videos for ALL topics (up to 20) ──
+        # ── Step 4: Pre-generate TTS videos (ONLY if user has opted in) ──
+        # Check per-user video_generation_enabled flag
+        try:
+            from video_batch_control import is_video_generation_enabled
+            video_gen_enabled = is_video_generation_enabled(user_id)
+        except Exception:
+            video_gen_enabled = False
+        
+        if not video_gen_enabled:
+            logger.info(f"⏸️ [BG] Video generation disabled for user {user_id} — skipping Step 4. User can start manually.")
+            _update_batch_status(job_id, "completed", progress=100, completed_steps=4, total_steps=4)
+            logger.info(f"🎉 [BG] Background processing complete (no videos): {filename} ({generated} lessons)")
+            return
+        
         from heygen_service import generate_tts_video_for_topic
         video_count = 0
         for topic_name in all_topic_titles[:20]:  # Match lesson cap
@@ -4276,7 +4289,7 @@ async def avatar_video_dashboard(current_user: User = Depends(get_current_user))
     documents = {}  # doc_name -> { topics: [...], ... }
     try:
         result = supabase.table("lesson_cache").select("doc_name, lesson_json, topic") \
-            .eq("lesson_type", "topics").execute()
+            .eq("lesson_type", "topics").eq("user_id", current_user.id).execute()
         for row in (result.data or []):
             doc_name = row.get("doc_name", "Unknown")
             lesson_json = row.get("lesson_json", {})
@@ -4571,6 +4584,53 @@ async def avatar_video_topics_without_videos(current_user: User = Depends(get_cu
     }
 
 
+# ── User: Self-service video control ──────────────────────────────────────────
+
+@app.get("/api/video-batch/my-status")
+async def user_video_batch_status(current_user: User = Depends(get_current_user)):
+    """User: Get their own video generation status + credit usage."""
+    try:
+        from video_batch_control import is_video_generation_enabled, get_user_replicate_usage
+        enabled = is_video_generation_enabled(current_user.id)
+        usage = get_user_replicate_usage(current_user.id)
+
+        # Get their batch jobs
+        result = supabase.table("batch_jobs") \
+            .select("*") \
+            .eq("user_id", current_user.id) \
+            .order("created_at", desc=True) \
+            .limit(10) \
+            .execute()
+
+        return {
+            "success": True,
+            "video_generation_enabled": enabled,
+            "replicate_usage": usage,
+            "jobs": result.data or [],
+        }
+    except Exception as e:
+        logger.error(f"User video batch status failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/video-batch/toggle")
+async def user_video_batch_toggle(current_user: User = Depends(get_current_user)):
+    """User: Toggle their own video generation on/off."""
+    try:
+        from video_batch_control import is_video_generation_enabled, set_video_generation_enabled
+        current = is_video_generation_enabled(current_user.id)
+        new_state = not current
+        success = set_video_generation_enabled(current_user.id, new_state)
+        return {
+            "success": success,
+            "video_generation_enabled": new_state,
+            "message": f"Video generation {'enabled' if new_state else 'disabled'}"
+        }
+    except Exception as e:
+        logger.error(f"User video batch toggle failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
 # ── Auto-start background video pre-generation on server startup ──
 _auto_batch_task = None
 
@@ -4600,6 +4660,20 @@ async def _auto_batch_video_scheduler():
             control = _load_batch_control()
             if control.get("user_cancelled", False):
                 logger.debug("⏸️ User cancelled batch — auto-scheduler will not start. Waiting for resume.")
+                await asyncio.sleep(300)
+                continue
+            
+            # Per-user video_generation_enabled guard
+            # Only auto-generate if there are users with video gen enabled
+            try:
+                from video_batch_control import get_all_users_batch_status
+                enabled_users = [u for u in get_all_users_batch_status() if u.get("video_generation_enabled")]
+                if not enabled_users:
+                    logger.debug("⏸️ No users have video generation enabled — auto-scheduler idle")
+                    await asyncio.sleep(300)
+                    continue
+            except Exception as e:
+                logger.debug(f"Video gen enabled check failed in scheduler: {e}")
                 await asyncio.sleep(300)
                 continue
 
@@ -4675,6 +4749,131 @@ async def require_admin(current_user: User = Depends(get_current_user)):
     if current_user.email.lower() not in ADMIN_EMAILS:
         raise HTTPException(status_code=403, detail="Forbidden — admin access only")
     return current_user
+
+
+# ── Admin: Per-User Video Batch Control ───────────────────────────────────────
+
+@app.get("/api/admin/video-batch/all-users")
+async def admin_video_batch_all_users(admin: User = Depends(require_admin)):
+    """
+    Admin view: All users' batch job status + video generation flags + credits.
+    This powers the admin "Presentation Control" dashboard.
+    """
+    try:
+        from video_batch_control import get_all_users_batch_status
+        users = get_all_users_batch_status()
+        return {"success": True, "users": users}
+    except Exception as e:
+        logger.error(f"Admin video batch all users failed: {e}")
+        return {"success": False, "error": str(e), "users": []}
+
+
+class VideoGenToggleRequest(BaseModel):
+    user_id: str
+    enabled: bool
+
+
+@app.post("/api/admin/video-batch/toggle")
+async def admin_video_batch_toggle(req: VideoGenToggleRequest, admin: User = Depends(require_admin)):
+    """Admin: Enable or disable video generation for a specific user."""
+    try:
+        from video_batch_control import set_video_generation_enabled
+        success = set_video_generation_enabled(req.user_id, req.enabled)
+        action = "enabled" if req.enabled else "disabled"
+        return {"success": success, "message": f"Video generation {action} for user {req.user_id}"}
+    except Exception as e:
+        logger.error(f"Admin video batch toggle failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+class AdminBatchControlRequest(BaseModel):
+    user_id: str
+    action: str  # "start", "stop", "resume"
+
+
+@app.post("/api/admin/video-batch/control")
+async def admin_video_batch_control(req: AdminBatchControlRequest, admin: User = Depends(require_admin)):
+    """Admin: Start/Stop/Resume video batch for a specific user."""
+    try:
+        if req.action == "stop":
+            from avatar_video_service import cancel_batch_worker
+            cancel_batch_worker()
+            from video_batch_control import set_video_generation_enabled
+            set_video_generation_enabled(req.user_id, False)
+            return {"success": True, "message": f"Video generation stopped for user {req.user_id}"}
+
+        elif req.action == "start" or req.action == "resume":
+            from video_batch_control import set_video_generation_enabled
+            set_video_generation_enabled(req.user_id, True)
+
+            from avatar_video_service import (
+                resume_batch_worker, get_batch_worker_status,
+                batch_generate_videos, get_all_topics_without_videos,
+                _load_topic_map, WORK_DIR,
+            )
+            resume_batch_worker()
+
+            status = get_batch_worker_status()
+            if status.get("running"):
+                return {"success": True, "message": "Batch is already running"}
+
+            db_topics = _discover_all_topics_from_db()
+            local_missing = get_all_topics_without_videos()
+            all_topic_set = set(t.strip().lower() for t in db_topics)
+            all_topic_set.update(t.strip().lower() for t in local_missing)
+
+            existing = _load_topic_map()
+            topics_to_generate = []
+            for topic_key in sorted(all_topic_set):
+                if topic_key in existing:
+                    entry = existing[topic_key]
+                    video_file = entry.get("filename", "")
+                    if video_file and (WORK_DIR / video_file).exists():
+                        continue
+                original = next((t for t in db_topics if t.strip().lower() == topic_key), None)
+                if not original:
+                    original = next((t for t in local_missing if t.strip().lower() == topic_key), None)
+                topics_to_generate.append(original or topic_key)
+
+            if not topics_to_generate:
+                return {"success": True, "message": "All topics already have videos"}
+
+            import threading
+            def _run():
+                batch_generate_videos(
+                    topics=topics_to_generate,
+                    user_id=req.user_id,
+                    voice="nova",
+                    avatar_id="teacher_female_1",
+                    video_mode="presentation",
+                )
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+
+            return {
+                "success": True,
+                "message": f"Batch started for user {req.user_id} — {len(topics_to_generate)} topics",
+                "topics_count": len(topics_to_generate),
+            }
+        else:
+            return {"success": False, "message": f"Unknown action: {req.action}"}
+
+    except Exception as e:
+        logger.error(f"Admin video batch control failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/admin/replicate-usage")
+async def admin_replicate_usage(admin: User = Depends(require_admin)):
+    """Admin: View Replicate API credit usage for all users."""
+    try:
+        from video_batch_control import get_all_users_replicate_usage
+        users = get_all_users_replicate_usage()
+        return {"success": True, "users": users}
+    except Exception as e:
+        logger.error(f"Admin replicate usage failed: {e}")
+        return {"success": False, "error": str(e), "users": []}
 
 
 # ── Usage Logging Helper ──────────────────────────────────────────────────────

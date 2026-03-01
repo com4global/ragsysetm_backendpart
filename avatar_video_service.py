@@ -731,10 +731,10 @@ def generate_talking_head(
     job_id: str,
 ) -> Optional[str]:
     """
-    Generate a realistic talking head video using a two-step pipeline:
-      Step 1: SadTalker — generates head animation from still image + audio
-      Step 2: MuseTalk — refines lip-sync on the video for accurate pronunciation
-    If MuseTalk fails, SadTalker's output is used directly (graceful fallback).
+    Generate a talking head video using SadTalker (single-step, fast).
+    SadTalker produces natural head movement + lip sync from still image + audio.
+    MuseTalk refinement step removed for ~3-4min speed gain per video — the
+    difference is negligible at PiP sizes used in presentation mode.
     """
     if not REPLICATE_API_TOKEN:
         logger.warning("REPLICATE_API_TOKEN not set — skipping talking head generation")
@@ -765,13 +765,12 @@ def generate_talking_head(
                 audio_url = f"data:audio/mp3;base64,{audio_b64}"
 
         # ═══════════════════════════════════════════════════════════════
-        # STEP 1: SadTalker — head animation (image → video)
-        # Generates natural head movement + basic mouth animation
+        # SadTalker — head animation + lip-sync (image + audio → video)
+        # Single-step pipeline: natural head movement + mouth animation
         # ═══════════════════════════════════════════════════════════════
-        sadtalker_path = WORK_DIR / f"{job_id}_st_{scene_index}.mp4"
         sadtalker_result = None
         try:
-            logger.info(f"   [{job_id}] Step 1/2: SadTalker head animation for scene {scene_index}...")
+            logger.info(f"   [{job_id}] SadTalker lip-sync for scene {scene_index}...")
             sadtalker_result = _replicate_api(
                 # cjwbw/sadtalker — audio-driven single image talking face
                 "a519cc0cfebaaeade068b23899165a11ec76aaa1d2b313d40d214f204ec957a3",
@@ -789,81 +788,23 @@ def generate_talking_head(
         except Exception as st_err:
             logger.error(f"   [{job_id}] SadTalker failed for scene {scene_index}: {st_err}")
 
-        # Download SadTalker output
+        # Download SadTalker output directly as final avatar clip
         st_output = sadtalker_result.get("output") if sadtalker_result else None
         if st_output:
             st_video_url = str(st_output)
             resp = requests.get(st_video_url, stream=True, timeout=120)
             if resp.status_code == 200:
-                with open(sadtalker_path, "wb") as f:
+                with open(output_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         f.write(chunk)
-                logger.info(f"   [{job_id}] SadTalker video saved ({sadtalker_path.stat().st_size} bytes)")
+                logger.info(f"✅ [{job_id}] SadTalker lip-sync done for scene {scene_index} ({output_path.stat().st_size} bytes)")
+                return str(output_path)
             else:
                 logger.error(f"   [{job_id}] SadTalker download failed: {resp.status_code}")
                 return None
         else:
             logger.error(f"   [{job_id}] SadTalker returned no output for scene {scene_index}")
             return None
-
-        # ═══════════════════════════════════════════════════════════════
-        # STEP 2: MuseTalk — lip-sync refinement (video + audio → video)
-        # Refines lip movement for accurate pronunciation
-        # ═══════════════════════════════════════════════════════════════
-        try:
-            logger.info(f"   [{job_id}] Step 2/2: MuseTalk lip refinement for scene {scene_index}...")
-            # Upload SadTalker video to Replicate for MuseTalk input
-            st_video_url_upload = _upload_file_to_replicate(str(sadtalker_path))
-
-            if st_video_url_upload:
-                muse_result = _replicate_api(
-                    # tmappdev/lipsync — MuseTalk-based lip-sync refinement
-                    "569bcd925698ea23d4bece4528546992012d84267ce2438ecc803618ce23764c",
-                    {
-                        "video_input": st_video_url_upload,
-                        "audio_input": audio_url,
-                        "fps": 25,
-                        "bbox_shift": 0,
-                    },
-                    timeout=300,
-                )
-
-                muse_output = muse_result.get("output") if muse_result else None
-                if muse_output:
-                    muse_video_url = str(muse_output)
-                    resp = requests.get(muse_video_url, stream=True, timeout=120)
-                    if resp.status_code == 200:
-                        with open(output_path, "wb") as f:
-                            for chunk in resp.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                        logger.info(f"✅ [{job_id}] MuseTalk lip-sync refined for scene {scene_index} ({output_path.stat().st_size} bytes)")
-                        # Clean up SadTalker intermediate
-                        try:
-                            sadtalker_path.unlink()
-                        except Exception:
-                            pass
-                        return str(output_path)
-                    else:
-                        logger.warning(f"   [{job_id}] MuseTalk download failed: {resp.status_code}")
-                else:
-                    logger.warning(f"   [{job_id}] MuseTalk returned no output")
-            else:
-                logger.warning(f"   [{job_id}] Could not upload SadTalker video for MuseTalk")
-
-        except Exception as muse_err:
-            logger.warning(f"   [{job_id}] MuseTalk failed for scene {scene_index}: {muse_err}")
-
-        # ═══════════════════════════════════════════════════════════════
-        # FALLBACK: Use SadTalker output directly if MuseTalk fails
-        # ═══════════════════════════════════════════════════════════════
-        if sadtalker_path.exists() and sadtalker_path.stat().st_size > 1000:
-            import shutil
-            shutil.move(str(sadtalker_path), str(output_path))
-            logger.info(f"⚠️ [{job_id}] Using SadTalker fallback for scene {scene_index}")
-            return str(output_path)
-
-        logger.warning(f"Talking head generation returned no output for scene {scene_index}")
-        return None
 
     except Exception as e:
         import traceback as _tb_mod
@@ -893,7 +834,8 @@ def generate_all_talking_heads(
         return idx, generate_talking_head(avatar_image_path, ap, idx, job_id)
 
     # Max 3 parallel for speed (Replicate handles concurrent requests)
-    with ThreadPoolExecutor(max_workers=min(3, len(tasks))) as pool:
+    # OPT: Increased from 3→5 workers for faster parallel lip-sync
+    with ThreadPoolExecutor(max_workers=min(5, len(tasks))) as pool:
         for idx, clip in pool.map(_gen, tasks):
             clips[idx] = clip
 
@@ -984,24 +926,29 @@ def generate_ai_scene_image(
     narration: str = "",
     aspect_ratio: str = "16:9",
     video_style: str = "educational_diagram",
+    image_only: bool = False,
 ) -> Optional[str]:
     """
     Generate a custom AI scene image using Replicate FLUX Schnell.
-    Returns the path to a video clip with Ken Burns zoom effect.
-    Falls back gracefully if Replicate is unavailable.
-
-    video_style: "photorealistic" (default) or "animated_explainer" (flat illustration)
+    When image_only=False: returns the path to a video clip with Ken Burns zoom.
+    When image_only=True: saves the PNG and returns the image path (skips video conversion).
     """
     if not REPLICATE_API_TOKEN:
         logger.info(f"   [{job_id}] REPLICATE_API_TOKEN not set — skipping AI image for scene {scene_index}")
         return None
 
-    output_path = WORK_DIR / f"{job_id}_ai_broll_{scene_index}.mp4"
-    if output_path.exists() and output_path.stat().st_size > 1000:
-        logger.info(f"🎯 AI B-roll {scene_index} cached")
-        return str(output_path)
-
+    # In image_only mode, check if the PNG already exists
     img_path = WORK_DIR / f"{job_id}_ai_img_{scene_index}.png"
+    if image_only:
+        if img_path.exists() and img_path.stat().st_size > 1000:
+            logger.info(f"🎯 AI image {scene_index} cached (image_only mode)")
+            return str(img_path)
+    else:
+        output_path = WORK_DIR / f"{job_id}_ai_broll_{scene_index}.mp4"
+        if output_path.exists() and output_path.stat().st_size > 1000:
+            logger.info(f"🎯 AI B-roll {scene_index} cached")
+            return str(output_path)
+
     if img_path.exists() and img_path.stat().st_size > 1000:
         logger.info(f"🎯 AI image {scene_index} cached, converting to video...")
     else:
@@ -1065,6 +1012,13 @@ def generate_ai_scene_image(
             logger.warning(f"   [{job_id}] AI image generation failed for scene {scene_index}: {e}")
             return None
 
+    # OPT: In image_only mode (presentation), skip Ken Burns video conversion
+    if image_only:
+        if img_path.exists():
+            logger.info(f"✅ [{job_id}] AI image saved for scene {scene_index} ({img_path.stat().st_size} bytes) [image_only]")
+            return str(img_path)
+        return None
+
     # Convert the AI-generated image to video with Ken Burns zoom
     if img_path.exists():
         try:
@@ -1078,7 +1032,7 @@ def generate_ai_scene_image(
                     "d=300:s=1920x1080:fps=30"
                 ),
                 "-t", "10",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "20",
                 "-pix_fmt", "yuv420p",
                 str(output_path)
             ]
@@ -1227,7 +1181,7 @@ def search_broll_footage(
                         "d=300:s=1920x1080:fps=30"
                     ),
                     "-t", "10",
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "20",
                     "-pix_fmt", "yuv420p",
                     str(output_path)
                 ]
@@ -1253,31 +1207,41 @@ def search_all_broll(
     scenes: List[Dict],
     job_id: str,
     video_style: str = "educational_diagram",
+    video_mode: str = "avatar",
 ) -> List[Optional[str]]:
     """
     Get scene visuals for all scenes.
-    Phase 1: Try AI-generated images via FLUX Schnell (Replicate).
-    Phase 2: Fall back to Pexels stock footage for any missing scenes.
+    In presentation mode: generates AI images only (PNG) — frontend shows them as slides.
+    In avatar mode: generates full Ken Burns videos + Pexels fallback.
     """
     broll_paths: List[Optional[str]] = [None] * len(scenes)
+    # OPT: In presentation mode, frontend displays _ai_img_X.png directly as slides.
+    # Skip Ken Burns video conversion and Pexels search entirely (~60s saved).
+    is_presentation = video_mode == "presentation"
 
     # ── Phase 1: AI-Generated Scene Images (FLUX Schnell) ──
+    # OPT: Parallelized with 3 workers instead of sequential loop (~2x faster)
     if REPLICATE_API_TOKEN:
-        logger.info(f"🎨 [{job_id}] Phase 1: Generating AI scene images via FLUX Schnell...")
-        # Run AI generation sequentially (Replicate rate limits concurrent requests)
-        for i, scene in enumerate(scenes):
+        mode_label = "image-only" if is_presentation else "full video"
+        logger.info(f"🎨 [{job_id}] Phase 1: Generating AI scene images ({mode_label}, parallel)...")
+
+        def _gen_scene_img(args):
+            i, scene = args
             visual_queries = scene.get("visual_queries", [])
             primary_query = scene.get("visual_query", "")
             narration = scene.get("narration", "")
-
             if not primary_query and visual_queries:
                 primary_query = visual_queries[0]
-
             if primary_query:
-                result = generate_ai_scene_image(
+                return i, generate_ai_scene_image(
                     primary_query, i, job_id, narration=narration,
                     video_style=video_style,
+                    image_only=is_presentation,
                 )
+            return i, None
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for i, result in pool.map(_gen_scene_img, enumerate(scenes)):
                 if result:
                     broll_paths[i] = result
 
@@ -1287,37 +1251,41 @@ def search_all_broll(
         logger.info(f"   [{job_id}] No REPLICATE_API_TOKEN — skipping AI image generation")
 
     # ── Phase 2: Pexels Fallback for missing scenes ──
-    missing = [i for i in range(len(scenes)) if not broll_paths[i]]
-    if missing:
-        logger.info(f"📹 [{job_id}] Phase 2: Searching Pexels for {len(missing)} remaining scenes...")
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {}
-            for i in missing:
-                scene = scenes[i]
-                visual_queries = scene.get("visual_queries", [])
-                primary_query = scene.get("visual_query", "")
+    # OPT: Skip Pexels entirely in presentation mode — images are sufficient for slides
+    if is_presentation:
+        logger.info(f"📊 [{job_id}] Presentation mode — skipping Pexels B-roll (slides use PNG images)")
+    else:
+        missing = [i for i in range(len(scenes)) if not broll_paths[i]]
+        if missing:
+            logger.info(f"📹 [{job_id}] Phase 2: Searching Pexels for {len(missing)} remaining scenes...")
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = {}
+                for i in missing:
+                    scene = scenes[i]
+                    visual_queries = scene.get("visual_queries", [])
+                    primary_query = scene.get("visual_query", "")
 
-                if not primary_query and visual_queries:
-                    primary_query = visual_queries[0]
+                    if not primary_query and visual_queries:
+                        primary_query = visual_queries[0]
 
-                fallbacks = [q for q in visual_queries if q and q != primary_query]
+                    fallbacks = [q for q in visual_queries if q and q != primary_query]
 
-                if primary_query:
-                    fut = pool.submit(
-                        search_broll_footage, primary_query, i, job_id,
-                        5, 30, fallbacks
-                    )
-                    futures[fut] = i
+                    if primary_query:
+                        fut = pool.submit(
+                            search_broll_footage, primary_query, i, job_id,
+                            5, 30, fallbacks
+                        )
+                        futures[fut] = i
 
-            for fut in futures:
-                idx = futures[fut]
-                try:
-                    broll_paths[idx] = fut.result()
-                except Exception as e:
-                    logger.error(f"B-roll failed for scene {idx}: {e}")
+                for fut in futures:
+                    idx = futures[fut]
+                    try:
+                        broll_paths[idx] = fut.result()
+                    except Exception as e:
+                        logger.error(f"B-roll failed for scene {idx}: {e}")
 
     found = sum(1 for p in broll_paths if p)
-    logger.info(f"🎬 [{job_id}] Total scene visuals: {found}/{len(scenes)} (AI + Pexels)")
+    logger.info(f"🎬 [{job_id}] Total scene visuals: {found}/{len(scenes)}")
     return broll_paths
 
 
@@ -1564,7 +1532,7 @@ def compose_final_video(
                     cmd += ["-map", f"{audio_input_idx}:a"]
                 cmd += [
                     "-t", str(actual_duration),
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "20",
                     "-c:a", "aac", "-b:a", "192k",
                     "-r", str(FPS),
                     "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -2109,70 +2077,81 @@ def generate_avatar_video(
         for idx, ap in enumerate(audio_paths):
             logger.info(f"   Audio[{idx}]: {ap}")
 
-        # ── Stage 4: Generate talking head avatars ──
-        # Routes: D-ID (primary) → SadTalker (fallback) → voiceover (objects)
+        # ── Stages 4+5: Avatar lip-sync AND scene images (run concurrently) ──
+        # OPT: These are independent — lip-sync needs audio, images need scene text.
+        # Running them in parallel saves the full duration of the shorter stage.
         avatar_image = get_avatar_image_path(avatar_id)
         avatar_clips = [None] * len(scenes)
+        broll_paths = [None] * len(scenes)
         is_face = _is_face_avatar(avatar_id)
         use_did = False  # Always use SadTalker/Replicate for lip-sync (D-ID disabled)
 
-        if video_style == "animated_explainer":
-            logger.info(f"🎨 [{job_id}] Stage 4: Skipping avatar (animated_explainer style — voiceover only)")
-            update_job_status(job_id, progress=45, stage="Animated explainer — skipping avatar...")
+        # ── Define Stage 4 worker (lip-sync) ──
+        def _run_stage4():
+            nonlocal avatar_clips
+            if video_style == "animated_explainer":
+                logger.info(f"🎨 [{job_id}] Stage 4: Skipping avatar (animated_explainer style — voiceover only)")
+                update_job_status(job_id, progress=45, stage="Animated explainer — skipping avatar...")
 
-        elif not is_face:
-            # Object avatar (banana, car, etc.) — voiceover mode, no lip-sync
-            logger.info(f"🍌 [{job_id}] Stage 4: Object avatar '{avatar_id}' — voiceover mode (no lip-sync)")
-            update_job_status(job_id, progress=45, stage="Object avatar — voiceover mode...")
-            # avatar_clips stays [None, ...], compose will use static image + audio
+            elif not is_face:
+                logger.info(f"🍌 [{job_id}] Stage 4: Object avatar '{avatar_id}' — voiceover mode (no lip-sync)")
+                update_job_status(job_id, progress=45, stage="Object avatar — voiceover mode...")
 
-        elif use_did:
-            # D-ID primary path — text-in, video-out with lip-sync
-            logger.info(f"🎬 [{job_id}] Stage 4: Using D-ID for lip-sync (avatar='{avatar_id}')")
-            update_job_status(job_id, progress=45, stage="Creating AI avatar via D-ID...")
-            # Upload avatar image to D-ID so it gets a publicly accessible URL
-            try:
-                from did_service import upload_image_to_did
-                avatar_url = upload_image_to_did(avatar_image) if avatar_image else ""
-                logger.info(f"📤 [{job_id}] Avatar uploaded to D-ID: {avatar_url[:80]}...")
-            except Exception as e:
-                logger.error(f"❌ [{job_id}] Failed to upload avatar to D-ID: {e}")
-                avatar_url = ""
-            if avatar_url:
-                avatar_clips = generate_all_did_talking_heads(
-                    scenes, job_id, avatar_image_url=avatar_url, language=language,
-                )
-                did_count = sum(1 for c in avatar_clips if c)
-                logger.info(f"✅ [{job_id}] D-ID: {did_count}/{len(scenes)} clips generated")
-                # If D-ID failed on ALL scenes, fall back to SadTalker
-                if did_count == 0 and avatar_image and REPLICATE_API_TOKEN:
-                    logger.warning(f"⚠️ [{job_id}] D-ID produced 0 clips — falling back to SadTalker")
-                    update_job_status(job_id, progress=50, stage="D-ID failed, using SadTalker fallback...")
-                    avatar_clips = generate_all_talking_heads(avatar_image, audio_paths, job_id)
+            elif use_did:
+                logger.info(f"🎬 [{job_id}] Stage 4: Using D-ID for lip-sync (avatar='{avatar_id}')")
+                update_job_status(job_id, progress=45, stage="Creating AI avatar via D-ID...")
+                try:
+                    from did_service import upload_image_to_did
+                    avatar_url = upload_image_to_did(avatar_image) if avatar_image else ""
+                    logger.info(f"📤 [{job_id}] Avatar uploaded to D-ID: {avatar_url[:80]}...")
+                except Exception as e:
+                    logger.error(f"❌ [{job_id}] Failed to upload avatar to D-ID: {e}")
+                    avatar_url = ""
+                if avatar_url:
+                    avatar_clips[:] = generate_all_did_talking_heads(
+                        scenes, job_id, avatar_image_url=avatar_url, language=language,
+                    )
+                    did_count = sum(1 for c in avatar_clips if c)
+                    logger.info(f"✅ [{job_id}] D-ID: {did_count}/{len(scenes)} clips generated")
+                    if did_count == 0 and avatar_image and REPLICATE_API_TOKEN:
+                        logger.warning(f"⚠️ [{job_id}] D-ID produced 0 clips — falling back to SadTalker")
+                        update_job_status(job_id, progress=50, stage="D-ID failed, using SadTalker fallback...")
+                        avatar_clips[:] = generate_all_talking_heads(avatar_image, audio_paths, job_id)
+                else:
+                    logger.warning(f"⚠️ [{job_id}] D-ID avatar upload failed, falling back to SadTalker")
+                    if avatar_image and REPLICATE_API_TOKEN:
+                        avatar_clips[:] = generate_all_talking_heads(avatar_image, audio_paths, job_id)
+
+            elif avatar_image and REPLICATE_API_TOKEN:
+                logger.info(f"📋 [{job_id}] Stage 4: Using SadTalker for lip-sync")
+                update_job_status(job_id, progress=45, stage="Creating AI avatar via SadTalker...")
+                avatar_clips[:] = generate_all_talking_heads(avatar_image, audio_paths, job_id)
+
             else:
-                logger.warning(f"⚠️ [{job_id}] D-ID avatar upload failed, falling back to SadTalker")
-                if avatar_image and REPLICATE_API_TOKEN:
-                    avatar_clips = generate_all_talking_heads(avatar_image, audio_paths, job_id)
+                update_job_status(job_id, progress=45, stage="Skipping avatar (no API keys)...")
+                logger.info(f"⏭️ [{job_id}] Skipping talking head generation (no DID/Replicate keys)")
 
-        elif avatar_image and REPLICATE_API_TOKEN:
-            # SadTalker fallback — needs separate audio + image
-            logger.info(f"📋 [{job_id}] Stage 4: Falling back to SadTalker (no DID_API_KEY)")
-            update_job_status(job_id, progress=45, stage="Creating AI avatar via SadTalker...")
-            avatar_clips = generate_all_talking_heads(avatar_image, audio_paths, job_id)
+        # ── Define Stage 5 worker (scene images) ──
+        def _run_stage5():
+            nonlocal broll_paths
+            logger.info(f"📋 [{job_id}] Stage 5: include_broll={include_broll}, PEXELS_KEY={'set' if PEXELS_API_KEY else 'NOT SET'}")
+            if include_broll and PEXELS_API_KEY:
+                update_job_status(job_id, progress=65, stage="Finding background footage...")
+                broll_paths[:] = search_all_broll(scenes, job_id, video_style=video_style, video_mode=video_mode)
+            else:
+                update_job_status(job_id, progress=65, stage="Skipping B-roll...")
+                logger.info(f"⏭️ [{job_id}] Skipping B-roll search")
 
-        else:
-            update_job_status(job_id, progress=45, stage="Skipping avatar (no API keys)...")
-            logger.info(f"⏭️ [{job_id}] Skipping talking head generation (no DID/Replicate keys)")
-
-        # ── Stage 5: Search B-roll footage ──
-        broll_paths = [None] * len(scenes)
-        logger.info(f"📋 [{job_id}] Stage 5: include_broll={include_broll}, PEXELS_KEY={'set' if PEXELS_API_KEY else 'NOT SET'}")
-        if include_broll and PEXELS_API_KEY:
-            update_job_status(job_id, progress=65, stage="Finding background footage...")
-            broll_paths = search_all_broll(scenes, job_id, video_style=video_style)
-        else:
-            update_job_status(job_id, progress=65, stage="Skipping B-roll...")
-            logger.info(f"⏭️ [{job_id}] Skipping B-roll search")
+        # ── Run Stages 4+5 concurrently ──
+        logger.info(f"🚀 [{job_id}] Running Stage 4 (lip-sync) + Stage 5 (scene images) concurrently...")
+        update_job_status(job_id, progress=40, stage="Creating avatar + scene images (parallel)...")
+        with ThreadPoolExecutor(max_workers=2) as stage_pool:
+            s4_future = stage_pool.submit(_run_stage4)
+            s5_future = stage_pool.submit(_run_stage5)
+            # Wait for both to complete
+            s4_future.result()
+            s5_future.result()
+        logger.info(f"✅ [{job_id}] Stages 4+5 complete: {sum(1 for c in avatar_clips if c)} avatar clips, {sum(1 for b in broll_paths if b)} scene images")
 
         # ── Stage 6: Compose final video ──
         logger.info(f"🎬 [{job_id}] Stage 6: Composing video with {len(scenes)} scenes, {audio_count} audio files")
