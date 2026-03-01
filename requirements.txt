@@ -10,7 +10,6 @@ beautifulsoup4
 youtube-transcript-api
 mangum
 pypdf
-numpy
 supabase
 openpyxl
 python-docx
@@ -18,8 +17,6 @@ pdfplumber
 Pillow
 stripe
 replicate
-moviepy
 rank-bm25
-sentence-transformers
 tiktoken
 pyyaml
