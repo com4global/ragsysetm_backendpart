@@ -53,7 +53,12 @@ _tls = _threading.local()
 
 # ── Directories ─────────────────────────────────────────────────────
 BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
-AVATAR_DIR = BASE_DIR / "static" / "avatars"
+
+# Temp dirs for processing (use /tmp on Linux/Vercel — /var/task is read-only)
+if os.name == "nt":
+    AVATAR_DIR = BASE_DIR / "static" / "avatars"
+else:
+    AVATAR_DIR = Path("/tmp") / "avatars"
 AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 
 # Temp dirs for processing (use /tmp on Linux/Vercel)
