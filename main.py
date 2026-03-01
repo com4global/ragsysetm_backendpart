@@ -4457,6 +4457,14 @@ async def avatar_video_batch_generate(
     Runs in a background thread. Returns immediately with status.
     """
     try:
+        # Vercel serverless kills background threads after the response is sent.
+        # Detect Vercel and return a clear error instead of silently failing.
+        if os.getenv("VERCEL"):
+            return {
+                "success": False,
+                "error": "Batch video generation is not supported on Vercel (serverless). "
+                         "Please run the backend locally with 'uvicorn main:app' to generate videos.",
+            }
         global _batch_video_thread
         from avatar_video_service import (
             batch_generate_videos, get_batch_worker_status,
