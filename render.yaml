@@ -1,0 +1,15 @@
+# Render.com deployment configuration
+# See https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: rag-hr-assistant-api
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.6"
+      # All other env vars should be set manually in Render Dashboard
+      # (they contain secrets and should not be committed to git)
