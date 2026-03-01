@@ -776,9 +776,9 @@ def generate_talking_head(
         sadtalker_result = None
         try:
             logger.info(f"   [{job_id}] SadTalker lip-sync for scene {scene_index}...")
-            sadtalker_result = _replicate_api(
+            sadtalker_result = _replicate_model_api(
                 # cjwbw/sadtalker — audio-driven single image talking face
-                "a519cc0cfebaaeade068b23899165a11ec76aaa1d2b313d40d214f204ec957a3",
+                "cjwbw", "sadtalker",
                 {
                     "source_image": face_url,
                     "driven_audio": audio_url,
