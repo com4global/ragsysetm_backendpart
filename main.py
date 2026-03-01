@@ -4456,153 +4456,169 @@ async def avatar_video_batch_generate(
     Start batch generation of avatar videos for ALL topics that don't have videos.
     Runs in a background thread. Returns immediately with status.
     """
-    global _batch_video_thread
-    from avatar_video_service import (
-        batch_generate_videos, get_batch_worker_status,
-        get_all_topics_without_videos
-    )
-    import threading
+    try:
+        global _batch_video_thread
+        from avatar_video_service import (
+            batch_generate_videos, get_batch_worker_status,
+            get_all_topics_without_videos
+        )
+        import threading
 
-    status = get_batch_worker_status()
-    if status.get("running"):
-        return {
-            "success": False,
-            "message": "Batch worker is already running",
-            "status": status,
-        }
+        status = get_batch_worker_status()
+        if status.get("running"):
+            return {
+                "success": False,
+                "message": "Batch worker is already running",
+                "status": status,
+            }
 
-    # Discover topics from DB + local files
-    db_topics = _discover_all_topics_from_db()
-    local_missing = get_all_topics_without_videos()
+        # Discover topics from DB + local files
+        db_topics = _discover_all_topics_from_db()
+        local_missing = get_all_topics_without_videos()
 
-    # Combine: all DB topics + locally-discovered topics
-    all_topic_set = set(t.strip().lower() for t in db_topics)
-    all_topic_set.update(t.strip().lower() for t in local_missing)
+        # Combine: all DB topics + locally-discovered topics
+        all_topic_set = set(t.strip().lower() for t in db_topics)
+        all_topic_set.update(t.strip().lower() for t in local_missing)
 
-    # Check which ones need videos (using the service function)
-    from avatar_video_service import _load_topic_map, WORK_DIR
-    existing = _load_topic_map()
-    topics_to_generate = []
-    for topic in sorted(all_topic_set):
-        if topic in existing:
-            entry = existing[topic]
-            video_file = entry.get("filename", "")
-            if video_file and (WORK_DIR / video_file).exists():
-                continue
-        # Find the original-case version
-        original = next((t for t in db_topics if t.strip().lower() == topic), None)
-        if not original:
-            original = next((t for t in local_missing if t.strip().lower() == topic), None)
-        topics_to_generate.append(original or topic)
+        # Check which ones need videos (using the service function)
+        from avatar_video_service import _load_topic_map, WORK_DIR
+        existing = _load_topic_map()
+        topics_to_generate = []
+        for topic in sorted(all_topic_set):
+            if topic in existing:
+                entry = existing[topic]
+                video_file = entry.get("filename", "")
+                if video_file and (WORK_DIR / video_file).exists():
+                    continue
+            # Find the original-case version
+            original = next((t for t in db_topics if t.strip().lower() == topic), None)
+            if not original:
+                original = next((t for t in local_missing if t.strip().lower() == topic), None)
+            topics_to_generate.append(original or topic)
 
-    if not topics_to_generate:
+        if not topics_to_generate:
+            return {
+                "success": True,
+                "message": "All topics already have avatar videos!",
+                "total_topics": len(all_topic_set),
+                "videos_exist": len(all_topic_set),
+            }
+
+        def _run_batch():
+            batch_generate_videos(
+                topics=topics_to_generate,
+                user_id=current_user.id,
+                voice="nova",
+                avatar_id="teacher_female_1",
+                video_mode="presentation",
+            )
+
+        _batch_video_thread = threading.Thread(target=_run_batch, daemon=True)
+        _batch_video_thread.start()
+
         return {
             "success": True,
-            "message": "All topics already have avatar videos!",
+            "message": f"Batch generation started for {len(topics_to_generate)} topics",
+            "topics": topics_to_generate,
             "total_topics": len(all_topic_set),
-            "videos_exist": len(all_topic_set),
+            "already_exist": len(all_topic_set) - len(topics_to_generate),
         }
-
-    def _run_batch():
-        batch_generate_videos(
-            topics=topics_to_generate,
-            user_id=current_user.id,
-            voice="nova",
-            avatar_id="teacher_female_1",
-            video_mode="presentation",
-        )
-
-    _batch_video_thread = threading.Thread(target=_run_batch, daemon=True)
-    _batch_video_thread.start()
-
-    return {
-        "success": True,
-        "message": f"Batch generation started for {len(topics_to_generate)} topics",
-        "topics": topics_to_generate,
-        "total_topics": len(all_topic_set),
-        "already_exist": len(all_topic_set) - len(topics_to_generate),
-    }
+    except Exception as e:
+        logger.error(f"Batch generate crashed: {e}", exc_info=True)
+        return {"success": False, "error": f"Batch generation error: {str(e)}"}
 
 
 @app.get("/api/avatar-video/batch-status")
 async def avatar_video_batch_status(current_user: User = Depends(get_current_user)):
     """Get the current status of the batch video generation worker."""
-    from avatar_video_service import get_batch_worker_status, get_all_topics_without_videos
-    status = get_batch_worker_status()
-    status["pending_topics"] = len(get_all_topics_without_videos())
-    return {"success": True, **status}
+    try:
+        from avatar_video_service import get_batch_worker_status, get_all_topics_without_videos
+        status = get_batch_worker_status()
+        status["pending_topics"] = len(get_all_topics_without_videos())
+        return {"success": True, **status}
+    except Exception as e:
+        logger.error(f"Batch status crashed: {e}", exc_info=True)
+        return {"success": False, "error": f"Batch status error: {str(e)}"}
 
 
 @app.post("/api/avatar-video/batch-cancel")
 async def avatar_video_batch_cancel(current_user: User = Depends(get_current_user)):
     """Cancel the running batch video generation worker.
     Sets persistent user_cancelled flag — batch will NOT auto-restart."""
-    from avatar_video_service import cancel_batch_worker, get_batch_worker_status
-    cancel_batch_worker()  # Always set the persistent flag, even if not running
-    updated = get_batch_worker_status()
-    return {
-        "success": True,
-        "message": "Batch cancelled — will NOT auto-restart until you click Resume",
-        "status": updated,
-    }
+    try:
+        from avatar_video_service import cancel_batch_worker, get_batch_worker_status
+        cancel_batch_worker()  # Always set the persistent flag, even if not running
+        updated = get_batch_worker_status()
+        return {
+            "success": True,
+            "message": "Batch cancelled — will NOT auto-restart until you click Resume",
+            "status": updated,
+        }
+    except Exception as e:
+        logger.error(f"Batch cancel crashed: {e}", exc_info=True)
+        return {"success": False, "error": f"Batch cancel error: {str(e)}"}
 
 
 @app.post("/api/avatar-video/batch-resume")
 async def avatar_video_batch_resume(current_user: User = Depends(get_current_user)):
     """Clear the persistent user_cancelled flag and restart batch generation."""
-    from avatar_video_service import (
-        resume_batch_worker, get_batch_worker_status,
-        batch_generate_videos, get_all_topics_without_videos,
-        _load_topic_map, WORK_DIR,
-    )
-
-    # Clear persistent cancel flag
-    resume_batch_worker()
-
-    status = get_batch_worker_status()
-    if status.get("running"):
-        return {"success": True, "message": "Batch is already running"}
-
-    # Discover topics and start batch
-    db_topics = _discover_all_topics_from_db()
-    local_missing = get_all_topics_without_videos()
-    all_topic_set = set(t.strip().lower() for t in db_topics)
-    all_topic_set.update(t.strip().lower() for t in local_missing)
-
-    existing = _load_topic_map()
-    topics_to_generate = []
-    for topic_key in sorted(all_topic_set):
-        if topic_key in existing:
-            entry = existing[topic_key]
-            video_file = entry.get("filename", "")
-            if video_file and (WORK_DIR / video_file).exists():
-                continue
-        original = next((t for t in db_topics if t.strip().lower() == topic_key), None)
-        if not original:
-            original = next((t for t in local_missing if t.strip().lower() == topic_key), None)
-        topics_to_generate.append(original or topic_key)
-
-    if not topics_to_generate:
-        return {"success": True, "message": "All topics already have videos"}
-
-    import threading
-    def _run():
-        batch_generate_videos(
-            topics=topics_to_generate,
-            user_id=str(current_user.id),
-            voice="nova",
-            avatar_id="teacher_female_1",
-            video_mode="presentation",
+    try:
+        from avatar_video_service import (
+            resume_batch_worker, get_batch_worker_status,
+            batch_generate_videos, get_all_topics_without_videos,
+            _load_topic_map, WORK_DIR,
         )
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+        # Clear persistent cancel flag
+        resume_batch_worker()
 
-    return {
-        "success": True,
-        "message": f"Batch resumed — generating {len(topics_to_generate)} topics",
-        "topics_count": len(topics_to_generate),
-    }
+        status = get_batch_worker_status()
+        if status.get("running"):
+            return {"success": True, "message": "Batch is already running"}
+
+        # Discover topics and start batch
+        db_topics = _discover_all_topics_from_db()
+        local_missing = get_all_topics_without_videos()
+        all_topic_set = set(t.strip().lower() for t in db_topics)
+        all_topic_set.update(t.strip().lower() for t in local_missing)
+
+        existing = _load_topic_map()
+        topics_to_generate = []
+        for topic_key in sorted(all_topic_set):
+            if topic_key in existing:
+                entry = existing[topic_key]
+                video_file = entry.get("filename", "")
+                if video_file and (WORK_DIR / video_file).exists():
+                    continue
+            original = next((t for t in db_topics if t.strip().lower() == topic_key), None)
+            if not original:
+                original = next((t for t in local_missing if t.strip().lower() == topic_key), None)
+            topics_to_generate.append(original or topic_key)
+
+        if not topics_to_generate:
+            return {"success": True, "message": "All topics already have videos"}
+
+        import threading
+        def _run():
+            batch_generate_videos(
+                topics=topics_to_generate,
+                user_id=str(current_user.id),
+                voice="nova",
+                avatar_id="teacher_female_1",
+                video_mode="presentation",
+            )
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+        return {
+            "success": True,
+            "message": f"Batch resumed — generating {len(topics_to_generate)} topics",
+            "topics_count": len(topics_to_generate),
+        }
+    except Exception as e:
+        logger.error(f"Batch resume crashed: {e}", exc_info=True)
+        return {"success": False, "error": f"Batch resume error: {str(e)}"}
 
 
 @app.get("/api/avatar-video/topics-without-videos")
