@@ -2034,6 +2034,7 @@ def generate_avatar_video(
     job_id: str = "",
     video_style: str = "educational_diagram",
     video_mode: str = "presentation",
+    skip_lipsync: bool = False,
 ) -> Dict:
     """
     Full avatar video generation pipeline.
@@ -2098,8 +2099,10 @@ def generate_avatar_video(
         avatar_image = get_avatar_image_path(avatar_id)
         avatar_clips = [None] * len(scenes)
         broll_paths = [None] * len(scenes)
-        is_face = _is_face_avatar(avatar_id)
+        is_face = _is_face_avatar(avatar_id) if not skip_lipsync else False
         use_did = False  # Always use SadTalker/Replicate for lip-sync (D-ID disabled)
+        if skip_lipsync:
+            logger.info(f"⚡ [{job_id}] Lip-sync SKIPPED (fast mode) — presentation-style video")
 
         # ── Define Stage 4 worker (lip-sync) ──
         def _run_stage4():
@@ -2515,6 +2518,7 @@ def batch_generate_videos(
                 job_id=job_id,
                 video_style="educational_diagram",
                 video_mode=video_mode,
+                skip_lipsync=True,  # Skip SadTalker for 3-4x faster batch
             )
 
             if result.get("status") == "completed":
