@@ -4357,7 +4357,7 @@ async def avatar_video_dashboard(
                 _load_topic_map, get_batch_worker_status, WORK_DIR
             )
             topic_map = _load_topic_map()
-            batch_status = get_batch_worker_status()
+            batch_status = get_batch_worker_status(user_id=current_user.id)
             WORK_DIR_resolved = WORK_DIR
         except Exception as e:
             logger.warning(f"Dashboard: avatar_video_service unavailable: {e}")
