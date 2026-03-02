@@ -2321,51 +2321,81 @@ def list_available_avatars() -> List[Dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ▸ Background Batch Video Pre-Generation Worker
+# ▸ Background Batch Video Pre-Generation Worker (Per-User)
 # ═══════════════════════════════════════════════════════════════════
 
 import threading as _threading
-_cancel_event = _threading.Event()
+
+# Per-user cancel events and status dictionaries
+_user_cancel_events = {}  # user_id -> threading.Event
+_user_batch_status = {}   # user_id -> status dict
+_batch_lock = _threading.Lock()
+
+def _get_cancel_event(user_id: str) -> _threading.Event:
+    """Get or create a cancel event for a specific user."""
+    if user_id not in _user_cancel_events:
+        _user_cancel_events[user_id] = _threading.Event()
+    return _user_cancel_events[user_id]
+
+def _default_status(user_id: str = "") -> dict:
+    """Return a fresh default status dict."""
+    return {
+        "running": False,
+        "user_id": user_id,
+        "current_topic": "",
+        "completed": 0,
+        "total": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": [],
+        "started_at": "",
+        "last_completed_at": "",
+        "cancelled": False,
+        "paused": False,
+        "user_cancelled": False,
+    }
 
 # ── Persistent batch control file (survives backend restarts) ──
 _BATCH_CONTROL_FILE = WORK_DIR / "_batch_control.json"
 
-def _load_batch_control() -> dict:
+def _load_batch_control(user_id: str = "") -> dict:
     """Load persistent batch control state from disk."""
     try:
-        if _BATCH_CONTROL_FILE.exists():
+        ctrl_file = WORK_DIR / f"_batch_control_{user_id}.json" if user_id else _BATCH_CONTROL_FILE
+        if ctrl_file.exists():
             import json
-            return json.loads(_BATCH_CONTROL_FILE.read_text())
+            return json.loads(ctrl_file.read_text())
     except Exception:
         pass
     return {"user_cancelled": False}
 
-def _save_batch_control(state: dict):
+def _save_batch_control(state: dict, user_id: str = ""):
     """Save batch control state to disk (persists across restarts)."""
     try:
         import json
-        _BATCH_CONTROL_FILE.write_text(json.dumps(state, indent=2))
+        ctrl_file = WORK_DIR / f"_batch_control_{user_id}.json" if user_id else _BATCH_CONTROL_FILE
+        ctrl_file.write_text(json.dumps(state, indent=2))
     except Exception as e:
         logger.error(f"Failed to save batch control state: {e}")
 
-# Load persistent cancel state on startup
-_persisted = _load_batch_control()
 
-_batch_worker_status = {
-    "running": False,
-    "user_id": "",
-    "current_topic": "",
-    "completed": 0,
-    "total": 0,
-    "failed": 0,
-    "skipped": 0,
-    "errors": [],
-    "started_at": "",
-    "last_completed_at": "",
-    "cancelled": _persisted.get("user_cancelled", False),
-    "paused": _persisted.get("user_cancelled", False),
-    "user_cancelled": _persisted.get("user_cancelled", False),
-}
+def _get_user_status(user_id: str) -> dict:
+    """Get or create a status dict for a specific user."""
+    with _batch_lock:
+        if user_id not in _user_batch_status:
+            persisted = _load_batch_control(user_id)
+            status = _default_status(user_id)
+            status["cancelled"] = persisted.get("user_cancelled", False)
+            status["paused"] = persisted.get("user_cancelled", False)
+            status["user_cancelled"] = persisted.get("user_cancelled", False)
+            _user_batch_status[user_id] = status
+        return _user_batch_status[user_id]
+
+
+# ── Legacy compatibility: global _batch_worker_status for old code ──
+# Keep as a simple reference — get_batch_worker_status() handles per-user logic
+_batch_worker_status = _default_status()
+_cancel_event = _threading.Event()
 
 
 def get_all_topics_without_videos() -> list:
@@ -2423,47 +2453,70 @@ def get_all_topics_without_videos() -> list:
     return missing
 
 
-def get_batch_worker_status() -> dict:
-    """Return the current status of the background batch worker."""
+def get_batch_worker_status(user_id: str = "") -> dict:
+    """Return the current batch status for a specific user (or global if no user_id)."""
+    if user_id:
+        status = dict(_get_user_status(user_id))
+        persisted = _load_batch_control(user_id)
+        status["user_cancelled"] = persisted.get("user_cancelled", False)
+        return status
+    # Legacy: return global status (for auto-scheduler compatibility)
     status = dict(_batch_worker_status)
-    # Always reflect persistent user_cancelled state
     persisted = _load_batch_control()
     status["user_cancelled"] = persisted.get("user_cancelled", False)
     return status
 
 
-def cancel_batch_worker():
+def cancel_batch_worker(user_id: str = ""):
     """Signal the batch worker to stop after the current video.
     Persists user_cancelled to disk so it survives backend restarts."""
-    _batch_worker_status["cancelled"] = True
-    _batch_worker_status["paused"] = True
-    _batch_worker_status["user_cancelled"] = True
-    _cancel_event.set()  # Signal immediately
-    # Persist to disk — this survives backend restarts
-    _save_batch_control({"user_cancelled": True})
-    logger.info("🛑 Batch video worker cancellation requested — persisted to disk")
+    if user_id:
+        st = _get_user_status(user_id)
+        st["cancelled"] = True
+        st["paused"] = True
+        st["user_cancelled"] = True
+        _get_cancel_event(user_id).set()
+        _save_batch_control({"user_cancelled": True}, user_id)
+        logger.info(f"🛑 Batch cancellation for user {user_id[:8]}... — persisted")
+    else:
+        _batch_worker_status["cancelled"] = True
+        _batch_worker_status["paused"] = True
+        _batch_worker_status["user_cancelled"] = True
+        _cancel_event.set()
+        _save_batch_control({"user_cancelled": True})
+        logger.info("🛑 Global batch cancellation requested")
 
 
-def resume_batch_worker():
-    """Clear the persistent user_cancelled flag so auto-scheduler or manual start can proceed."""
-    _batch_worker_status["cancelled"] = False
-    _batch_worker_status["paused"] = False
-    _batch_worker_status["user_cancelled"] = False
-    _cancel_event.clear()
-    _save_batch_control({"user_cancelled": False})
-    logger.info("▶ Batch worker resume requested — persistent cancel flag cleared")
+def resume_batch_worker(user_id: str = ""):
+    """Clear the persistent user_cancelled flag so batch can proceed."""
+    if user_id:
+        st = _get_user_status(user_id)
+        st["cancelled"] = False
+        st["paused"] = False
+        st["user_cancelled"] = False
+        _get_cancel_event(user_id).clear()
+        _save_batch_control({"user_cancelled": False}, user_id)
+        logger.info(f"▶ Batch resume for user {user_id[:8]}...")
+    else:
+        _batch_worker_status["cancelled"] = False
+        _batch_worker_status["paused"] = False
+        _batch_worker_status["user_cancelled"] = False
+        _cancel_event.clear()
+        _save_batch_control({"user_cancelled": False})
+        logger.info("▶ Global batch resume requested")
 
 
 def batch_generate_videos(
     topics: list = None,
     user_id: str = "",
     voice: str = "nova",
-    avatar_id: str = "teacher_female_1",
+    avatar_id: str = "",
     video_mode: str = "presentation",
 ):
     """
     Generate avatar videos for a list of topics (or all missing topics).
     Runs synchronously — should be called from a background thread.
+    Now per-user: each user has independent status and cancel tracking.
     """
     import time
 
@@ -2474,10 +2527,14 @@ def batch_generate_videos(
         logger.info("✅ All topics already have avatar videos!")
         return
 
-    _cancel_event.clear()  # Reset cancel signal
+    # Get per-user cancel event and status
+    cancel_evt = _get_cancel_event(user_id) if user_id else _cancel_event
+    status = _get_user_status(user_id) if user_id else _batch_worker_status
+
+    cancel_evt.clear()  # Reset cancel signal
     # Clear persistent cancel flag when batch is explicitly started
-    _save_batch_control({"user_cancelled": False})
-    _batch_worker_status.update({
+    _save_batch_control({"user_cancelled": False}, user_id)
+    status.update({
         "running": True,
         "user_id": user_id,
         "current_topic": "",
@@ -2493,12 +2550,12 @@ def batch_generate_videos(
         "user_cancelled": False,
     })
 
-    logger.info(f"🎬 Batch video worker starting: {len(topics)} topics to generate")
+    logger.info(f"🎬 Batch worker starting for user {user_id[:8] if user_id else 'global'}: {len(topics)} topics")
 
     for i, topic in enumerate(topics):
-        if _batch_worker_status["cancelled"] or _cancel_event.is_set():
+        if status["cancelled"] or cancel_evt.is_set():
             logger.info(f"🛑 Batch worker cancelled/paused after {i} videos")
-            _batch_worker_status["paused"] = True
+            status["paused"] = True
             break
 
         # Skip if video was generated while we were working
@@ -2508,12 +2565,12 @@ def batch_generate_videos(
             entry = mapping[key]
             video_file = entry.get("filename", "")
             if video_file and (WORK_DIR / video_file).exists():
-                _batch_worker_status["skipped"] += 1
-                _batch_worker_status["completed"] += 1
+                status["skipped"] += 1
+                status["completed"] += 1
                 logger.info(f"⏭️ [{i+1}/{len(topics)}] Skipping '{topic}' — already exists")
                 continue
 
-        _batch_worker_status["current_topic"] = topic
+        status["current_topic"] = topic
         logger.info(f"🎬 [{i+1}/{len(topics)}] Generating video for: '{topic}'")
 
         try:
@@ -2540,35 +2597,37 @@ def batch_generate_videos(
             )
 
             if result.get("status") == "completed":
-                _batch_worker_status["completed"] += 1
-                _batch_worker_status["last_completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                status["completed"] += 1
+                status["last_completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 logger.info(f"✅ [{i+1}/{len(topics)}] Video generated: '{topic}'")
             else:
-                _batch_worker_status["failed"] += 1
+                status["failed"] += 1
                 err_msg = result.get("error", "Unknown error")
-                _batch_worker_status["errors"].append(f"{topic}: {err_msg}")
+                status["errors"].append(f"{topic}: {err_msg}")
                 logger.warning(f"❌ [{i+1}/{len(topics)}] Failed for '{topic}': {err_msg}")
 
         except Exception as e:
-            _batch_worker_status["failed"] += 1
-            _batch_worker_status["errors"].append(f"{topic}: {str(e)}")
+            status["failed"] += 1
+            status["errors"].append(f"{topic}: {str(e)}")
             logger.error(f"❌ [{i+1}/{len(topics)}] Error generating '{topic}': {e}")
 
         # Brief pause between videos to avoid overloading
         # Also check cancel during the pause for faster response
         for _ in range(4):
-            if _cancel_event.is_set():
+            if cancel_evt.is_set():
                 break
             time.sleep(0.5)
 
-    was_cancelled = _batch_worker_status["cancelled"] or _cancel_event.is_set()
-    _batch_worker_status["running"] = False
-    _batch_worker_status["current_topic"] = ""
+    was_cancelled = status["cancelled"] or cancel_evt.is_set()
+    status["running"] = False
+    status["current_topic"] = ""
     if was_cancelled:
-        _batch_worker_status["paused"] = True
+        status["paused"] = True
     logger.info(
-        f"{'⏸️ Batch video worker paused' if was_cancelled else '🎉 Batch video worker finished'}: "
-        f"{_batch_worker_status['completed']} completed, "
-        f"{_batch_worker_status['failed']} failed, "
-        f"{_batch_worker_status['skipped']} skipped"
+        f"{'⏸️ Batch paused' if was_cancelled else '🎉 Batch finished'} "
+        f"(user {user_id[:8] if user_id else 'global'}): "
+        f"{status['completed']} completed, "
+        f"{status['failed']} failed, "
+        f"{status['skipped']} skipped"
     )
+

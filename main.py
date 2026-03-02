@@ -4479,11 +4479,11 @@ async def avatar_video_batch_generate(
         )
         import threading
 
-        status = get_batch_worker_status()
+        status = get_batch_worker_status(user_id=current_user.id)
         if status.get("running"):
             return {
                 "success": False,
-                "message": "Batch worker is already running",
+                "message": "Your batch is already running",
                 "status": status,
             }
 
@@ -4524,7 +4524,7 @@ async def avatar_video_batch_generate(
                 topics=topics_to_generate,
                 user_id=current_user.id,
                 voice="nova",
-                avatar_id="teacher_female_1",
+                avatar_id="",
                 video_mode="presentation",
             )
 
@@ -4548,7 +4548,7 @@ async def avatar_video_batch_status(current_user: User = Depends(get_current_use
     """Get the current status of the batch video generation worker."""
     try:
         from avatar_video_service import get_batch_worker_status, get_all_topics_without_videos
-        status = get_batch_worker_status()
+        status = get_batch_worker_status(user_id=current_user.id)
         status["pending_topics"] = len(get_all_topics_without_videos())
         return {"success": True, **status}
     except Exception as e:
@@ -4562,8 +4562,8 @@ async def avatar_video_batch_cancel(current_user: User = Depends(get_current_use
     Sets persistent user_cancelled flag — batch will NOT auto-restart."""
     try:
         from avatar_video_service import cancel_batch_worker, get_batch_worker_status
-        cancel_batch_worker()  # Always set the persistent flag, even if not running
-        updated = get_batch_worker_status()
+        cancel_batch_worker(user_id=current_user.id)  # Per-user cancel
+        updated = get_batch_worker_status(user_id=current_user.id)
         return {
             "success": True,
             "message": "Batch cancelled — will NOT auto-restart until you click Resume",
@@ -4584,12 +4584,12 @@ async def avatar_video_batch_resume(current_user: User = Depends(get_current_use
             _load_topic_map, WORK_DIR,
         )
 
-        # Clear persistent cancel flag
-        resume_batch_worker()
+        # Clear persistent cancel flag for this user
+        resume_batch_worker(user_id=current_user.id)
 
-        status = get_batch_worker_status()
+        status = get_batch_worker_status(user_id=current_user.id)
         if status.get("running"):
-            return {"success": True, "message": "Batch is already running"}
+            return {"success": True, "message": "Your batch is already running"}
 
         # Discover topics and start batch
         db_topics = _discover_all_topics_from_db()
@@ -4619,7 +4619,7 @@ async def avatar_video_batch_resume(current_user: User = Depends(get_current_use
                 topics=topics_to_generate,
                 user_id=str(current_user.id),
                 voice="nova",
-                avatar_id="teacher_female_1",
+                avatar_id="",
                 video_mode="presentation",
             )
 
