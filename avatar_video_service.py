@@ -1815,7 +1815,8 @@ def _load_topic_map() -> dict:
     return {}
 
 def _save_topic_video(topic: str, video_filename: str, user_id: str = ""):
-    """Save a topic→video mapping to the persistent file."""
+    """Save a topic→video mapping to the persistent file AND to Supabase ai_videos."""
+    video_url = ""
     try:
         import json
         mapping = _load_topic_map()
@@ -1828,6 +1829,52 @@ def _save_topic_video(topic: str, video_filename: str, user_id: str = ""):
         _TOPIC_MAP_FILE.write_text(json.dumps(mapping, indent=2))
     except Exception as e:
         logger.warning(f"Could not save topic mapping: {e}")
+
+    # Also upload to Supabase Storage + save to ai_videos table (survives restarts)
+    try:
+        video_path = WORK_DIR / video_filename
+        if video_path.exists() and video_path.stat().st_size > 1000:
+            from local_video_service import upload_video_to_supabase
+            import hashlib
+            # Use a unique storage filename
+            storage_name = f"avatar_{hashlib.md5(topic.strip().lower().encode()).hexdigest()[:12]}_{video_filename}"
+            video_url = upload_video_to_supabase(str(video_path), storage_name)
+            if video_url:
+                # Update local mapping with the URL
+                try:
+                    mapping = _load_topic_map()
+                    if key in mapping:
+                        mapping[key]["video_url"] = video_url
+                        _TOPIC_MAP_FILE.write_text(json.dumps(mapping, indent=2))
+                except Exception:
+                    pass
+                logger.info(f"☁️ Video uploaded to Supabase Storage: {topic} → {video_url[:80]}...")
+            else:
+                logger.warning(f"Supabase Storage upload returned empty URL for: {topic}")
+    except Exception as e:
+        logger.warning(f"Supabase Storage upload failed (video still local): {e}")
+
+    # Save to ai_videos table for persistent lookup
+    try:
+        from database import supabase as _sb
+        import time as _time
+        import hashlib
+        cache_key = hashlib.md5(f"{topic.strip().lower()}|{user_id}|avatar".encode()).hexdigest()
+        _sb.table("ai_videos").upsert({
+            "cache_key": cache_key,
+            "topic": topic,
+            "doc_name": "",
+            "language": "en",
+            "video_id": video_filename.replace("_final.mp4", ""),
+            "video_url": video_url or f"/static/avatar_video_temp/{video_filename}",
+            "presenter": "AI Avatar",
+            "status": "completed",
+            "user_id": user_id,
+            "updated_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }, on_conflict="cache_key").execute()
+        logger.info(f"✅ ai_videos table saved: {topic}")
+    except Exception as e:
+        logger.warning(f"ai_videos table save failed (non-fatal): {e}")
 
 def find_video_by_topic(topic: str) -> Optional[dict]:
     """Find a video for a given topic. Returns dict with url + scene data, or None."""
@@ -1892,6 +1939,25 @@ def find_video_by_topic(topic: str) -> Optional[dict]:
                     return result
         except Exception:
             pass
+
+    # 3. Fallback: check Supabase ai_videos table (survives restarts on Railway)
+    try:
+        from database import supabase as _sb
+        ai_result = _sb.table("ai_videos").select("video_url,topic,status") \
+            .eq("status", "completed") \
+            .ilike("topic", topic.strip()) \
+            .limit(1).execute()
+        if ai_result.data and ai_result.data[0].get("video_url"):
+            row = ai_result.data[0]
+            return {
+                "url": row["video_url"],
+                "topic": row.get("topic", topic),
+                "video_mode": "presentation",
+                "scene_timings": [],
+                "scenes": [],
+            }
+    except Exception as e:
+        logger.debug(f"ai_videos lookup in find_video_by_topic failed: {e}")
 
     return None
 
