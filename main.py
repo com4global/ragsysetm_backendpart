@@ -4482,8 +4482,9 @@ async def avatar_video_batch_generate(
         status = get_batch_worker_status(user_id=current_user.id)
         if status.get("running"):
             return {
-                "success": False,
-                "message": "Your batch is already running",
+                "success": True,
+                "message": "Your batch is already running — check progress below",
+                "already_running": True,
                 "status": status,
             }
 
@@ -4783,7 +4784,7 @@ async def _auto_batch_video_scheduler():
                         topics=topics_to_generate,
                         user_id="system",
                         voice="nova",
-                        avatar_id="teacher_female_1",
+                        avatar_id="",
                         video_mode="presentation",
                     )
 
@@ -4867,7 +4868,7 @@ async def admin_video_batch_control(req: AdminBatchControlRequest, admin: User =
     try:
         if req.action == "stop":
             from avatar_video_service import cancel_batch_worker
-            cancel_batch_worker()
+            cancel_batch_worker(user_id=req.user_id)
             from video_batch_control import set_video_generation_enabled
             set_video_generation_enabled(req.user_id, False)
             return {"success": True, "message": f"Video generation stopped for user {req.user_id}"}
@@ -4881,9 +4882,9 @@ async def admin_video_batch_control(req: AdminBatchControlRequest, admin: User =
                 batch_generate_videos, get_all_topics_without_videos,
                 _load_topic_map, WORK_DIR,
             )
-            resume_batch_worker()
+            resume_batch_worker(user_id=req.user_id)
 
-            status = get_batch_worker_status()
+            status = get_batch_worker_status(user_id=req.user_id)
             if status.get("running"):
                 return {"success": True, "message": "Batch is already running"}
 
@@ -4914,7 +4915,7 @@ async def admin_video_batch_control(req: AdminBatchControlRequest, admin: User =
                     topics=topics_to_generate,
                     user_id=req.user_id,
                     voice="nova",
-                    avatar_id="teacher_female_1",
+                    avatar_id="",
                     video_mode="presentation",
                 )
 
