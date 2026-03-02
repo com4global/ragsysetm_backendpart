@@ -25,6 +25,7 @@ import uuid
 import hashlib
 import logging
 import asyncio
+import random
 import tempfile
 import requests
 from pathlib import Path
@@ -60,6 +61,11 @@ if os.name == "nt":
 else:
     AVATAR_DIR = Path("/tmp") / "avatars"
 AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+
+# Clean up bad auto-generated avatar (the old teacher_female_1 was a garbled face grid)
+_bad_avatar = AVATAR_DIR / "teacher_female_1.png"
+if _bad_avatar.exists():
+    _bad_avatar.unlink()
 
 # Temp dirs for processing (use /tmp on Linux/Vercel)
 if os.name == "nt":
@@ -2016,7 +2022,17 @@ def get_avatar_image_path(avatar_id: str) -> str:
     if generated:
         return generated
 
-    logger.warning(f"No avatar image found for '{avatar_id}' and generation failed")
+    # Fallback: randomly pick a default avatar and try to generate that instead
+    fallback = random.choice(DEFAULT_AVATARS)
+    logger.info(f"🎲 Falling back to random avatar: {fallback['id']}")
+    fb_path = AVATAR_DIR / fallback["image"]
+    if fb_path.exists():
+        return str(fb_path)
+    fb_gen = generate_avatar_face(fallback["id"], fallback.get("description", ""))
+    if fb_gen:
+        return fb_gen
+
+    logger.warning(f"No avatar image found for '{avatar_id}' and all fallbacks failed")
     return ""
 
 
@@ -2510,7 +2526,7 @@ def batch_generate_videos(
                 topic=topic,
                 content="",  # Let the pipeline search for content
                 user_id=user_id,
-                avatar_id=avatar_id,
+                avatar_id=random.choice(DEFAULT_AVATARS)["id"],  # Random avatar per video
                 language="en",
                 voice=voice,
                 style="educational",
