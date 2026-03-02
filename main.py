@@ -4856,24 +4856,42 @@ async def admin_video_batch_all_users(admin: User = Depends(require_admin)):
         from video_batch_control import get_all_users_batch_status
         users = get_all_users_batch_status()
 
+        # Also count completed videos from ai_videos table (persists across restarts)
+        ai_videos_per_user = {}
+        try:
+            from database import supabase as _sb
+            vids_result = _sb.table("ai_videos").select("user_id,topic,status") \
+                .eq("status", "completed").execute()
+            for v in (vids_result.data or []):
+                uid = v.get("user_id", "")
+                if uid:
+                    ai_videos_per_user[uid] = ai_videos_per_user.get(uid, 0) + 1
+        except Exception as e:
+            logger.debug(f"ai_videos count query failed: {e}")
+
         # Merge in-memory batch running status from avatar_video_service
         try:
-            from avatar_video_service import _user_batch_status
+            from avatar_video_service import _user_batch_status, _get_user_status
             for user_entry in users:
-                uid = user_entry.get("user_id", "")
-                if uid in _user_batch_status:
-                    mem_status = _user_batch_status[uid]
-                    user_entry["batch_running"] = mem_status.get("running", False)
-                    user_entry["batch_current_topic"] = mem_status.get("current_topic", "")
-                    user_entry["batch_completed"] = mem_status.get("completed", 0)
-                    user_entry["batch_total"] = mem_status.get("total", 0)
-                    user_entry["batch_started_at"] = mem_status.get("started_at", "")
-                else:
-                    user_entry["batch_running"] = False
-                    user_entry["batch_current_topic"] = ""
-                    user_entry["batch_completed"] = 0
-                    user_entry["batch_total"] = 0
-                    user_entry["batch_started_at"] = ""
+                uid = str(user_entry.get("user_id", ""))
+
+                # Use _get_user_status which also loads persisted state
+                mem_status = _get_user_status(uid) if uid else {}
+                user_entry["batch_running"] = mem_status.get("running", False)
+                user_entry["batch_current_topic"] = mem_status.get("current_topic", "")
+                user_entry["batch_completed"] = mem_status.get("completed", 0)
+                user_entry["batch_total"] = mem_status.get("total", 0)
+                user_entry["batch_started_at"] = mem_status.get("started_at", "")
+                user_entry["batch_paused"] = mem_status.get("paused", False)
+                user_entry["batch_cancelled"] = mem_status.get("user_cancelled", False)
+
+                # Supplement with ai_videos count (persisted across restarts)
+                user_entry["ai_videos_completed"] = ai_videos_per_user.get(uid, 0)
+
+                # If batch_jobs has no records but ai_videos does, use that as completed_jobs
+                if user_entry.get("completed_jobs", 0) == 0 and ai_videos_per_user.get(uid, 0) > 0:
+                    user_entry["completed_jobs"] = ai_videos_per_user[uid]
+                    user_entry["total_jobs"] = max(user_entry.get("total_jobs", 0), ai_videos_per_user[uid])
         except Exception as e:
             logger.debug(f"Could not merge in-memory batch status: {e}")
 
