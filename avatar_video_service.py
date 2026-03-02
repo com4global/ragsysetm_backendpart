@@ -2337,6 +2337,7 @@ _persisted = _load_batch_control()
 
 _batch_worker_status = {
     "running": False,
+    "user_id": "",
     "current_topic": "",
     "completed": 0,
     "total": 0,
@@ -2462,6 +2463,7 @@ def batch_generate_videos(
     _save_batch_control({"user_cancelled": False})
     _batch_worker_status.update({
         "running": True,
+        "user_id": user_id,
         "current_topic": "",
         "completed": 0,
         "total": len(topics),
