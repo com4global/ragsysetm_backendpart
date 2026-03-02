@@ -4352,6 +4352,7 @@ async def avatar_video_dashboard(
         topic_map = {}
         batch_status = {}
         WORK_DIR_resolved = None
+        supabase_videos = {}  # topic_lower -> video_url from ai_videos table
         try:
             from avatar_video_service import (
                 _load_topic_map, get_batch_worker_status, WORK_DIR
@@ -4362,6 +4363,17 @@ async def avatar_video_dashboard(
         except Exception as e:
             logger.warning(f"Dashboard: avatar_video_service unavailable: {e}")
 
+        # Also check ai_videos table (covers Railway/prod where local files don't exist)
+        try:
+            ai_vid_result = supabase.table("ai_videos").select("topic,video_url,status") \
+                .eq("user_id", current_user.id).execute()
+            for v in (ai_vid_result.data or []):
+                t = v.get("topic", "")
+                if t and v.get("video_url") and v.get("status") == "completed":
+                    supabase_videos[t.strip().lower()] = v["video_url"]
+        except Exception as e:
+            logger.debug(f"Dashboard: ai_videos query skipped: {e}")
+
         total_topics = 0
         total_with_video = 0
 
@@ -4369,17 +4381,27 @@ async def avatar_video_dashboard(
             for topic_entry in doc_data["topics"]:
                 total_topics += 1
                 key = topic_entry["title"].strip().lower()
+                has_video = False
+                video_url = None
+
+                # Check 1: local topic_map (avatar_video_service)
                 if key in topic_map:
                     entry = topic_map[key]
                     video_file = entry.get("filename", "")
                     if video_file and WORK_DIR_resolved and (WORK_DIR_resolved / video_file).exists():
-                        topic_entry["has_video"] = True
-                        topic_entry["video_url"] = f"/static/avatar_video_temp/{video_file}"
-                        topic_entry["video_mode"] = entry.get("video_mode", "presentation")
-                        total_with_video += 1
-                    else:
-                        topic_entry["has_video"] = False
-                        topic_entry["video_url"] = None
+                        has_video = True
+                        video_url = f"/static/avatar_video_temp/{video_file}"
+
+                # Check 2: ai_videos table in Supabase (production/Railway)
+                if not has_video and key in supabase_videos:
+                    has_video = True
+                    video_url = supabase_videos[key]
+
+                if has_video:
+                    topic_entry["has_video"] = True
+                    topic_entry["video_url"] = video_url
+                    topic_entry["video_mode"] = topic_map.get(key, {}).get("video_mode", "presentation")
+                    total_with_video += 1
                 else:
                     topic_entry["has_video"] = False
                     topic_entry["video_url"] = None
@@ -4592,8 +4614,8 @@ async def avatar_video_batch_resume(current_user: User = Depends(get_current_use
         if status.get("running"):
             return {"success": True, "message": "Your batch is already running"}
 
-        # Discover topics and start batch
-        db_topics = _discover_all_topics_from_db()
+        # Discover topics and start batch — ONLY for this user
+        db_topics = _discover_all_topics_from_db(user_id=current_user.id)
         local_missing = get_all_topics_without_videos()
         all_topic_set = set(t.strip().lower() for t in db_topics)
         all_topic_set.update(t.strip().lower() for t in local_missing)
