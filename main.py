@@ -4855,6 +4855,28 @@ async def admin_video_batch_all_users(admin: User = Depends(require_admin)):
     try:
         from video_batch_control import get_all_users_batch_status
         users = get_all_users_batch_status()
+
+        # Merge in-memory batch running status from avatar_video_service
+        try:
+            from avatar_video_service import _user_batch_status
+            for user_entry in users:
+                uid = user_entry.get("user_id", "")
+                if uid in _user_batch_status:
+                    mem_status = _user_batch_status[uid]
+                    user_entry["batch_running"] = mem_status.get("running", False)
+                    user_entry["batch_current_topic"] = mem_status.get("current_topic", "")
+                    user_entry["batch_completed"] = mem_status.get("completed", 0)
+                    user_entry["batch_total"] = mem_status.get("total", 0)
+                    user_entry["batch_started_at"] = mem_status.get("started_at", "")
+                else:
+                    user_entry["batch_running"] = False
+                    user_entry["batch_current_topic"] = ""
+                    user_entry["batch_completed"] = 0
+                    user_entry["batch_total"] = 0
+                    user_entry["batch_started_at"] = ""
+        except Exception as e:
+            logger.debug(f"Could not merge in-memory batch status: {e}")
+
         return {"success": True, "users": users}
     except Exception as e:
         logger.error(f"Admin video batch all users failed: {e}")
