@@ -1943,18 +1943,40 @@ def find_video_by_topic(topic: str) -> Optional[dict]:
     # 3. Fallback: check Supabase ai_videos table (survives restarts on Railway)
     try:
         from database import supabase as _sb
-        ai_result = _sb.table("ai_videos").select("video_url,topic,status") \
+        ai_result = _sb.table("ai_videos").select("video_url,topic,status,script") \
             .eq("status", "completed") \
             .ilike("topic", topic.strip()) \
             .limit(1).execute()
         if ai_result.data and ai_result.data[0].get("video_url"):
             row = ai_result.data[0]
+            scenes = []
+            scene_timings = []
+            # Parse script JSON if available (contains scene data)
+            script_raw = row.get("script", "") or ""
+            if script_raw:
+                try:
+                    script_data = json.loads(script_raw) if isinstance(script_raw, str) else script_raw
+                    scenes = script_data.get("scenes", [])
+                    # Build scene_timings from scenes
+                    cumulative = 0.0
+                    for i, sc in enumerate(scenes):
+                        dur = sc.get("duration_estimate", 10)
+                        scene_timings.append({
+                            "index": i,
+                            "start_time": cumulative,
+                            "end_time": cumulative + dur,
+                            "narration": sc.get("narration", ""),
+                            "text_overlay": sc.get("text_overlay", ""),
+                        })
+                        cumulative += dur
+                except Exception as parse_err:
+                    logger.debug(f"Could not parse script JSON: {parse_err}")
             return {
                 "url": row["video_url"],
                 "topic": row.get("topic", topic),
                 "video_mode": "presentation",
-                "scene_timings": [],
-                "scenes": [],
+                "scene_timings": scene_timings,
+                "scenes": scenes,
             }
     except Exception as e:
         logger.debug(f"ai_videos lookup in find_video_by_topic failed: {e}")
