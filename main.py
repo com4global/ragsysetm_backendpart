@@ -123,8 +123,11 @@ async def lifespan(app: FastAPI):
     
     # Start auto-batch video pre-generation scheduler
     global _auto_batch_task
-    _auto_batch_task = asyncio.create_task(_auto_batch_video_scheduler())
-    logger.info("🎬 Auto-batch video scheduler registered (starts in 60s)")
+    try:
+        _auto_batch_task = asyncio.create_task(_auto_batch_video_scheduler())
+        logger.info("🎬 Auto-batch video scheduler registered (starts in 60s)")
+    except NameError:
+        logger.warning("⚠️ Auto-batch scheduler not available — skipping")
     
     # Warmup cross-encoder re-ranker model (Phase 1 RAG Enhancement)
     try:
@@ -5467,3 +5470,9 @@ async def admin_replicate_usage(admin: User = Depends(require_admin)):
     except Exception as e:
         logger.error(f"Admin replicate usage failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
