@@ -4369,7 +4369,7 @@ async def avatar_video_dashboard(
         # Also check ai_videos table (covers Railway/prod where local files don't exist)
         try:
             ai_vid_result = supabase.table("ai_videos").select("topic,video_url,status") \
-                .eq("user_id", current_user.id).execute()
+                .eq("status", "completed").execute()
             for v in (ai_vid_result.data or []):
                 t = v.get("topic", "")
                 if t and v.get("video_url") and v.get("status") == "completed":
